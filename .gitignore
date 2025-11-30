@@ -1,0 +1,4 @@
+# ESP-IDF stuff
+/build/
+sdkconfig
+sdkconfig.old
