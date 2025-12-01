@@ -34,6 +34,53 @@ static int        mesh_layer        = -1;
 static esp_netif_t *netif_sta       = NULL;
 
 /* -------------------------------------------------------------------------- */
+/*  Моніторинг усіх стеків FreeRTOS                                           */
+/* -------------------------------------------------------------------------- */
+
+#define STACK_MONITOR_PERIOD_MS   60000      // раз у 10 секунд
+#define STACK_MONITOR_MAX_TASKS   20         // якщо тасок буде більше – збільшиш
+
+static void stack_monitor_task(void *arg)
+{
+    TaskStatus_t status[STACK_MONITOR_MAX_TASKS];
+    UBaseType_t  count;
+    uint32_t     total_run_time;    // можемо не використовувати, але хай буде
+
+    while (1) {
+        // Отримуємо знімок усіх тасок
+        count = uxTaskGetSystemState(status,
+                                     STACK_MONITOR_MAX_TASKS,
+                                     &total_run_time);
+
+        ESP_LOGI(MESH_TAG,
+                 "===== STACK MONITOR: %u task(s) =====",
+                 (unsigned)count);
+
+        for (UBaseType_t i = 0; i < count; ++i) {
+            const char *name = status[i].pcTaskName;
+            if (!name || !name[0]) {
+                name = "noname";
+            }
+
+            // usStackHighWaterMark – в "словах" (StackType_t), для ESP32 зазвичай 4 байти
+            size_t free_words = status[i].usStackHighWaterMark;
+            size_t free_bytes = free_words * sizeof(StackType_t);
+
+            ESP_LOGI(MESH_TAG,
+                     "[STACK] task=\"%s\" prio=%u free=%u words (%u bytes)",
+                     name,
+                     (unsigned)status[i].uxCurrentPriority,
+                     (unsigned)free_words,
+                     (unsigned)free_bytes);
+        }
+
+        ESP_LOGI(MESH_TAG, "===== END STACK MONITOR =====");
+
+        vTaskDelay(pdMS_TO_TICKS(STACK_MONITOR_PERIOD_MS));
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Мінімальний власний протокол                                              */
 /* -------------------------------------------------------------------------- */
 /*
@@ -46,16 +93,6 @@ static esp_netif_t *netif_sta       = NULL;
  *  src_mac  - MAC відправника
  *  payload  - невеликий текст (рядок з '\0' в кінці)
  */
-// ---- ХЕЛПЕР ДЛЯ ВИВОДУ СТЕКА ----
-static void log_stack_watermark(const char *task_name)
-{
-	UBaseType_t watermark_words = uxTaskGetStackHighWaterMark(NULL);
-	ESP_LOGI(MESH_TAG,
-	         "[stack] %s watermark: %u words (~%u bytes)",
-	         task_name,
-	         (unsigned)watermark_words,
-	         (unsigned)watermark_words * 4);
-}
 
 typedef struct __attribute__((packed)) {
 	uint8_t  magic;
@@ -130,25 +167,18 @@ static void mesh_single_tx_task(void *arg)
     mesh_packet_t pkt;
     esp_err_t     err;
     uint32_t      counter = 0;
-    uint32_t      loop_cnt = 0;   // <- для періодичного логування
 
     TickType_t last_wake = xTaskGetTickCount();
 
     while (is_running) {
         // чекаємо рівно 5 сек від попереднього “тика”
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SINGLE_TX_INTERVAL_MS));
-        
-        // раз на 10 циклів (50 секунд при TX_INTERVAL_MS=5000)
-		if ((loop_cnt % 10) == 0) {
-			log_stack_watermark("single_tx");
-		}
 
         // якщо нода ще не в mesh – нічого не робимо
         if (!is_mesh_connected) {
             continue;
         }
 
-        loop_cnt++;
         counter++;
 
         memset(&pkt, 0, sizeof(pkt));
@@ -192,7 +222,6 @@ static void mesh_tx_task(void *arg)
 	mesh_addr_t   dest;
 	esp_err_t     err;
 	uint32_t      counter = 0;
-    //uint32_t loop_cnt = 0;
 
 	data.data  = (uint8_t *)&pkt;
 	data.proto = MESH_PROTO_BIN;
@@ -201,16 +230,11 @@ static void mesh_tx_task(void *arg)
 	while (is_running) {
 		vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
 
-        // if ((loop_cnt % 10) == 0) {
-		// log_stack_watermark("mesh_tx");
-	    // }
-
 		// Шлемо тільки, якщо ми підключені до mesh і ми НЕ root
 		if (!is_mesh_connected || esp_mesh_is_root()) {
 			continue;
 		}
 
-        //loop_cnt++;
 		counter++;
 
 		memset(&pkt, 0, sizeof(pkt));
@@ -255,16 +279,11 @@ static void mesh_rx_task(void *arg)
 	mesh_addr_t   from;
 	int           flag;
 	esp_err_t     err;
-    uint32_t loop_cnt = 0;
 
 	data.data = (uint8_t *)&pkt;
 	data.size = sizeof(pkt);
 
 	while (is_running) {
-        loop_cnt++;
-        if ((loop_cnt % 10) == 0) {
-		log_stack_watermark("mesh_rx");
-	    }
 
 		data.size = sizeof(pkt);
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
@@ -335,12 +354,6 @@ static void root_broadcast_task(void *arg)
 		if (!esp_mesh_is_root() || !is_mesh_connected) {
 			continue;
 		}
-
-		// --- монітор стеку цієї таски ---
-		UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
-		ESP_LOGI(MESH_TAG,
-		         "[root_bcast] stack HW=%u words (~%u bytes)",
-		         (unsigned)hw, (unsigned)(hw * sizeof(StackType_t)));
 
 		// обновляємо routing table
 		route_table_size = 0;
@@ -531,7 +544,7 @@ static void mesh_event_handler(void *arg,
 		if (esp_mesh_is_root()) {
 			esp_netif_dhcpc_stop(netif_sta);
 			esp_netif_dhcpc_start(netif_sta);
-            
+
             root_broadcast_start();
 		}
 		mesh_comm_start();
@@ -545,7 +558,6 @@ static void mesh_event_handler(void *arg,
 		         "<MESH_EVENT_PARENT_DISCONNECTED> reason:%d",
 		         disc->reason);
 		is_mesh_connected = false;
-		//mesh_disconnected_indicator();
 		mesh_layer = esp_mesh_get_layer();
 	}
 	break;
@@ -560,7 +572,6 @@ static void mesh_event_handler(void *arg,
 		         esp_mesh_is_root() ? "<ROOT>" :
 		         (mesh_layer == 2) ? "<layer2>" : "");
 		last_layer = mesh_layer;
-		//mesh_connected_indicator(mesh_layer);
 	}
 	break;
 
@@ -693,4 +704,12 @@ void app_main(void)
 	         esp_mesh_get_topology(),
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
+
+    // Старт монітора стеків
+    xTaskCreate(stack_monitor_task,
+                "stack_mon",      // ім’я для дебага
+                4096,             // стек (як для інших твоїх тасок)
+                NULL,
+                3,                // пріоритет нижчий/середній, щоб не заважати mesh/wifi
+                NULL);
 }
