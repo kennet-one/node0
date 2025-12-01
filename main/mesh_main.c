@@ -14,17 +14,13 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
-// Якщо проект ще містить mesh_light.c/h — можеш залишити підключення
-// і функції індикаторів, щоб мигав LED.
-//#include "mesh_light.h"
-
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
 /* -------------------------------------------------------------------------- */
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
-#define FIXED_ROOT  1   // на node0
+//#define FIXED_ROOT  1   // на node0
 
 static const char *MESH_TAG = "node0";
 
@@ -50,6 +46,16 @@ static esp_netif_t *netif_sta       = NULL;
  *  src_mac  - MAC відправника
  *  payload  - невеликий текст (рядок з '\0' в кінці)
  */
+// ---- ХЕЛПЕР ДЛЯ ВИВОДУ СТЕКА ----
+static void log_stack_watermark(const char *task_name)
+{
+	UBaseType_t watermark_words = uxTaskGetStackHighWaterMark(NULL);
+	ESP_LOGI(MESH_TAG,
+	         "[stack] %s watermark: %u words (~%u bytes)",
+	         task_name,
+	         (unsigned)watermark_words,
+	         (unsigned)watermark_words * 4);
+}
 
 typedef struct __attribute__((packed)) {
 	uint8_t  magic;
@@ -83,6 +89,98 @@ static void mesh_tx_task(void *arg);
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
 
+static void root_broadcast_task(void *arg);
+static esp_err_t root_broadcast_start(void);
+
+
+// -----------------------------SINGLE_SENDER---------------------------------------
+static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
+
+static esp_err_t mesh_send_single(const uint8_t to_mac[6],
+                                  const mesh_packet_t *pkt)
+{
+    mesh_addr_t dest = {0};
+    mesh_data_t data;
+
+    // заповнюємо адресу призначення
+    memcpy(dest.addr, to_mac, 6);
+
+    data.data  = (uint8_t *)pkt;
+    data.size  = sizeof(*pkt);
+    data.proto = MESH_PROTO_BIN;
+    data.tos   = MESH_TOS_P2P;
+
+    // звичайний p2p-send – mesh сам прокладе маршрут
+    return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+}
+
+#define SINGLE_TX_INTERVAL_MS  5000   // 5 секунд
+
+// щоб можна було вмикати/вимикати відправника на різних білдах
+#define I_AM_SINGLE_SENDER     1      // на вузлі, який ШЛЕ, став 1; на інших 0
+
+static void mesh_single_tx_task(void *arg)
+{
+#if !I_AM_SINGLE_SENDER
+    // На цій ноді не треба нічого слати – одразу вбиваємо таску
+    vTaskDelete(NULL);
+    return;
+#endif
+
+    mesh_packet_t pkt;
+    esp_err_t     err;
+    uint32_t      counter = 0;
+    uint32_t      loop_cnt = 0;   // <- для періодичного логування
+
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (is_running) {
+        // чекаємо рівно 5 сек від попереднього “тика”
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SINGLE_TX_INTERVAL_MS));
+        
+        // раз на 10 циклів (50 секунд при TX_INTERVAL_MS=5000)
+		if ((loop_cnt % 10) == 0) {
+			log_stack_watermark("single_tx");
+		}
+
+        // якщо нода ще не в mesh – нічого не робимо
+        if (!is_mesh_connected) {
+            continue;
+        }
+
+        loop_cnt++;
+        counter++;
+
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.magic   = MESH_PKT_MAGIC;
+        pkt.version = MESH_PKT_VERSION;
+        pkt.type    = MESH_PKT_TYPE_TEXT;
+        pkt.counter = counter;
+
+        // MAC цієї ноди – для логів
+        esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
+
+        snprintf(pkt.payload, sizeof(pkt.payload),
+                 "single %lu", (unsigned long)counter);
+
+        err = mesh_send_single(NODE1_MAC, &pkt);
+        if (err == ESP_OK) {
+            ESP_LOGI(MESH_TAG,
+                     "SINGLE TX -> " MACSTR " cnt=%lu payload=\"%s\"",
+                     MAC2STR(NODE1_MAC),
+                     (unsigned long)counter,
+                     pkt.payload);
+        } else {
+            ESP_LOGE(MESH_TAG,
+                     "mesh_send_single failed: 0x%x (%s)",
+                     err, esp_err_to_name(err));
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+
 /* -------------------------------------------------------------------------- */
 /*  TX task – періодично шлемо пакет на root                                  */
 /* -------------------------------------------------------------------------- */
@@ -94,6 +192,7 @@ static void mesh_tx_task(void *arg)
 	mesh_addr_t   dest;
 	esp_err_t     err;
 	uint32_t      counter = 0;
+    //uint32_t loop_cnt = 0;
 
 	data.data  = (uint8_t *)&pkt;
 	data.proto = MESH_PROTO_BIN;
@@ -102,11 +201,16 @@ static void mesh_tx_task(void *arg)
 	while (is_running) {
 		vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
 
+        // if ((loop_cnt % 10) == 0) {
+		// log_stack_watermark("mesh_tx");
+	    // }
+
 		// Шлемо тільки, якщо ми підключені до mesh і ми НЕ root
 		if (!is_mesh_connected || esp_mesh_is_root()) {
 			continue;
 		}
 
+        //loop_cnt++;
 		counter++;
 
 		memset(&pkt, 0, sizeof(pkt));
@@ -151,11 +255,17 @@ static void mesh_rx_task(void *arg)
 	mesh_addr_t   from;
 	int           flag;
 	esp_err_t     err;
+    uint32_t loop_cnt = 0;
 
 	data.data = (uint8_t *)&pkt;
 	data.size = sizeof(pkt);
 
 	while (is_running) {
+        loop_cnt++;
+        if ((loop_cnt % 10) == 0) {
+		log_stack_watermark("mesh_rx");
+	    }
+
 		data.size = sizeof(pkt);
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
@@ -200,6 +310,113 @@ static void mesh_rx_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Root broadcast task – раз в 10 сек шле пакет ВСІМ нодам + монітор стеку   */
+/* -------------------------------------------------------------------------- */
+
+static void root_broadcast_task(void *arg)
+{
+	mesh_packet_t pkt;
+	mesh_data_t   data;
+	esp_err_t     err;
+	uint32_t      counter = 0;
+
+	// таблиця роутів (MAC усіх відомих нод)
+	mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
+	int route_table_size = 0;
+
+	data.data  = (uint8_t *)&pkt;
+	data.proto = MESH_PROTO_BIN;
+	data.tos   = MESH_TOS_P2P;
+
+	while (is_running) {
+		vTaskDelay(pdMS_TO_TICKS(10 * 1000));   // 10 секунд
+
+		// Підстраховка: шлемо тільки якщо ми root і підключені
+		if (!esp_mesh_is_root() || !is_mesh_connected) {
+			continue;
+		}
+
+		// --- монітор стеку цієї таски ---
+		UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+		ESP_LOGI(MESH_TAG,
+		         "[root_bcast] stack HW=%u words (~%u bytes)",
+		         (unsigned)hw, (unsigned)(hw * sizeof(StackType_t)));
+
+		// обновляємо routing table
+		route_table_size = 0;
+		err = esp_mesh_get_routing_table(
+		          route_table,
+		          CONFIG_MESH_ROUTE_TABLE_SIZE * sizeof(mesh_addr_t),
+		          &route_table_size);
+
+		if (err != ESP_OK) {
+			ESP_LOGE(MESH_TAG,
+			         "get_routing_table err=0x%x (%s)",
+			         err, esp_err_to_name(err));
+			continue;
+		}
+
+		if (route_table_size == 0) {
+			ESP_LOGW(MESH_TAG, "root_bcast: routing table is empty");
+			continue;
+		}
+
+		counter++;
+
+		// формуємо пакет
+		memset(&pkt, 0, sizeof(pkt));
+		pkt.magic   = MESH_PKT_MAGIC;
+		pkt.version = MESH_PKT_VERSION;
+		pkt.type    = MESH_PKT_TYPE_TEXT;   // можна лишити TEXT
+		pkt.counter = counter;
+
+		esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
+
+		snprintf(pkt.payload, sizeof(pkt.payload),
+		         "BCAST %lu", (unsigned long)counter);
+
+		data.size = sizeof(pkt);
+
+		ESP_LOGI(MESH_TAG,
+		         "ROOT BCAST cnt=%lu to %d nodes",
+		         (unsigned long)counter, route_table_size);
+
+		for (int i = 0; i < route_table_size; ++i) {
+			err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+			if (err != ESP_OK) {
+				ESP_LOGE(MESH_TAG,
+				         "bcast -> " MACSTR " err=0x%x (%s)",
+				         MAC2STR(route_table[i].addr),
+				         err, esp_err_to_name(err));
+			}
+		}
+	}
+
+	vTaskDelete(NULL);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Старт root-broadcast таски (один раз на кожному девайсі)                  */
+/* -------------------------------------------------------------------------- */
+
+static esp_err_t root_broadcast_start(void)
+{
+	static bool started = false;
+
+	if (!started) {
+		started = true;
+		xTaskCreate(root_broadcast_task,
+		            "root_bcast",
+		            4096,        // зараз 4 KB, потім зменшиш, дивлячись на HW
+		            NULL,
+		            5,
+		            NULL);
+		ESP_LOGI(MESH_TAG, "root_broadcast_task started");
+	}
+	return ESP_OK;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Запуск задач TX/RX один раз                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -211,6 +428,7 @@ static esp_err_t mesh_comm_start(void)
 		started = true;
 		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
+        xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
 	}
 	return ESP_OK;
 }
@@ -313,6 +531,8 @@ static void mesh_event_handler(void *arg,
 		if (esp_mesh_is_root()) {
 			esp_netif_dhcpc_stop(netif_sta);
 			esp_netif_dhcpc_start(netif_sta);
+            
+            root_broadcast_start();
 		}
 		mesh_comm_start();
 	}
@@ -425,15 +645,11 @@ void app_main(void)
 	    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
 	                               &mesh_event_handler, NULL));
     // --- налаштування типу вузла / фіксований root ---
-    #if FIXED_ROOT
+
         // Ця прошивка буде завжди root (якщо може підключитися до роутера)
-        ESP_ERROR_CHECK(esp_mesh_fix_root(true));       // не віддаємо роль root
-        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));  // я – root
-    #else
-        // Звичайний вузол, root’ом не стає
-        //ESP_ERROR_CHECK(esp_mesh_fix_root(false));      // можна й не викликати, але так явно
-        //ESP_ERROR_CHECK(esp_mesh_set_type(MESH_NODE));  // я – node, не root
-    #endif
+    ESP_ERROR_CHECK(esp_mesh_fix_root(true));       // не віддаємо роль root
+    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));  // я – root
+
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
 	ESP_ERROR_CHECK(esp_mesh_set_max_layer(CONFIG_MESH_MAX_LAYER));
