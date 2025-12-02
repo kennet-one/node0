@@ -14,6 +14,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "legacy_proto.h"
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
 /* -------------------------------------------------------------------------- */
@@ -158,12 +159,6 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
 
 static void mesh_single_tx_task(void *arg)
 {
-#if !I_AM_SINGLE_SENDER
-    // На цій ноді не треба нічого слати – одразу вбиваємо таску
-    vTaskDelete(NULL);
-    return;
-#endif
-
     mesh_packet_t pkt;
     esp_err_t     err;
     uint32_t      counter = 0;
@@ -317,6 +312,7 @@ static void mesh_rx_task(void *arg)
 			         MAC2STR(from.addr),
 			         MAC2STR(pkt.src_mac),
 			         pkt.payload);
+            legacy_handle_text(pkt.payload);
 		} else {
 			ESP_LOGI(MESH_TAG,
 			         "RX type=%u cnt=%lu from " MACSTR,
@@ -329,7 +325,7 @@ static void mesh_rx_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Root broadcast task – раз в 10 сек шле пакет ВСІМ нодам + монітор стеку   */
+/*  Root broadcast task – раз в 10 сек шле пакет ВСІМ нодам  */
 /* -------------------------------------------------------------------------- */
 
 static void root_broadcast_task(void *arg)
@@ -442,6 +438,7 @@ static esp_err_t mesh_comm_start(void)
 		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
         xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
+        xTaskCreate(stack_monitor_task, "stack_mon", 4096, NULL, 3, NULL);
 	}
 	return ESP_OK;
 }
@@ -705,11 +702,4 @@ void app_main(void)
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
 
-    // Старт монітора стеків
-    xTaskCreate(stack_monitor_task,
-                "stack_mon",      // ім’я для дебага
-                4096,             // стек (як для інших твоїх тасок)
-                NULL,
-                3,                // пріоритет нижчий/середній, щоб не заважати mesh/wifi
-                NULL);
 }
