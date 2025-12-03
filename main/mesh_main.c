@@ -15,6 +15,8 @@
 #include "nvs_flash.h"
 
 #include "legacy_proto.h"
+#include "stack_monitor.h"
+
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
 /* -------------------------------------------------------------------------- */
@@ -33,53 +35,6 @@ static bool       is_mesh_connected = false;
 static mesh_addr_t mesh_parent_addr;
 static int        mesh_layer        = -1;
 static esp_netif_t *netif_sta       = NULL;
-
-/* -------------------------------------------------------------------------- */
-/*  Моніторинг усіх стеків FreeRTOS                                           */
-/* -------------------------------------------------------------------------- */
-
-#define STACK_MONITOR_PERIOD_MS   60000      // раз у 10 секунд
-#define STACK_MONITOR_MAX_TASKS   20         // якщо тасок буде більше – збільшиш
-
-static void stack_monitor_task(void *arg)
-{
-    TaskStatus_t status[STACK_MONITOR_MAX_TASKS];
-    UBaseType_t  count;
-    uint32_t     total_run_time;    // можемо не використовувати, але хай буде
-
-    while (1) {
-        // Отримуємо знімок усіх тасок
-        count = uxTaskGetSystemState(status,
-                                     STACK_MONITOR_MAX_TASKS,
-                                     &total_run_time);
-
-        ESP_LOGI(MESH_TAG,
-                 "===== STACK MONITOR: %u task(s) =====",
-                 (unsigned)count);
-
-        for (UBaseType_t i = 0; i < count; ++i) {
-            const char *name = status[i].pcTaskName;
-            if (!name || !name[0]) {
-                name = "noname";
-            }
-
-            // usStackHighWaterMark – в "словах" (StackType_t), для ESP32 зазвичай 4 байти
-            size_t free_words = status[i].usStackHighWaterMark;
-            size_t free_bytes = free_words * sizeof(StackType_t);
-
-            ESP_LOGI(MESH_TAG,
-                     "[STACK] task=\"%s\" prio=%u free=%u words (%u bytes)",
-                     name,
-                     (unsigned)status[i].uxCurrentPriority,
-                     (unsigned)free_words,
-                     (unsigned)free_bytes);
-        }
-
-        ESP_LOGI(MESH_TAG, "===== END STACK MONITOR =====");
-
-        vTaskDelay(pdMS_TO_TICKS(STACK_MONITOR_PERIOD_MS));
-    }
-}
 
 /* -------------------------------------------------------------------------- */
 /*  Мінімальний власний протокол                                              */
@@ -438,7 +393,7 @@ static esp_err_t mesh_comm_start(void)
 		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
         xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
-        xTaskCreate(stack_monitor_task, "stack_mon", 4096, NULL, 3, NULL);
+        stack_monitor_start(3);
 	}
 	return ESP_OK;
 }
