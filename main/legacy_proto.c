@@ -1,10 +1,13 @@
 #include "legacy_proto.h"
+#include "uart_bridge.h"
 #include "esp_log.h"
 
 #include <string.h>
 #include <stdlib.h>   // atof
 
 static const char *LEG_TAG = "legacy";
+
+
 
 static void trim(char *s)
 {
@@ -46,6 +49,8 @@ void legacy_handle_text(const char *msg)
     trim(buf);
     if (!buf[0]) return;
 
+    uart_bridge_send_line(msg);   // піде в UART → SPI → BT → ноут
+
     // ---- Сенсорні значення (мінімальна логіка) ----
     if (starts_with(buf, "TDSB")) {
         float v = atof(buf + 4);
@@ -59,11 +64,11 @@ void legacy_handle_text(const char *msg)
         return;
     }
 
-    if (starts_with(buf, "ttds")) {
-        float t = atof(buf + 4);
-        ESP_LOGI(LEG_TAG, "[SENSOR] temp for TDS ≈ %.2f °C (%s)", t, buf);
-        return;
-    }
+    // if (starts_with(buf, "ttds")) {
+    //     float t = atof(buf + 4);
+    //     ESP_LOGI(LEG_TAG, "[SENSOR] temp for TDS ≈ %.2f °C (%s)", t, buf);
+    //     return;
+    // }
 
     // ---- Команди (поки тільки лог, без дій) ----
     if (!strcmp(buf, "readtds")   ||

@@ -552,5 +552,6 @@ void app_main(void)
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
 
-	ESP_ERROR_CHECK(uart_bridge_init());
+	uart_bridge_init();
+	uart_bridge_start();
 }
