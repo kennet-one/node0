@@ -10,6 +10,9 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
+#include "mesh_root_bcast.h"
+
+
 #define ROOT_UART_PORT UART_NUM_1    // можна 1 або 2
 #define ROOT_UART_TX   GPIO_NUM_17   // TX root -> RX master (17 -> 16)
 #define ROOT_UART_RX   GPIO_NUM_16   // RX root <- TX master (16 <- 17)
@@ -21,16 +24,27 @@ static void uart_bridge_task(void *arg)
     uint8_t buf[128];
 
     while (1) {
-        // читаємо, максимум 127 байт, 50мс таймаут
+        // читаємо, максимум 127 байт, 20мс таймаут
         int n = uart_read_bytes(ROOT_UART_PORT,
-                                buf,
+                                (uint8_t*)buf,
                                 sizeof(buf) - 1,
-                                pdMS_TO_TICKS(50));
+                                pdMS_TO_TICKS(20));
         if (n > 0) {
             buf[n] = 0;  // робимо "рядок" для логів
 
             // можна тут почистити \r\n/пробіли, якщо хочеш
             ESP_LOGI(TAGU, "RX UART: '%s'", (char *)buf);
+
+                    // якщо з Arduino прилетів тільки \r\n, можна ще підчистити:
+            while (n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) {
+                buf[--n] = '\0';
+            }
+            
+            if (n == 0) {
+                continue;
+            }
+
+            mesh_root_broadcast_text((const char*)buf);
 
             // TODO: тут можеш парсити команду і
             // або шити її в esp_mesh_send(),

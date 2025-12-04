@@ -83,10 +83,6 @@ static void mesh_tx_task(void *arg);
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
 
-static void root_broadcast_task(void *arg);
-static esp_err_t root_broadcast_start(void);
-
-
 // -----------------------------SINGLE_SENDER---------------------------------------
 static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
 
@@ -281,107 +277,6 @@ static void mesh_rx_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Root broadcast task – раз в 10 сек шле пакет ВСІМ нодам  */
-/* -------------------------------------------------------------------------- */
-
-static void root_broadcast_task(void *arg)
-{
-	mesh_packet_t pkt;
-	mesh_data_t   data;
-	esp_err_t     err;
-	uint32_t      counter = 0;
-
-	// таблиця роутів (MAC усіх відомих нод)
-	mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
-	int route_table_size = 0;
-
-	data.data  = (uint8_t *)&pkt;
-	data.proto = MESH_PROTO_BIN;
-	data.tos   = MESH_TOS_P2P;
-
-	while (is_running) {
-		vTaskDelay(pdMS_TO_TICKS(10 * 1000));   // 10 секунд
-
-		// Підстраховка: шлемо тільки якщо ми root і підключені
-		if (!esp_mesh_is_root() || !is_mesh_connected) {
-			continue;
-		}
-
-		// обновляємо routing table
-		route_table_size = 0;
-		err = esp_mesh_get_routing_table(
-		          route_table,
-		          CONFIG_MESH_ROUTE_TABLE_SIZE * sizeof(mesh_addr_t),
-		          &route_table_size);
-
-		if (err != ESP_OK) {
-			ESP_LOGE(MESH_TAG,
-			         "get_routing_table err=0x%x (%s)",
-			         err, esp_err_to_name(err));
-			continue;
-		}
-
-		if (route_table_size == 0) {
-			ESP_LOGW(MESH_TAG, "root_bcast: routing table is empty");
-			continue;
-		}
-
-		counter++;
-
-		// формуємо пакет
-		memset(&pkt, 0, sizeof(pkt));
-		pkt.magic   = MESH_PKT_MAGIC;
-		pkt.version = MESH_PKT_VERSION;
-		pkt.type    = MESH_PKT_TYPE_TEXT;   // можна лишити TEXT
-		pkt.counter = counter;
-
-		esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-
-		snprintf(pkt.payload, sizeof(pkt.payload),
-		         "BCAST %lu", (unsigned long)counter);
-
-		data.size = sizeof(pkt);
-
-		ESP_LOGI(MESH_TAG,
-		         "ROOT BCAST cnt=%lu to %d nodes",
-		         (unsigned long)counter, route_table_size);
-
-		for (int i = 0; i < route_table_size; ++i) {
-			err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
-			if (err != ESP_OK) {
-				ESP_LOGE(MESH_TAG,
-				         "bcast -> " MACSTR " err=0x%x (%s)",
-				         MAC2STR(route_table[i].addr),
-				         err, esp_err_to_name(err));
-			}
-		}
-	}
-
-	vTaskDelete(NULL);
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Старт root-broadcast таски (один раз на кожному девайсі)                  */
-/* -------------------------------------------------------------------------- */
-
-static esp_err_t root_broadcast_start(void)
-{
-	static bool started = false;
-
-	if (!started) {
-		started = true;
-		xTaskCreate(root_broadcast_task,
-		            "root_bcast",
-		            4096,        // зараз 4 KB, потім зменшиш, дивлячись на HW
-		            NULL,
-		            5,
-		            NULL);
-		ESP_LOGI(MESH_TAG, "root_broadcast_task started");
-	}
-	return ESP_OK;
-}
-
-/* -------------------------------------------------------------------------- */
 /*  Запуск задач TX/RX один раз                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -498,7 +393,6 @@ static void mesh_event_handler(void *arg,
 			esp_netif_dhcpc_stop(netif_sta);
 			esp_netif_dhcpc_start(netif_sta);
 
-            root_broadcast_start();
 		}
 		mesh_comm_start();
 	}
