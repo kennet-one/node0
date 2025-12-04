@@ -16,6 +16,7 @@
 
 #include "legacy_proto.h"
 #include "stack_monitor.h"
+#include "uart_bridge.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -657,4 +658,5 @@ void app_main(void)
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
 
+	ESP_ERROR_CHECK(uart_bridge_init());
 }
