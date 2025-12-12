@@ -17,6 +17,8 @@
 #include "legacy_proto.h"
 #include "stack_monitor.h"
 #include "uart_bridge.h"
+#include "log_http_server.h"
+
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -470,7 +472,13 @@ static void ip_event_handler(void *arg,
 	ESP_LOGI(MESH_TAG,
 	         "<IP_EVENT_STA_GOT_IP> IP:" IPSTR,
 	         IP2STR(&ev->ip_info.ip));
+
+	// Якщо ми root – запускаємо HTTP-сервер
+	if (esp_mesh_is_root()) {
+		log_http_server_start();
+	}
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*  app_main – ініціалізація mesh + Wi-Fi                                     */
@@ -554,4 +562,5 @@ void app_main(void)
 
 	uart_bridge_init();
 	uart_bridge_start();
+	log_http_server_init();
 }
