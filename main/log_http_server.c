@@ -134,27 +134,41 @@ esp_err_t log_http_server_init(void)
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-	const char *html_head =
-		"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+	const char *html =
+		"<!DOCTYPE html>"
+		"<html>"
+		"<head>"
+		"<meta charset=\"utf-8\">"
 		"<title>ESP-MESH root log</title>"
-		"<meta http-equiv=\"refresh\" content=\"2\">"
-		"<style>body{font-family:monospace;background:#111;color:#eee;}pre{white-space:pre-wrap;}</style>"
-		"</head><body><h2>ESP-MESH root log</h2><pre>";
+		"<style>"
+		"body{font-family:monospace;background:#111;color:#eee;margin:0;padding:0;}"
+		"#log{white-space:pre-wrap;padding:8px;}"
+		"</style>"
+		"</head>"
+		"<body>"
+		"<h2 style=\"margin:8px;\">ESP-MESH root log (live)</h2>"
+		"<pre id=\"log\">Loading...</pre>"
+		"<script>"
+		"function updateLog(){"
+			"fetch('/log').then(function(r){return r.text();}).then(function(t){"
+				"var pre=document.getElementById('log');"
+				"pre.textContent=t;"
+				"window.scrollTo(0, document.body.scrollHeight);"
+			"}).catch(function(e){"
+				"console.error(e);"
+			"});"
+		"}"
+		"updateLog();"
+		"setInterval(updateLog, 500);"  // 500 мс – можна змінити
+		"</script>"
+		"</body>"
+		"</html>";
 
 	httpd_resp_set_type(req, "text/html; charset=utf-8");
-	httpd_resp_sendstr_chunk(req, html_head);
-
-	size_t len = 0;
-	char *snapshot = log_buffer_snapshot(&len);
-	if (snapshot && len > 0) {
-		httpd_resp_send_chunk(req, snapshot, len);
-	}
-	free(snapshot);
-
-	httpd_resp_sendstr_chunk(req, "</pre></body></html>");
-	httpd_resp_sendstr_chunk(req, NULL); // кінець chunked-відповіді
+	httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 	return ESP_OK;
 }
+
 
 // /log – чистий текст без HTML
 static esp_err_t log_get_handler(httpd_req_t *req)
