@@ -19,12 +19,8 @@
 #include "uart_bridge.h"
 #include "log_http_server.h"
 #include "time_sync.h"
+#include "log_time_vprintf.h"
 
-#define LOGI_TIME(tag, fmt, ...) do { \
-	char _ts[24]; \
-	time_sync_format(_ts, sizeof(_ts)); \
-	ESP_LOGI(tag, "[%s] " fmt, _ts, ##__VA_ARGS__); \
-} while (0)
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
 /* -------------------------------------------------------------------------- */
@@ -155,7 +151,7 @@ static void mesh_single_tx_task(void *arg)
                      (unsigned long)counter,
                      pkt.payload);
         } else {
-            LOGI_TIME(MESH_TAG,
+            ESP_LOGE(MESH_TAG,
                      "mesh_send_single failed: 0x%x (%s)",
                      err, esp_err_to_name(err));
         }
@@ -493,7 +489,7 @@ static void ip_event_handler(void *arg,
 void app_main(void)
 {
 	//ESP_ERROR_CHECK(mesh_light_init());   // якщо не треба LED – можна забрати
-
+	log_time_vprintf_start();
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -569,4 +565,5 @@ void app_main(void)
 	uart_bridge_init();
 	uart_bridge_start();
 	log_http_server_init();
+	
 }
