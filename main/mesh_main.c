@@ -18,8 +18,13 @@
 #include "stack_monitor.h"
 #include "uart_bridge.h"
 #include "log_http_server.h"
+#include "time_sync.h"
 
-
+#define LOGI_TIME(tag, fmt, ...) do { \
+	char _ts[24]; \
+	time_sync_format(_ts, sizeof(_ts)); \
+	ESP_LOGI(tag, "[%s] " fmt, _ts, ##__VA_ARGS__); \
+} while (0)
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
 /* -------------------------------------------------------------------------- */
@@ -150,7 +155,7 @@ static void mesh_single_tx_task(void *arg)
                      (unsigned long)counter,
                      pkt.payload);
         } else {
-            ESP_LOGE(MESH_TAG,
+            LOGI_TIME(MESH_TAG,
                      "mesh_send_single failed: 0x%x (%s)",
                      err, esp_err_to_name(err));
         }
@@ -388,7 +393,6 @@ static void mesh_event_handler(void *arg,
 		         MAC2STR(id.addr),
 		         conn->duty);
 		last_layer = mesh_layer;
-		//mesh_connected_indicator(mesh_layer);
 		is_mesh_connected = true;
 
 		if (esp_mesh_is_root()) {
@@ -472,6 +476,8 @@ static void ip_event_handler(void *arg,
 	ESP_LOGI(MESH_TAG,
 	         "<IP_EVENT_STA_GOT_IP> IP:" IPSTR,
 	         IP2STR(&ev->ip_info.ip));
+	
+	time_sync_start();	
 
 	// Якщо ми root – запускаємо HTTP-сервер
 	if (esp_mesh_is_root()) {
