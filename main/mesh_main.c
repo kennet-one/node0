@@ -244,10 +244,6 @@ static void mesh_rx_task(void *arg)
 			         MAC2STR(from.addr));
 			continue;
 		}
-		if (pkt.type == MESH_PKT_TYPE_TIME) {
-			mesh_time_sync_handle_packet(&pkt);
-			continue;
-		}
 
 		if (pkt.type == MESH_PKT_TYPE_TEXT) {
 			// Гарантуємо, що payload закінчується '\0'
@@ -467,7 +463,7 @@ static void ip_event_handler(void *arg,
 	
 	time_sync_start();	
 
-	mesh_time_sync_root_start(MESH_TIME_SYNC_PERIOD_MS);
+	mesh_time_sync_root_start(5000);
 
 	// Якщо ми root – запускаємо HTTP-сервер
 	if (esp_mesh_is_root()) {
@@ -484,6 +480,7 @@ void app_main(void)
 {
 	//ESP_ERROR_CHECK(mesh_light_init());   // якщо не треба LED – можна забрати
 	log_time_vprintf_start();
+	
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());

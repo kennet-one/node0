@@ -1,22 +1,24 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 #include "esp_err.h"
-#include "mesh_proto.h"
 
-#ifndef MESH_TIME_SYNC_PERIOD_MS
-	#define MESH_TIME_SYNC_PERIOD_MS	60000	// 1 хв; потім легко поміняєш на 10 хв
+#ifdef __cplusplus
+extern "C" {
 #endif
 
-// Викликати на ВСІХ нодах (root і не-root). Просто готує TZ.
-void mesh_time_sync_init(void);
+// Ми займаємо type=2 під TIME
+#define MESH_TIME_SYNC_TYPE_TIME	2
 
-// ТІЛЬКИ на root: стартує задачу, яка раз на period_ms розсилає час всім.
-esp_err_t mesh_time_sync_root_start(uint32_t period_ms);
+void		mesh_time_sync_init(void);
 
-// Викликати в RX, коли прийшов пакет type=TIME
-void mesh_time_sync_handle_packet(const mesh_packet_t *pkt);
+// Root: стартує таску, яка розсилає час всім нодам раз в period_ms
+esp_err_t	mesh_time_sync_root_start(uint32_t period_ms);
 
-// Просто щоб бачити стан (опціонально)
-bool mesh_time_sync_has_time(void);
+// RX: викликаєш у mesh_rx_task, коли pkt.type == 2
+esp_err_t	mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len);
+
+#ifdef __cplusplus
+}
+#endif
