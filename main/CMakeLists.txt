@@ -6,5 +6,6 @@ idf_component_register(SRCS "time_sync.c" "log_http_server.c" "stack_monitor.c" 
                         "log_http_server.c"
                         "time_sync.c"
                         "log_time_vprintf.c"
+                        "mesh_time_sync.c"
                     PRIV_REQUIRES esp_wifi esp_driver_gpio esp_http_server driver nvs_flash
                     INCLUDE_DIRS "." "include")

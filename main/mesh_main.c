@@ -20,6 +20,8 @@
 #include "log_http_server.h"
 #include "time_sync.h"
 #include "log_time_vprintf.h"
+#include "mesh_proto.h"
+#include "mesh_time_sync.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -53,20 +55,6 @@ static esp_netif_t *netif_sta       = NULL;
  *  src_mac  - MAC відправника
  *  payload  - невеликий текст (рядок з '\0' в кінці)
  */
-
-typedef struct __attribute__((packed)) {
-	uint8_t  magic;
-	uint8_t  version;
-	uint8_t  type;
-	uint8_t  reserved;
-	uint32_t counter;
-	uint8_t  src_mac[6];
-	char     payload[32];
-} mesh_packet_t;
-
-#define MESH_PKT_MAGIC   0xA5
-#define MESH_PKT_VERSION 1
-#define MESH_PKT_TYPE_TEXT 1
 
 /* -------------------------------------------------------------------------- */
 /*  Прототипи                                                                 */
@@ -254,6 +242,10 @@ static void mesh_rx_task(void *arg)
 			ESP_LOGW(MESH_TAG,
 			         "RX unknown packet from " MACSTR,
 			         MAC2STR(from.addr));
+			continue;
+		}
+		if (pkt.type == MESH_PKT_TYPE_TIME) {
+			mesh_time_sync_handle_packet(&pkt);
 			continue;
 		}
 
@@ -475,6 +467,8 @@ static void ip_event_handler(void *arg,
 	
 	time_sync_start();	
 
+	mesh_time_sync_root_start(MESH_TIME_SYNC_PERIOD_MS);
+
 	// Якщо ми root – запускаємо HTTP-сервер
 	if (esp_mesh_is_root()) {
 		log_http_server_start();
@@ -565,5 +559,6 @@ void app_main(void)
 	uart_bridge_init();
 	uart_bridge_start();
 	log_http_server_init();
+	mesh_time_sync_init();
 	
 }
