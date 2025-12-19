@@ -124,12 +124,7 @@ static void mesh_time_root_task(void *arg)
 
 	while (true) {
 
-		// якщо ще не слали перший раз — перевіряєм частіше
-		if (!first_sent) {
-			vTaskDelay(pdMS_TO_TICKS(1000));
-		} else {
-			vTaskDelayUntil(&last, pdMS_TO_TICKS(s_period_ms));
-		}
+		vTaskDelayUntil(&last, pdMS_TO_TICKS(s_period_ms));
 
 		if (!esp_mesh_is_root()) continue;
 		if (!is_time_valid_now()) continue;
@@ -153,23 +148,20 @@ static void mesh_time_root_task(void *arg)
 
 esp_err_t mesh_time_sync_root_start(uint32_t period_ms)
 {
-	mesh_time_sync_init();
-	mesh_time_sync_root_set_period_ms(period_ms);
-
-	if (s_root_task_started) return ESP_OK;
-	s_root_task_started = true;
+	//mesh_time_sync_init();
 
 	if (xTaskCreate(mesh_time_root_task, "mesh_time_tx", 4096, NULL, 4, NULL) != pdPASS) {
-		s_root_task_started = false;
 		return ESP_ERR_NO_MEM;
 	}
 
+	ESP_LOGI(TAG, "TIME task started, period=%u ms", (unsigned)s_period_ms);
 	return ESP_OK;
 }
 
+
 esp_err_t mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len)
 {
-	mesh_time_sync_init();
+	//mesh_time_sync_init();
 
 	if (!pkt_buf || pkt_len < sizeof(mesh_packet_wire_t)) {
 		return ESP_ERR_INVALID_SIZE;
