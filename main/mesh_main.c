@@ -209,63 +209,90 @@ static void mesh_tx_task(void *arg)
 /* -------------------------------------------------------------------------- */
 /*  RX task – слухаємо пакети від інших нод                                   */
 /* -------------------------------------------------------------------------- */
-
 static void mesh_rx_task(void *arg)
 {
-	mesh_packet_t pkt;
-	mesh_data_t   data;
-	mesh_addr_t   from;
-	int           flag;
-	esp_err_t     err;
+	uint8_t      rx_buf[256];
+	mesh_data_t  data;
+	mesh_addr_t  from;
+	int          flag = 0;
+	esp_err_t    err;
 
-	data.data = (uint8_t *)&pkt;
-	data.size = sizeof(pkt);
+	memset(&data, 0, sizeof(data));
+	data.data = rx_buf;
+	data.size = sizeof(rx_buf);
 
 	while (is_running) {
 
-		data.size = sizeof(pkt);
+		data.size = sizeof(rx_buf);
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
-			ESP_LOGE(MESH_TAG,
-			         "esp_mesh_recv failed: 0x%x (%s)",
-			         err, esp_err_to_name(err));
-			continue;
-		}
-		if (data.size < sizeof(mesh_packet_t)) {
-			ESP_LOGW(MESH_TAG,
-			         "RX short packet: %d bytes", data.size);
+			ESP_LOGE(MESH_TAG, "esp_mesh_recv failed: 0x%x (%s)", err, esp_err_to_name(err));
 			continue;
 		}
 
-		// Перевіряємо, що це "наш" формат
-		if (pkt.magic != MESH_PKT_MAGIC || pkt.version != MESH_PKT_VERSION) {
-			ESP_LOGW(MESH_TAG,
-			         "RX unknown packet from " MACSTR,
-			         MAC2STR(from.addr));
+		if (data.size < sizeof(mesh_pkt_hdr_t)) {
+			ESP_LOGW(MESH_TAG, "RX too short: %d bytes", data.size);
 			continue;
 		}
 
-		if (pkt.type == MESH_PKT_TYPE_TEXT) {
-			// Гарантуємо, що payload закінчується '\0'
-			pkt.payload[sizeof(pkt.payload) - 1] = '\0';
-			ESP_LOGI(MESH_TAG,
-			         "RX TEXT: cnt=%lu from " MACSTR
-			         " (src_mac=" MACSTR "), payload=\"%s\"",
-			         (unsigned long)pkt.counter,
-			         MAC2STR(from.addr),
-			         MAC2STR(pkt.src_mac),
-			         pkt.payload);
-            legacy_handle_text(pkt.payload);
-		} else {
-			ESP_LOGI(MESH_TAG,
-			         "RX type=%u cnt=%lu from " MACSTR,
-			         pkt.type,
-			         (unsigned long)pkt.counter,
-			         MAC2STR(from.addr));
+		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
+
+		// наш протокол?
+		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION) {
+
+			// 1) NodeInfo (tag) — для меню
+			if (h->type == MESH_LOG_TYPE_NODEINFO) {
+				if (data.size >= sizeof(mesh_nodeinfo_packet_t)) {
+					const mesh_nodeinfo_packet_t *p = (const mesh_nodeinfo_packet_t *)rx_buf;
+					log_http_server_node_seen(p->h.src_mac, p->tag);
+				}
+				continue;
+			}
+
+			// 2) Log line — пишемо в буфер тільки якщо ця нода вибрана
+			if (h->type == MESH_LOG_TYPE_LINE) {
+				if (data.size >= sizeof(mesh_log_line_packet_t)) {
+					const mesh_log_line_packet_t *p = (const mesh_log_line_packet_t *)rx_buf;
+					log_http_server_node_seen(p->h.src_mac, p->tag);          // щоб нода була у списку
+					log_http_server_remote_line(p->h.src_mac, p->tag, p->line); // буферизація (всередині є фільтр по selected)
+				}
+				continue;
+			}
+
+			// 3) Time sync (type=2) — якщо хочеш, щоб root теж це приймав тут
+			if (h->type == MESH_TIME_SYNC_TYPE_TIME) {
+				mesh_time_sync_handle_rx(rx_buf, data.size);
+				continue;
+			}
+
+			// 4) Старий TEXT (type=1) — твоя поточна логіка
+			if (h->type == MESH_PKT_TYPE_TEXT) {
+				if (data.size >= sizeof(mesh_packet_t)) {
+					const mesh_packet_t *p = (const mesh_packet_t *)rx_buf;
+					char payload[33];
+					memcpy(payload, p->payload, 32);
+					payload[32] = '\0';
+
+					ESP_LOGI(MESH_TAG, "RX TEXT: cnt=%lu from " MACSTR " payload=\"%s\"",
+						(unsigned long)p->counter, MAC2STR(from.addr), payload);
+
+					// якщо ще треба твій legacy_handle_text() — викликай тут
+					legacy_handle_text(payload);
+				}
+				continue;
+			}
+
+			// інші типи нашого протоколу
+			ESP_LOGI(MESH_TAG, "RX type=%u from " MACSTR " len=%u", h->type, MAC2STR(from.addr), (unsigned)data.size);
+			continue;
 		}
+
+		// не наш протокол — можеш або ігнор, або стару обробку
+		ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " len=%u", MAC2STR(from.addr), (unsigned)data.size);
 	}
 	vTaskDelete(NULL);
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*  Запуск задач TX/RX один раз                                               */
