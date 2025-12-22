@@ -117,6 +117,14 @@ static void log_buffer_append_line(const char *line, size_t len)
 {
 	if (!line || len == 0) return;
 
+	// прибрати кінцеві \r \n
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+		len--;
+	}
+
+	// якщо після trim нічого не лишилось — не пишемо
+	if (len == 0) return;
+
 	portENTER_CRITICAL(&s_log_lock);
 	{
 		uint32_t idx = s_write_idx % LOG_HTTP_LINES;
@@ -130,6 +138,7 @@ static void log_buffer_append_line(const char *line, size_t len)
 	}
 	portEXIT_CRITICAL(&s_log_lock);
 }
+
 
 static char *log_buffer_snapshot_since(uint32_t from, size_t *out_len, uint32_t *out_next, bool *out_reset)
 {
@@ -565,13 +574,15 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<style>\n"
 		"body{font-family:monospace;background:#111;color:#ddd;margin:0;padding:0}\n"
 		"#top{padding:10px;background:#1b1b1b;position:sticky;top:0;display:flex;gap:10px;align-items:center}\n"
-		"#log{white-space:pre;overflow:auto;height:calc(100vh - 60px);padding:10px}\n"
+		"#log{overflow:auto;height:calc(100vh - 60px);padding:10px;white-space:pre}\n"
+		".ln{white-space:pre;margin:0;padding:0}\n"
 		"button,select{font-family:monospace;font-size:14px}\n"
 		".lvI{color:#00ff7f}\n"
 		".lvW{color:#ffcc00}\n"
 		".lvE{color:#ff4d4d}\n"
 		".lvD{color:#66a3ff}\n"
 		".lvV{color:#aaaaaa}\n"
+		".ts{color:#66a3ff}\n"
 		"</style></head>\n"
 		"<body>\n"
 		"<div id='top'>\n"
@@ -587,10 +598,9 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let lastNodes='';\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
-		"function clsByLine(l){\n"
-		"  const m=l.match(/\\]\\s+([IWEVD])\\s/);\n"
-		"  if(!m) return '';\n"
-		"  const c=m[1];\n"
+		"function lvlClassByRest(rest){\n"
+		"  if(!rest||rest.length===0) return '';\n"
+		"  const c=rest[0];\n"
 		"  if(c==='I') return 'lvI';\n"
 		"  if(c==='W') return 'lvW';\n"
 		"  if(c==='E') return 'lvE';\n"
@@ -601,11 +611,27 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function renderChunk(text){\n"
 		"  const lines=text.split('\\n');\n"
 		"  let out='';\n"
-		"  for(const l of lines){\n"
-		"    if(l.length===0){out+='\\n';continue;}\n"
-		"    const c=clsByLine(l);\n"
-		"    if(c) out+=`<span class='${c}'>${esc(l)}</span>\\n`;\n"
-		"    else out+=esc(l)+'\\n';\n"
+		"  for(let raw of lines){\n"
+		"    if(raw===undefined||raw===null) continue;\n"
+		"    raw=raw.replace(/\\r/g,'');\n"
+		"    if(raw.trim().length===0) continue; // <-- прибирає фейкові пусті рядки\n"
+		"\n"
+		"    let ts='';\n"
+		"    let rest=raw;\n"
+		"    if(raw[0]==='['){\n"
+		"      const k=raw.indexOf(']');\n"
+		"      if(k>0 && k<40){\n"
+		"        ts=raw.slice(0,k+1);\n"
+		"        rest=raw.slice(k+1).trimStart();\n"
+		"      }\n"
+		"    }\n"
+		"\n"
+		"    const cls=lvlClassByRest(rest);\n"
+		"    if(ts){\n"
+		"      out+=`<div class=\"ln ${cls}\"><span class=\"ts\">${esc(ts)}</span> ${esc(rest)}</div>`;\n"
+		"    }else{\n"
+		"      out+=`<div class=\"ln ${cls}\">${esc(rest)}</div>`;\n"
+		"    }\n"
 		"  }\n"
 		"  return out;\n"
 		"}\n"
@@ -625,11 +651,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"async function loadNodes(){\n"
 		"  const s=document.getElementById('nodeSel');\n"
-		"  if(document.activeElement===s) return; // не чіпай коли меню відкрите/у фокусі\n"
+		"  if(document.activeElement===s) return;\n"
 		"  try{\n"
 		"    const r=await fetch('/nodes');\n"
 		"    const txt=await r.text();\n"
-		"    if(txt===lastNodes) return; // нічого не мінялось\n"
+		"    if(txt===lastNodes) return;\n"
 		"    lastNodes=txt;\n"
 		"    const j=JSON.parse(txt);\n"
 		"    const cur=j.selected_mac;\n"
@@ -641,7 +667,6 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"      o.textContent=n.tag+' ['+n.mac+']';\n"
 		"      s.appendChild(o);\n"
 		"    }\n"
-		"    // відновити поточний вибір (без user change)\n"
 		"    s.value = cur || prev;\n"
 		"  }catch(e){}\n"
 		"}\n"
@@ -658,7 +683,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  document.getElementById('log').innerHTML='';\n"
 		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
-		"  if(!e.isTrusted) return; // тільки реальний клік користувача\n"
+		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
@@ -671,6 +696,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 	httpd_resp_set_type(req, "text/html");
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
+
 
 /* ----------------- Public API ----------------- */
 
@@ -697,7 +723,7 @@ esp_err_t log_http_server_start(void)
 	if (s_http_server) return ESP_OK;
 
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-	config.stack_size = 4096;
+	config.stack_size = 5128;
 	config.lru_purge_enable = true;
 
 	esp_err_t err = httpd_start(&s_http_server, &config);

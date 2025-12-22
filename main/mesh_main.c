@@ -259,12 +259,6 @@ static void mesh_rx_task(void *arg)
 				continue;
 			}
 
-			// 3) Time sync (type=2) — якщо хочеш, щоб root теж це приймав тут
-			if (h->type == MESH_TIME_SYNC_TYPE_TIME) {
-				mesh_time_sync_handle_rx(rx_buf, data.size);
-				continue;
-			}
-
 			// 4) Старий TEXT (type=1) — твоя поточна логіка
 			if (h->type == MESH_PKT_TYPE_TEXT) {
 				if (data.size >= sizeof(mesh_packet_t)) {
