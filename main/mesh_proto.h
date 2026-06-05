@@ -46,6 +46,12 @@ typedef struct __attribute__((packed)) {
 	char		tag[16];		// MESH_TAG (обрізаємо якщо довше)
 } mesh_nodeinfo_packet_t;
 
+typedef struct __attribute__((packed)) {
+	mesh_pkt_hdr_t	h;
+	char		tag[16];		// MESH_TAG
+	uint32_t	uptime_s;		// seconds since node boot
+} mesh_nodeinfo_v2_packet_t;
+
 // Одна строка лога
 typedef struct __attribute__((packed)) {
 	mesh_pkt_hdr_t	h;

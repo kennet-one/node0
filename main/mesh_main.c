@@ -12,6 +12,7 @@
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 #include "esp_netif.h"
+#include "esp_private/wifi_os_adapter.h"
 #include "nvs_flash.h"
 #include "lwip/ip4_addr.h"
 
@@ -30,6 +31,7 @@
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
+#define NODE0_MTXON_STACK_EXTRA_WORDS (500U)
 //#define FIXED_ROOT  1   // на node0
 
 static const char *MESH_TAG = "node0";
@@ -42,6 +44,92 @@ static bool       is_mesh_connected = false;
 static mesh_addr_t mesh_parent_addr;
 static int        mesh_layer        = -1;
 static esp_netif_t *netif_sta       = NULL;
+
+typedef int32_t (*node0_wifi_task_create_fn_t)(void *task_func,
+                                               const char *name,
+                                               uint32_t stack_depth,
+                                               void *param,
+                                               uint32_t prio,
+                                               void *task_handle);
+
+typedef int32_t (*node0_wifi_task_create_pinned_fn_t)(void *task_func,
+                                                      const char *name,
+                                                      uint32_t stack_depth,
+                                                      void *param,
+                                                      uint32_t prio,
+                                                      void *task_handle,
+                                                      uint32_t core_id);
+
+static node0_wifi_task_create_fn_t s_wifi_task_create_orig = NULL;
+static node0_wifi_task_create_pinned_fn_t s_wifi_task_create_pinned_orig = NULL;
+static bool s_wifi_task_stack_patch_installed = false;
+
+static uint32_t node0_wifi_stack_depth_for_task(const char *name,
+                                                uint32_t stack_depth)
+{
+	if (name && strcmp(name, "MTXON") == 0) {
+		return stack_depth + NODE0_MTXON_STACK_EXTRA_WORDS;
+	}
+
+	return stack_depth;
+}
+
+static int32_t node0_wifi_task_create_wrapper(void *task_func,
+                                              const char *name,
+                                              uint32_t stack_depth,
+                                              void *param,
+                                              uint32_t prio,
+                                              void *task_handle)
+{
+	return s_wifi_task_create_orig(
+	    task_func,
+	    name,
+	    node0_wifi_stack_depth_for_task(name, stack_depth),
+	    param,
+	    prio,
+	    task_handle);
+}
+
+static int32_t node0_wifi_task_create_pinned_wrapper(void *task_func,
+                                                     const char *name,
+                                                     uint32_t stack_depth,
+                                                     void *param,
+                                                     uint32_t prio,
+                                                     void *task_handle,
+                                                     uint32_t core_id)
+{
+	return s_wifi_task_create_pinned_orig(
+	    task_func,
+	    name,
+	    node0_wifi_stack_depth_for_task(name, stack_depth),
+	    param,
+	    prio,
+	    task_handle,
+	    core_id);
+}
+
+static void node0_install_wifi_task_stack_patch(void)
+{
+	if (s_wifi_task_stack_patch_installed) {
+		return;
+	}
+
+	if (!g_wifi_osi_funcs._task_create ||
+	    !g_wifi_osi_funcs._task_create_pinned_to_core) {
+		ESP_LOGW(MESH_TAG, "MTXON stack patch skipped: Wi-Fi OS adapter missing task hooks");
+		return;
+	}
+
+	s_wifi_task_create_orig = g_wifi_osi_funcs._task_create;
+	s_wifi_task_create_pinned_orig = g_wifi_osi_funcs._task_create_pinned_to_core;
+	g_wifi_osi_funcs._task_create = node0_wifi_task_create_wrapper;
+	g_wifi_osi_funcs._task_create_pinned_to_core = node0_wifi_task_create_pinned_wrapper;
+	s_wifi_task_stack_patch_installed = true;
+
+	ESP_LOGI(MESH_TAG,
+	         "MTXON stack patch installed: +%u words",
+	         (unsigned)NODE0_MTXON_STACK_EXTRA_WORDS);
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Мінімальний власний протокол                                              */
@@ -352,7 +440,10 @@ static void mesh_rx_task(void *arg)
 
 			// 1) NodeInfo (tag) — для меню
 			if (h->type == MESH_LOG_TYPE_NODEINFO) {
-				if (data.size >= sizeof(mesh_nodeinfo_packet_t)) {
+				if (data.size >= sizeof(mesh_nodeinfo_v2_packet_t)) {
+					const mesh_nodeinfo_v2_packet_t *p = (const mesh_nodeinfo_v2_packet_t *)rx_buf;
+					log_http_server_node_seen_uptime(p->h.src_mac, p->tag, true, p->uptime_s);
+				} else if (data.size >= sizeof(mesh_nodeinfo_packet_t)) {
 					const mesh_nodeinfo_packet_t *p = (const mesh_nodeinfo_packet_t *)rx_buf;
 					log_http_server_node_seen(p->h.src_mac, p->tag);
 				}
@@ -630,6 +721,7 @@ void app_main(void)
 	    esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
 
 	// Wi-Fi
+	node0_install_wifi_task_stack_patch();
 	wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 	ESP_ERROR_CHECK(

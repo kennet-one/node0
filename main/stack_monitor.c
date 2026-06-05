@@ -198,7 +198,7 @@ void stack_monitor_start(UBaseType_t priority)
 	BaseType_t ok = xTaskCreate(
 			stack_monitor_task,
 			"stack_mon",
-			5128,			// стек монітора
+			6000,			// стек монітора
 			NULL,
 			priority,
 			NULL);

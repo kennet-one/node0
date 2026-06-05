@@ -11,6 +11,7 @@
 #include "esp_http_server.h"
 #include "esp_err.h"
 #include "esp_mesh.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -80,6 +81,9 @@ typedef struct {
 	uint8_t mac[6];
 	char tag[16];
 	uint32_t last_seen_ms;
+	bool uptime_valid;
+	uint32_t uptime_s;
+	uint32_t uptime_seen_ms;
 } node_ent_t;
 
 static node_ent_t s_nodes[LOG_HTTP_MAX_NODES];
@@ -106,6 +110,11 @@ static uint32_t ms_now(void)
 	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+static uint32_t local_uptime_s(void)
+{
+	return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
 {
 	return memcmp(a, b, 6) == 0;
@@ -127,6 +136,42 @@ static void copy_tag(char *dst, size_t dst_sz, const char *tag)
 	if (!dst || dst_sz == 0) return;
 	strncpy(dst, (tag && tag[0]) ? tag : "node", dst_sz - 1);
 	dst[dst_sz - 1] = '\0';
+}
+
+static uint32_t uptime_advanced_s(uint32_t uptime_s, uint32_t uptime_seen_ms, uint32_t now_ms)
+{
+	return uptime_s + ((uint32_t)(now_ms - uptime_seen_ms) / 1000U);
+}
+
+static bool node_uptime_for_mac(const uint8_t mac[6], uint32_t *uptime_s)
+{
+	if (!mac || !uptime_s) return false;
+
+	if (mac_eq(mac, s_local_mac)) {
+		*uptime_s = local_uptime_s();
+		return true;
+	}
+
+	bool valid = false;
+	uint32_t value = 0;
+	uint32_t now = ms_now();
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac) && s_nodes[i].uptime_valid) {
+				valid = true;
+				value = uptime_advanced_s(s_nodes[i].uptime_s, s_nodes[i].uptime_seen_ms, now);
+				break;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	if (valid) {
+		*uptime_s = value;
+	}
+	return valid;
 }
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
@@ -681,19 +726,26 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 
 /* ----------------- Public API (з mesh RX) ----------------- */
 
-void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
+void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
+                                      bool uptime_valid, uint32_t uptime_s)
 {
 	if (!mac) return;
+
+	uint32_t now = ms_now();
 
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
 		for (uint32_t i = 0; i < s_nodes_count; i++) {
 			if (mac_eq(s_nodes[i].mac, mac)) {
 				if (tag && tag[0]) {
-					strncpy(s_nodes[i].tag, tag, sizeof(s_nodes[i].tag) - 1);
-					s_nodes[i].tag[sizeof(s_nodes[i].tag) - 1] = '\0';
+					copy_tag(s_nodes[i].tag, sizeof(s_nodes[i].tag), tag);
 				}
-				s_nodes[i].last_seen_ms = ms_now();
+				s_nodes[i].last_seen_ms = now;
+				if (uptime_valid) {
+					s_nodes[i].uptime_valid = true;
+					s_nodes[i].uptime_s = uptime_s;
+					s_nodes[i].uptime_seen_ms = now;
+				}
 				portEXIT_CRITICAL(&s_nodes_lock);
 				return;
 			}
@@ -701,13 +753,20 @@ void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
 
 		if (s_nodes_count < LOG_HTTP_MAX_NODES) {
 			mac_copy(s_nodes[s_nodes_count].mac, mac);
-			strncpy(s_nodes[s_nodes_count].tag, (tag && tag[0]) ? tag : "node", sizeof(s_nodes[s_nodes_count].tag) - 1);
-			s_nodes[s_nodes_count].tag[sizeof(s_nodes[s_nodes_count].tag) - 1] = '\0';
-			s_nodes[s_nodes_count].last_seen_ms = ms_now();
+			copy_tag(s_nodes[s_nodes_count].tag, sizeof(s_nodes[s_nodes_count].tag), tag);
+			s_nodes[s_nodes_count].last_seen_ms = now;
+			s_nodes[s_nodes_count].uptime_valid = uptime_valid;
+			s_nodes[s_nodes_count].uptime_s = uptime_valid ? uptime_s : 0;
+			s_nodes[s_nodes_count].uptime_seen_ms = now;
 			s_nodes_count++;
 		}
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
+}
+
+void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
+{
+	log_http_server_node_seen_uptime(mac, tag, false, 0);
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -724,39 +783,57 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 
 static esp_err_t http_nodes_get(httpd_req_t *req)
 {
-	char out[2048];
-	size_t pos = 0;
+	enum { NODES_JSON_MAX = 4096 };
+	char *out = (char *)malloc(NODES_JSON_MAX);
+	if (!out) {
+		httpd_resp_set_type(req, "text/plain");
+		return httpd_resp_send(req, "no-mem\n", HTTPD_RESP_USE_STRLEN);
+	}
 
-	pos += snprintf(out + pos, sizeof(out) - pos,
+	size_t pos = 0;
+	uint32_t local_uptime = local_uptime_s();
+
+	pos += snprintf(out + pos, NODES_JSON_MAX - pos,
 		"{\"selected_mac\":\"%02x%02x%02x%02x%02x%02x\",\"selected_tag\":\"%s\",\"nodes\":[",
 		s_sel_mac[0], s_sel_mac[1], s_sel_mac[2], s_sel_mac[3], s_sel_mac[4], s_sel_mac[5],
 		s_sel_tag
 	);
 
 	// local
-	pos += snprintf(out + pos, sizeof(out) - pos,
-		"{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\"}",
+	pos += snprintf(out + pos, NODES_JSON_MAX - pos,
+		"{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\","
+		"\"uptime_valid\":true,\"uptime_s\":%lu}",
 		s_local_mac[0], s_local_mac[1], s_local_mac[2], s_local_mac[3], s_local_mac[4], s_local_mac[5],
-		s_local_tag
+		s_local_tag,
+		(unsigned long)local_uptime
 	);
 
 	bool sel_in_list = mac_eq(s_sel_mac, s_local_mac);
+	uint32_t now = ms_now();
 
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
 		for (uint32_t i = 0; i < s_nodes_count; i++) {
-			if (pos + 128 >= sizeof(out)) break;
+			if (pos + 192 >= NODES_JSON_MAX) break;
 
 			// не дублюємо local
 			if (mac_eq(s_nodes[i].mac, s_local_mac)) continue;
 
 			if (mac_eq(s_nodes[i].mac, s_sel_mac)) sel_in_list = true;
 
-			pos += snprintf(out + pos, sizeof(out) - pos,
-				",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\"}",
+			bool uptime_valid = s_nodes[i].uptime_valid;
+			uint32_t uptime_s = uptime_valid
+				? uptime_advanced_s(s_nodes[i].uptime_s, s_nodes[i].uptime_seen_ms, now)
+				: 0;
+
+			pos += snprintf(out + pos, NODES_JSON_MAX - pos,
+				",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\","
+				"\"uptime_valid\":%s,\"uptime_s\":%lu}",
 				s_nodes[i].mac[0], s_nodes[i].mac[1], s_nodes[i].mac[2],
 				s_nodes[i].mac[3], s_nodes[i].mac[4], s_nodes[i].mac[5],
-				s_nodes[i].tag
+				s_nodes[i].tag,
+				uptime_valid ? "true" : "false",
+				(unsigned long)uptime_s
 			);
 		}
 	}
@@ -764,9 +841,10 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 
 	// якщо вибрана remote нода не в списку — додамо як option (щоб не скидалось)
 	if (!sel_in_list && !mac_eq(s_sel_mac, (uint8_t[6]){0,0,0,0,0,0})) {
-		if (pos + 128 < sizeof(out)) {
-			pos += snprintf(out + pos, sizeof(out) - pos,
-				",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\"}",
+		if (pos + 192 < NODES_JSON_MAX) {
+			pos += snprintf(out + pos, NODES_JSON_MAX - pos,
+				",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\","
+				"\"uptime_valid\":false,\"uptime_s\":0}",
 				s_sel_mac[0], s_sel_mac[1], s_sel_mac[2],
 				s_sel_mac[3], s_sel_mac[4], s_sel_mac[5],
 				s_sel_tag
@@ -774,10 +852,12 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 		}
 	}
 
-	pos += snprintf(out + pos, sizeof(out) - pos, "]}");
+	pos += snprintf(out + pos, NODES_JSON_MAX - pos, "]}");
 
 	httpd_resp_set_type(req, "application/json");
-	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	free(out);
+	return err;
 }
 
 static bool parse_mac_hex(const char *s, uint8_t mac[6])
@@ -939,6 +1019,9 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 
 	char mac_hex[13];
 	mac_to_hex(mac, mac_hex);
+	int slot_count = mac_eq(mac, s_local_mac) ? STACK_MONITOR_MAX_TASKS : -1;
+	uint32_t uptime_s = 0;
+	bool uptime_valid = node_uptime_for_mac(mac, &uptime_s);
 
 	size_t pos = 0;
 
@@ -949,7 +1032,12 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		pos = append_json_string(out, TASKS_JSON_MAX, pos, tag);
 		pos = append_fmt(out, TASKS_JSON_MAX, pos,
 		                 ",\"updated_ms\":0,\"age_ms\":0,"
-		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,\"tasks\":[]}");
+		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
+		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"uptime_s\":%lu,\"tasks\":[]}",
+		                 slot_count,
+		                 uptime_valid ? "true" : "false",
+		                 (unsigned long)uptime_s);
 	} else {
 		uint32_t now = ms_now();
 		uint32_t age_ms = (now >= snap.updated_ms) ? (now - snap.updated_ms) : 0;
@@ -960,11 +1048,16 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		pos = append_json_string(out, TASKS_JSON_MAX, pos, tag);
 		pos = append_fmt(out, TASKS_JSON_MAX, pos,
 		                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
-		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,\"tasks\":[",
+		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
+		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"uptime_s\":%lu,\"tasks\":[",
 		                 (unsigned long)snap.updated_ms,
 		                 (unsigned long)age_ms,
 		                 snap.cpu_valid ? "true" : "false",
-		                 (unsigned long)snap.cpu_load_x10);
+		                 (unsigned long)snap.cpu_load_x10,
+		                 slot_count,
+		                 uptime_valid ? "true" : "false",
+		                 (unsigned long)uptime_s);
 
 		for (uint32_t i = 0; i < snap.count && i < STACK_MONITOR_MAX_TASKS; i++) {
 			const stack_monitor_task_info_t *t = &snap.tasks[i];
@@ -1002,7 +1095,12 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"body.showTasks #tasks{display:block}\n"
 		".ln{white-space:pre;margin:0;padding:0}\n"
 		"button,select{font-family:monospace;font-size:14px}\n"
-		".taskTop{display:flex;justify-content:space-between;margin-bottom:8px;color:#eee}\n"
+		".taskTop{display:flex;justify-content:space-between;gap:8px;margin-bottom:8px;color:#eee}\n"
+		".taskLeft{display:flex;gap:6px;align-items:baseline;min-width:0}\n"
+		".taskNode{color:#00ff7f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n"
+		".taskUptime{color:#aaa;white-space:nowrap}\n"
+		".taskMeta{text-align:right;color:#aaa;font-size:11px;line-height:1.25;white-space:nowrap}\n"
+		".taskMac{color:#ddd}\n"
 		".cpu{color:#9ad;margin-bottom:8px}\n"
 		"table{width:100%;border-collapse:collapse;font-size:12px}\n"
 		"th,td{border-bottom:1px solid #2c2c2c;padding:3px 4px;text-align:right;white-space:nowrap}\n"
@@ -1026,7 +1124,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"</div>\n"
 		"<div id='main'>\n"
 		"<div id='log'></div>\n"
-		"<div id='tasks'><div class='taskTop'><b id='taskTitle'>Task manager</b><span id='taskAge'>...</span></div><div id='taskCpu' class='cpu'>...</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
@@ -1040,8 +1138,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
-		"function shortMac(m){return m?m.slice(-6):''}\n"
-		"function clearTasksPanel(){lastTasks='';document.getElementById('taskTitle').textContent='Task manager';document.getElementById('taskAge').textContent='...';document.getElementById('taskCpu').textContent='...';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function taskSlotsText(count,slots){return count+'/'+(slots>=0?slots:'?')}\n"
+		"function pad2(n){return String(n).padStart(2,'0')}\n"
+		"function fmtUptime(valid,sec){if(!valid)return 'up ?';sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;return 'up '+(d>0?d+'d ':'')+pad2(h)+':'+pad2(m)+':'+pad2(s)}\n"
+		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
+		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
 		"  const c=rest[0];\n"
@@ -1109,7 +1210,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    for(const n of j.nodes){\n"
 		"      const o=document.createElement('option');\n"
 		"      o.value=n.mac;\n"
-		"      o.textContent=n.tag+' ['+n.mac+']';\n"
+		"      o.textContent=n.tag||'node';\n"
 		"      s.appendChild(o);\n"
 		"    }\n"
 		"    s.value = cur || prev;\n"
@@ -1141,19 +1242,21 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    lastTasks=txt;\n"
 		"    const j=JSON.parse(txt);\n"
 		"    const box=document.getElementById('taskTable');\n"
-		"    document.getElementById('taskTitle').textContent='Task manager '+(j.tag||'node')+' '+shortMac(j.mac||mac);\n"
-		"    if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ?';document.getElementById('taskAge').textContent='no data';return;}\n"
+		"    const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
+		"    setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);\n"
+		"    if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';return;}\n"
 		"    const tasks=j.tasks||[];\n"
+		"    const slots=typeof j.slot_count==='number'?j.slot_count:-1;\n"
 		"    tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
 		"    let rows='';\n"
 		"    for(const t of tasks){\n"
 		"      const cls=stackCls(t.free_words);\n"
 		"      rows+='<tr'+(cls?' class='+cls:'')+'><td>'+esc(t.name)+'</td><td>'+t.prio+'</td><td>'+pct(t.cpu_x10)+'</td><td>'+t.free_words+'</td></tr>';\n"
 		"    }\n"
-		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / '+tasks.length+' tasks';\n"
-		"    document.getElementById('taskAge').textContent=Math.floor((j.age_ms||0)/1000)+'s ago';\n"
+		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);\n"
+		"    setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
 		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='tasks ERR'}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?'}\n"
 		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
