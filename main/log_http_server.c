@@ -18,6 +18,7 @@
 #include "freertos/portmacro.h"
 
 #include "mesh_proto.h"
+#include "stack_monitor.h"
 
 static const char *TAG = "log_http";
 
@@ -85,6 +86,19 @@ static node_ent_t s_nodes[LOG_HTTP_MAX_NODES];
 static uint32_t s_nodes_count = 0;
 static portMUX_TYPE s_nodes_lock = portMUX_INITIALIZER_UNLOCKED;
 
+typedef struct {
+	uint8_t mac[6];
+	char tag[16];
+	bool used;
+	bool valid;
+	bool staging_active;
+	stack_monitor_snapshot_t current;
+	stack_monitor_snapshot_t staging;
+} taskmon_ent_t;
+
+static taskmon_ent_t s_taskmon[LOG_HTTP_MAX_NODES];
+static portMUX_TYPE s_taskmon_lock = portMUX_INITIALIZER_UNLOCKED;
+
 /* ----------------- Helpers ----------------- */
 
 static uint32_t ms_now(void)
@@ -100,6 +114,289 @@ static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
 static void mac_copy(uint8_t dst[6], const uint8_t src[6])
 {
 	memcpy(dst, src, 6);
+}
+
+static void mac_to_hex(const uint8_t mac[6], char out[13])
+{
+	snprintf(out, 13, "%02x%02x%02x%02x%02x%02x",
+	         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void copy_tag(char *dst, size_t dst_sz, const char *tag)
+{
+	if (!dst || dst_sz == 0) return;
+	strncpy(dst, (tag && tag[0]) ? tag : "node", dst_sz - 1);
+	dst[dst_sz - 1] = '\0';
+}
+
+static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
+{
+	taskmon_ent_t *empty = NULL;
+
+	for (uint32_t i = 0; i < LOG_HTTP_MAX_NODES; i++) {
+		if (s_taskmon[i].used && mac_eq(s_taskmon[i].mac, mac)) {
+			return &s_taskmon[i];
+		}
+		if (!s_taskmon[i].used && !empty) {
+			empty = &s_taskmon[i];
+		}
+	}
+
+	if (!create || !empty) {
+		return NULL;
+	}
+
+	memset(empty, 0, sizeof(*empty));
+	empty->used = true;
+	mac_copy(empty->mac, mac);
+	copy_tag(empty->tag, sizeof(empty->tag), "node");
+	return empty;
+}
+
+static void taskmon_update_tag_locked(taskmon_ent_t *ent, const char *tag)
+{
+	if (ent && tag && tag[0]) {
+		copy_tag(ent->tag, sizeof(ent->tag), tag);
+	}
+}
+
+static void taskmon_start_locked(taskmon_ent_t *ent, const uint8_t mac[6], const char *tag)
+{
+	if (!ent) return;
+
+	memset(&ent->staging, 0, sizeof(ent->staging));
+	ent->staging.updated_ms = ms_now();
+	ent->staging.count = 0;
+	ent->staging.cpu_valid = false;
+	ent->staging_active = true;
+	mac_copy(ent->mac, mac);
+	taskmon_update_tag_locked(ent, tag);
+}
+
+static void taskmon_publish_locked(taskmon_ent_t *ent)
+{
+	if (!ent || !ent->staging_active) return;
+
+	ent->staging.updated_ms = ms_now();
+	ent->current = ent->staging;
+	ent->valid = true;
+	ent->staging_active = false;
+}
+
+static void taskmon_add_task_locked(taskmon_ent_t *ent, const uint8_t mac[6],
+                                    const char *tag, const stack_monitor_task_info_t *task)
+{
+	if (!ent || !task) return;
+
+	if (!ent->staging_active) {
+		taskmon_start_locked(ent, mac, tag);
+	}
+
+	if (ent->staging.count >= STACK_MONITOR_MAX_TASKS) {
+		return;
+	}
+
+	ent->staging.tasks[ent->staging.count++] = *task;
+	taskmon_update_tag_locked(ent, tag);
+}
+
+static void taskmon_set_cpu_locked(taskmon_ent_t *ent, const uint8_t mac[6],
+                                   const char *tag, uint32_t cpu_load_x10)
+{
+	if (!ent) return;
+
+	if (!ent->staging_active) {
+		taskmon_start_locked(ent, mac, tag);
+	}
+
+	ent->staging.cpu_valid = true;
+	ent->staging.cpu_load_x10 = cpu_load_x10;
+	taskmon_update_tag_locked(ent, tag);
+}
+
+static bool taskmon_get_snapshot(const uint8_t mac[6], stack_monitor_snapshot_t *out,
+                                 char *tag, size_t tag_sz)
+{
+	bool ok = false;
+
+	if (tag && tag_sz > 0) {
+		tag[0] = '\0';
+	}
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, false);
+		if (ent) {
+			if (tag && tag_sz > 0) {
+				copy_tag(tag, tag_sz, ent->tag);
+			}
+			if (ent->valid && out) {
+				*out = ent->current;
+				ok = true;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+
+	return ok;
+}
+
+static bool lookup_node_tag(const uint8_t mac[6], char *tag, size_t tag_sz)
+{
+	if (!tag || tag_sz == 0) return false;
+
+	if (mac_eq(mac, s_local_mac)) {
+		copy_tag(tag, tag_sz, s_local_tag);
+		return true;
+	}
+
+	if (mac_eq(mac, s_sel_mac)) {
+		copy_tag(tag, tag_sz, s_sel_tag);
+		return true;
+	}
+
+	bool found = false;
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac)) {
+				copy_tag(tag, tag_sz, s_nodes[i].tag);
+				found = true;
+				break;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	return found;
+}
+
+static const char *body_after_marker(const char *line, const char *marker)
+{
+	const char *p = strstr(line, marker);
+	if (!p) return NULL;
+
+	p += strlen(marker);
+	if (*p == ':') p++;
+	while (*p == ' ') p++;
+	return p;
+}
+
+static bool parse_taskmon_task(const char *line, stack_monitor_task_info_t *task)
+{
+	if (!line || !task) return false;
+
+	memset(task, 0, sizeof(*task));
+	task->cpu_x10 = -1;
+
+	const char *body = body_after_marker(line, "[STACKMON]");
+	if (body && body[0] == '"') {
+		char name[STACK_MONITOR_TASK_NAME_MAX] = {0};
+		unsigned prio = 0;
+		unsigned free_words = 0;
+		unsigned free_bytes = 0;
+		char cpu_token[16] = {0};
+		float cpu_pct = 0.0f;
+
+		if (sscanf(body,
+		           "\"%15[^\"]\" prio=%u free=%u words (%u bytes), cpu=%15s",
+		           name, &prio, &free_words, &free_bytes, cpu_token) == 5) {
+			copy_tag(task->name, sizeof(task->name), name);
+			task->priority = prio;
+			task->free_words = free_words;
+			task->free_bytes = free_bytes;
+			task->cpu_x10 = (cpu_token[0] == '?') ? -1 : (int32_t)(strtof(cpu_token, NULL) * 10.0f + 0.5f);
+			return true;
+		}
+
+		if (sscanf(body,
+		           "\"%15[^\"]\" prio=%u free=%u words, cpu=%f%%",
+		           name, &prio, &free_words, &cpu_pct) == 4) {
+			copy_tag(task->name, sizeof(task->name), name);
+			task->priority = prio;
+			task->free_words = free_words;
+			task->free_bytes = free_words * sizeof(StackType_t);
+			task->cpu_x10 = (int32_t)(cpu_pct * 10.0f + 0.5f);
+			return true;
+		}
+	}
+
+	body = body_after_marker(line, "[STACK] task=");
+	if (body && body[0] == '"') {
+		char name[STACK_MONITOR_TASK_NAME_MAX] = {0};
+		unsigned prio = 0;
+		unsigned free_words = 0;
+		unsigned free_bytes = 0;
+
+		if (sscanf(body,
+		           "\"%15[^\"]\" prio=%u free=%u words (%u bytes)",
+		           name, &prio, &free_words, &free_bytes) == 4) {
+			copy_tag(task->name, sizeof(task->name), name);
+			task->priority = prio;
+			task->free_words = free_words;
+			task->free_bytes = free_bytes;
+			task->cpu_x10 = -1;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool parse_taskmon_cpu(const char *line, uint32_t *cpu_load_x10)
+{
+	if (!line || !cpu_load_x10) return false;
+
+	const char *p = strstr(line, "CPU: CPU load ~");
+	if (!p) return false;
+
+	float cpu_pct = 0.0f;
+	if (sscanf(p, "CPU: CPU load ~ %f%%", &cpu_pct) != 1) {
+		return false;
+	}
+
+	*cpu_load_x10 = (uint32_t)(cpu_pct * 10.0f + 0.5f);
+	return true;
+}
+
+static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const char *line)
+{
+	if (!mac || !line) return false;
+
+	stack_monitor_task_info_t task;
+	uint32_t cpu_load_x10 = 0;
+	bool is_end = strstr(line, "===== END STACK MONITOR") != NULL;
+	bool is_start = !is_end && strstr(line, "===== STACK MONITOR") != NULL;
+	bool has_task = parse_taskmon_task(line, &task);
+	bool has_cpu = parse_taskmon_cpu(line, &cpu_load_x10);
+
+	if (!is_start && !is_end && !has_task && !has_cpu) {
+		return false;
+	}
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, true);
+		if (ent) {
+			taskmon_update_tag_locked(ent, tag);
+
+			if (is_start) {
+				taskmon_start_locked(ent, mac, tag);
+			}
+			if (has_task) {
+				taskmon_add_task_locked(ent, mac, tag, &task);
+			}
+			if (has_cpu) {
+				taskmon_set_cpu_locked(ent, mac, tag, cpu_load_x10);
+			}
+			if (is_end) {
+				taskmon_publish_locked(ent);
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+
+	return true;
 }
 
 static void log_buffer_clear(void)
@@ -342,12 +639,16 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 	va_end(ap_copy2);
 
 	if (w < 0) {
-		log_buffer_append_line(stack_buf, strnlen(stack_buf, cap));
+		if (!taskmon_ingest_line(s_local_mac, s_local_tag, stack_buf)) {
+			log_buffer_append_line(stack_buf, strnlen(stack_buf, cap));
+		}
 		return ret;
 	}
 
 	if ((size_t)w < (cap - copy_t)) {
-		log_buffer_append_line(stack_buf, copy_t + (size_t)w);
+		if (!taskmon_ingest_line(s_local_mac, s_local_tag, stack_buf)) {
+			log_buffer_append_line(stack_buf, copy_t + (size_t)w);
+		}
 		return ret;
 	}
 
@@ -356,7 +657,9 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 
 	char *heap_buf = (char *)malloc(need);
 	if (!heap_buf) {
-		log_buffer_append_line(stack_buf, cap - 1);
+		if (!taskmon_ingest_line(s_local_mac, s_local_tag, stack_buf)) {
+			log_buffer_append_line(stack_buf, cap - 1);
+		}
 		return ret;
 	}
 
@@ -368,7 +671,9 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 	vsnprintf(heap_buf + copy_t, need - copy_t, fmt, ap_copy3);
 	va_end(ap_copy3);
 
-	log_buffer_append_line(heap_buf, strnlen(heap_buf, need));
+	if (!taskmon_ingest_line(s_local_mac, s_local_tag, heap_buf)) {
+		log_buffer_append_line(heap_buf, strnlen(heap_buf, need));
+	}
 	free(heap_buf);
 
 	return ret;
@@ -410,9 +715,9 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 	if (!mac || !line) return;
 	if (!mac_eq(mac, s_sel_mac)) return;
 
-	(void)tag;
-
-	log_buffer_append_line(line, strnlen(line, 2048));
+	if (!taskmon_ingest_line(mac, tag, line)) {
+		log_buffer_append_line(line, strnlen(line, 2048));
+	}
 }
 
 /* ----------------- HTTP handlers ----------------- */
@@ -564,6 +869,123 @@ static esp_err_t http_log_get(httpd_req_t *req)
 	return err;
 }
 
+static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...)
+{
+	if (!out || cap == 0 || pos >= cap) return pos;
+
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(out + pos, cap - pos, fmt, ap);
+	va_end(ap);
+
+	if (n < 0) return pos;
+	if ((size_t)n >= cap - pos) return cap - 1;
+	return pos + (size_t)n;
+}
+
+static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s)
+{
+	if (!out || cap == 0 || pos >= cap) return pos;
+
+	if (pos < cap - 1) out[pos++] = '"';
+	for (const char *p = s ? s : ""; *p && pos < cap - 1; p++) {
+		unsigned char c = (unsigned char)*p;
+		if (c == '"' || c == '\\') {
+			if (pos + 2 >= cap) break;
+			out[pos++] = '\\';
+			out[pos++] = (char)c;
+		} else if (c < 32) {
+			out[pos++] = ' ';
+		} else {
+			out[pos++] = (char)c;
+		}
+	}
+	if (pos < cap - 1) out[pos++] = '"';
+	out[pos] = '\0';
+	return pos;
+}
+
+static esp_err_t http_tasks_get(httpd_req_t *req)
+{
+	enum { TASKS_JSON_MAX = 4096 };
+	char *out = (char *)malloc(TASKS_JSON_MAX);
+	if (!out) {
+		httpd_resp_set_type(req, "text/plain");
+		return httpd_resp_send(req, "no-mem\n", HTTPD_RESP_USE_STRLEN);
+	}
+
+	uint8_t mac[6];
+	mac_copy(mac, s_sel_mac);
+
+	char q[64] = {0};
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[32] = {0};
+		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
+			uint8_t parsed[6];
+			if (parse_mac_hex(v, parsed)) {
+				mac_copy(mac, parsed);
+			}
+		}
+	}
+
+	stack_monitor_snapshot_t snap;
+	char tag[16] = {0};
+	bool valid = taskmon_get_snapshot(mac, &snap, tag, sizeof(tag));
+	if (tag[0] == '\0') {
+		if (!lookup_node_tag(mac, tag, sizeof(tag))) {
+			copy_tag(tag, sizeof(tag), "node");
+		}
+	}
+
+	char mac_hex[13];
+	mac_to_hex(mac, mac_hex);
+
+	size_t pos = 0;
+
+	if (!valid) {
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 "{\"valid\":false,\"mac\":\"%s\",\"tag\":",
+		                 mac_hex);
+		pos = append_json_string(out, TASKS_JSON_MAX, pos, tag);
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 ",\"updated_ms\":0,\"age_ms\":0,"
+		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,\"tasks\":[]}");
+	} else {
+		uint32_t now = ms_now();
+		uint32_t age_ms = (now >= snap.updated_ms) ? (now - snap.updated_ms) : 0;
+
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 "{\"valid\":true,\"mac\":\"%s\",\"tag\":",
+		                 mac_hex);
+		pos = append_json_string(out, TASKS_JSON_MAX, pos, tag);
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
+		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,\"tasks\":[",
+		                 (unsigned long)snap.updated_ms,
+		                 (unsigned long)age_ms,
+		                 snap.cpu_valid ? "true" : "false",
+		                 (unsigned long)snap.cpu_load_x10);
+
+		for (uint32_t i = 0; i < snap.count && i < STACK_MONITOR_MAX_TASKS; i++) {
+			const stack_monitor_task_info_t *t = &snap.tasks[i];
+			if (i > 0) pos = append_fmt(out, TASKS_JSON_MAX, pos, ",");
+			pos = append_fmt(out, TASKS_JSON_MAX, pos, "{\"name\":");
+			pos = append_json_string(out, TASKS_JSON_MAX, pos, t->name);
+			pos = append_fmt(out, TASKS_JSON_MAX, pos,
+			                 ",\"prio\":%lu,\"free_words\":%lu,\"cpu_x10\":%ld}",
+			                 (unsigned long)t->priority,
+			                 (unsigned long)t->free_words,
+			                 (long)t->cpu_x10);
+		}
+		pos = append_fmt(out, TASKS_JSON_MAX, pos, "]}");
+	}
+
+	httpd_resp_set_type(req, "application/json");
+	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	free(out);
+	return err;
+}
+
 static esp_err_t http_root_get(httpd_req_t *req)
 {
 	static const char html[] =
@@ -572,32 +994,54 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
 		"<title>keeMASH logs</title>\n"
 		"<style>\n"
-		"body{font-family:monospace;background:#111;color:#ddd;margin:0;padding:0}\n"
-		"#top{padding:10px;background:#1b1b1b;position:sticky;top:0;display:flex;gap:10px;align-items:center}\n"
-		"#log{overflow:auto;height:calc(100vh - 60px);padding:10px;white-space:pre}\n"
+		"body{font-family:monospace;background:#111;color:#ddd;margin:0;padding:0;height:100vh;overflow:hidden}\n"
+		"#top{height:42px;padding:8px 10px;box-sizing:border-box;background:#1b1b1b;display:flex;gap:10px;align-items:center}\n"
+		"#main{display:flex;height:calc(100vh - 42px);min-height:0}\n"
+		"#log{flex:1;overflow:auto;padding:10px;white-space:pre;min-width:0}\n"
+		"#tasks{display:none;width:370px;overflow:auto;border-left:1px solid #333;background:#151515;padding:10px;box-sizing:border-box}\n"
+		"body.showTasks #tasks{display:block}\n"
 		".ln{white-space:pre;margin:0;padding:0}\n"
 		"button,select{font-family:monospace;font-size:14px}\n"
+		".taskTop{display:flex;justify-content:space-between;margin-bottom:8px;color:#eee}\n"
+		".cpu{color:#9ad;margin-bottom:8px}\n"
+		"table{width:100%;border-collapse:collapse;font-size:12px}\n"
+		"th,td{border-bottom:1px solid #2c2c2c;padding:3px 4px;text-align:right;white-space:nowrap}\n"
+		"th:first-child,td:first-child{text-align:left;max-width:150px;overflow:hidden;text-overflow:ellipsis}\n"
+		".warn{color:#ffcc00}.bad{color:#ff4d4d}\n"
 		".lvI{color:#00ff7f}\n"
 		".lvW{color:#ffcc00}\n"
 		".lvE{color:#ff4d4d}\n"
 		".lvD{color:#66a3ff}\n"
 		".lvV{color:#aaaaaa}\n"
 		".ts{color:#66a3ff}\n"
+		"@media(max-width:760px){#tasks{position:fixed;right:0;top:42px;bottom:0;width:90vw;z-index:5;box-shadow:-8px 0 20px #000}}\n"
 		"</style></head>\n"
 		"<body>\n"
 		"<div id='top'>\n"
 		"<button onclick='toggleFollow()'>follow: <span id=\"f\">ON</span></button>\n"
 		"<button onclick='clearServer()'>clear</button>\n"
+		"<button onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
 		"<select id='nodeSel'></select>\n"
 		"<span id='st'>...</span>\n"
 		"</div>\n"
+		"<div id='main'>\n"
 		"<div id='log'></div>\n"
+		"<div id='tasks'><div class='taskTop'><b id='taskTitle'>Task manager</b><span id='taskAge'>...</span></div><div id='taskCpu' class='cpu'>...</div><div id='taskTable'></div></div>\n"
+		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
+		"let tasksVisible=false;\n"
 		"let cursor=0;\n"
 		"let lastNodes='';\n"
+		"let lastTasks='';\n"
+		"let selectedMac='';\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadTasks()}\n"
 		"function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
+		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
+		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
+		"function shortMac(m){return m?m.slice(-6):''}\n"
+		"function clearTasksPanel(){lastTasks='';document.getElementById('taskTitle').textContent='Task manager';document.getElementById('taskAge').textContent='...';document.getElementById('taskCpu').textContent='...';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
 		"  const c=rest[0];\n"
@@ -660,6 +1104,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const j=JSON.parse(txt);\n"
 		"    const cur=j.selected_mac;\n"
 		"    const prev=s.value;\n"
+		"    selectedMac=cur||prev||selectedMac;\n"
 		"    s.innerHTML='';\n"
 		"    for(const n of j.nodes){\n"
 		"      const o=document.createElement('option');\n"
@@ -668,19 +1113,47 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"      s.appendChild(o);\n"
 		"    }\n"
 		"    s.value = cur || prev;\n"
+		"    selectedMac=s.value||selectedMac;\n"
 		"  }catch(e){}\n"
 		"}\n"
 		"async function onNodeSel(){\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  const mac=s.value;\n"
+		"  selectedMac=mac;\n"
+		"  clearTasksPanel();\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetch('/select?mac='+mac);}catch(e){}\n"
+		"  if(tasksVisible) loadTasks();\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
 		"  try{await fetch('/clear');}catch(e){}\n"
 		"  document.getElementById('log').innerHTML='';\n"
+		"}\n"
+		"async function loadTasks(){\n"
+		"  if(!tasksVisible) return;\n"
+		"  try{\n"
+		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
+		"    const r=await fetch('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''));\n"
+		"    const txt=await r.text();\n"
+		"    if(txt===lastTasks) return;\n"
+		"    lastTasks=txt;\n"
+		"    const j=JSON.parse(txt);\n"
+		"    const box=document.getElementById('taskTable');\n"
+		"    document.getElementById('taskTitle').textContent='Task manager '+(j.tag||'node')+' '+shortMac(j.mac||mac);\n"
+		"    if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ?';document.getElementById('taskAge').textContent='no data';return;}\n"
+		"    const tasks=j.tasks||[];\n"
+		"    tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
+		"    let rows='';\n"
+		"    for(const t of tasks){\n"
+		"      const cls=stackCls(t.free_words);\n"
+		"      rows+='<tr'+(cls?' class='+cls:'')+'><td>'+esc(t.name)+'</td><td>'+t.prio+'</td><td>'+pct(t.cpu_x10)+'</td><td>'+t.free_words+'</td></tr>';\n"
+		"    }\n"
+		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / '+tasks.length+' tasks';\n"
+		"    document.getElementById('taskAge').textContent=Math.floor((j.age_ms||0)/1000)+'s ago';\n"
+		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='tasks ERR'}\n"
 		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
@@ -688,6 +1161,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"});\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
 		"setInterval(loadNodes,2000);\n"
+		"setInterval(loadTasks,2000);\n"
 		"loadNodes();\n"
 		"tick();\n"
 		"</script>\n"
@@ -746,6 +1220,13 @@ esp_err_t log_http_server_start(void)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_tasks = {
+		.uri		= "/tasks",
+		.method		= HTTP_GET,
+		.handler	= http_tasks_get,
+		.user_ctx	= NULL
+	};
+
 	httpd_uri_t uri_nodes = {
 		.uri		= "/nodes",
 		.method		= HTTP_GET,
@@ -769,6 +1250,7 @@ esp_err_t log_http_server_start(void)
 
 	httpd_register_uri_handler(s_http_server, &uri_root);
 	httpd_register_uri_handler(s_http_server, &uri_log);
+	httpd_register_uri_handler(s_http_server, &uri_tasks);
 	httpd_register_uri_handler(s_http_server, &uri_nodes);
 	httpd_register_uri_handler(s_http_server, &uri_select);
 	httpd_register_uri_handler(s_http_server, &uri_clear);
