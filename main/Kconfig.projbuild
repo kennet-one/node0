@@ -169,4 +169,39 @@ menu "Example Configuration"
         default 50
         help
             The number of devices over the network(max: 300).
+
+    config NODE0_STATIC_IP_ENABLE
+        bool "Use static IPv4 address for node0 root"
+        default y
+        help
+            If enabled, node0 stops the STA DHCP client when it is root and sets
+            the IPv4 address from the NODE0_STATIC_* options.
+
+    config NODE0_STATIC_IP_ADDR
+        string "node0 static IPv4 address"
+        depends on NODE0_STATIC_IP_ENABLE
+        default "192.168.1.50"
+        help
+            Static IPv4 address used by node0 for the router-facing STA netif.
+
+    config NODE0_STATIC_NETMASK_ADDR
+        string "node0 static IPv4 netmask"
+        depends on NODE0_STATIC_IP_ENABLE
+        default "255.255.255.0"
+        help
+            Static IPv4 netmask used by node0.
+
+    config NODE0_STATIC_GW_ADDR
+        string "node0 static IPv4 gateway"
+        depends on NODE0_STATIC_IP_ENABLE
+        default "192.168.1.1"
+        help
+            Static IPv4 gateway used by node0.
+
+    config NODE0_STATIC_DNS_ADDR
+        string "node0 static IPv4 DNS server"
+        depends on NODE0_STATIC_IP_ENABLE
+        default "192.168.1.1"
+        help
+            Main DNS server used by node0 when static IPv4 is enabled.
 endmenu

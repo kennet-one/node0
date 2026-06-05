@@ -11,9 +11,10 @@
     "--query-driver=C:\\Users\\kennet\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
     "--compile-commands-dir=c:\\Users\\kennet\\Desktop\\To Git\\node0\\build"
   ],
-  "idf.portWin": "COM12",
+  "idf.portWin": "COM7",
   "idf.espIdfPathWin": "C:\\Users\\kennet\\esp\\v5.5.1\\esp-idf",
   "idf.toolsPathWin": "C:\\Users\\kennet\\.espressif",
   "idf.pythonInstallPath": "C:\\Users\\kennet\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf"
 }

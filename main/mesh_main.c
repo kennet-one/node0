@@ -13,6 +13,7 @@
 #include "esp_mesh_internal.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "lwip/ip4_addr.h"
 
 #include "legacy_proto.h"
 #include "stack_monitor.h"
@@ -73,6 +74,11 @@ static void ip_event_handler(void *arg,
 static void mesh_tx_task(void *arg);
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
+static esp_err_t node0_restart_dhcp_client(void);
+
+#if CONFIG_NODE0_STATIC_IP_ENABLE
+static esp_err_t node0_apply_static_ip(void);
+#endif
 
 // -----------------------------SINGLE_SENDER---------------------------------------
 static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
@@ -94,6 +100,110 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
     // звичайний p2p-send – mesh сам прокладе маршрут
     return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
+
+
+static esp_err_t node0_restart_dhcp_client(void)
+{
+	if (!netif_sta) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	esp_err_t err = esp_netif_dhcpc_stop(netif_sta);
+	if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+		ESP_LOGW(MESH_TAG,
+		         "DHCP client stop failed before restart: %s",
+		         esp_err_to_name(err));
+		return err;
+	}
+
+	err = esp_netif_dhcpc_start(netif_sta);
+	if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+		ESP_LOGW(MESH_TAG,
+		         "DHCP client start failed: %s",
+		         esp_err_to_name(err));
+		return err;
+	}
+
+	return ESP_OK;
+}
+
+
+#if CONFIG_NODE0_STATIC_IP_ENABLE
+static esp_err_t node0_set_dns_server(const char *addr, esp_netif_dns_type_t type)
+{
+	esp_netif_dns_info_t dns = {0};
+
+	dns.ip.u_addr.ip4.addr = ipaddr_addr(addr);
+	dns.ip.type = IPADDR_TYPE_V4;
+	if (dns.ip.u_addr.ip4.addr == IPADDR_NONE) {
+		ESP_LOGE(MESH_TAG, "invalid static DNS address: %s", addr);
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	return esp_netif_set_dns_info(netif_sta, type, &dns);
+}
+
+
+static esp_err_t node0_apply_static_ip(void)
+{
+	if (!netif_sta) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	uint32_t ip_addr = ipaddr_addr(CONFIG_NODE0_STATIC_IP_ADDR);
+	uint32_t netmask_addr = ipaddr_addr(CONFIG_NODE0_STATIC_NETMASK_ADDR);
+	uint32_t gw_addr = ipaddr_addr(CONFIG_NODE0_STATIC_GW_ADDR);
+
+	if (ip_addr == IPADDR_NONE ||
+	    netmask_addr == IPADDR_NONE ||
+	    gw_addr == IPADDR_NONE) {
+		ESP_LOGE(MESH_TAG,
+		         "invalid static IP config ip:%s netmask:%s gw:%s",
+		         CONFIG_NODE0_STATIC_IP_ADDR,
+		         CONFIG_NODE0_STATIC_NETMASK_ADDR,
+		         CONFIG_NODE0_STATIC_GW_ADDR);
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	esp_err_t err = esp_netif_dhcpc_stop(netif_sta);
+	if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+		ESP_LOGE(MESH_TAG,
+		         "failed to stop DHCP client before static IP: %s",
+		         esp_err_to_name(err));
+		return err;
+	}
+
+	esp_netif_ip_info_t ip = {0};
+	ip.ip.addr = ip_addr;
+	ip.netmask.addr = netmask_addr;
+	ip.gw.addr = gw_addr;
+
+	err = esp_netif_set_ip_info(netif_sta, &ip);
+	if (err != ESP_OK) {
+		ESP_LOGE(MESH_TAG,
+		         "failed to set static IP info: %s",
+		         esp_err_to_name(err));
+		return err;
+	}
+
+	err = node0_set_dns_server(CONFIG_NODE0_STATIC_DNS_ADDR, ESP_NETIF_DNS_MAIN);
+	if (err != ESP_OK) {
+		ESP_LOGE(MESH_TAG,
+		         "failed to set static DNS: %s",
+		         esp_err_to_name(err));
+		return err;
+	}
+
+	ESP_LOGI(MESH_TAG,
+	         "static IP configured ip:%s netmask:%s gw:%s dns:%s",
+	         CONFIG_NODE0_STATIC_IP_ADDR,
+	         CONFIG_NODE0_STATIC_NETMASK_ADDR,
+	         CONFIG_NODE0_STATIC_GW_ADDR,
+	         CONFIG_NODE0_STATIC_DNS_ADDR);
+	return ESP_OK;
+}
+#endif
+
 
 #define SINGLE_TX_INTERVAL_MS  5000   // 5 секунд
 
@@ -401,8 +511,17 @@ static void mesh_event_handler(void *arg,
 		is_mesh_connected = true;
 
 		if (esp_mesh_is_root()) {
-			esp_netif_dhcpc_stop(netif_sta);
-			esp_netif_dhcpc_start(netif_sta);
+#if CONFIG_NODE0_STATIC_IP_ENABLE
+			esp_err_t err = node0_apply_static_ip();
+			if (err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "static IP setup failed (%s), falling back to DHCP",
+				         esp_err_to_name(err));
+				ESP_ERROR_CHECK_WITHOUT_ABORT(node0_restart_dhcp_client());
+			}
+#else
+			ESP_ERROR_CHECK_WITHOUT_ABORT(node0_restart_dhcp_client());
+#endif
 
 		}
 		mesh_comm_start();
