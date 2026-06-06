@@ -10,9 +10,14 @@
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_err.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_image_format.h"
 #include "esp_mesh.h"
+#include "esp_ota_ops.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -85,6 +90,25 @@ typedef struct {
 	uint32_t uptime_s;
 	uint32_t uptime_seen_ms;
 } node_ent_t;
+
+typedef struct {
+	bool valid;
+	uint32_t free_bytes;
+	uint32_t min_free_bytes;
+	uint32_t total_bytes;
+} ram_status_t;
+
+typedef struct {
+	bool flash_valid;
+	uint32_t flash_chip_bytes;
+	uint32_t app_used_bytes;
+	uint32_t app_partition_bytes;
+	bool nvs_valid;
+	uint32_t nvs_used_entries;
+	uint32_t nvs_free_entries;
+	uint32_t nvs_available_entries;
+	uint32_t nvs_total_entries;
+} persistent_status_t;
 
 static node_ent_t s_nodes[LOG_HTTP_MAX_NODES];
 static uint32_t s_nodes_count = 0;
@@ -172,6 +196,57 @@ static bool node_uptime_for_mac(const uint8_t mac[6], uint32_t *uptime_s)
 		*uptime_s = value;
 	}
 	return valid;
+}
+
+static ram_status_t ram_status_for_mac(const uint8_t mac[6])
+{
+	ram_status_t ram = {0};
+
+	if (mac && mac_eq(mac, s_local_mac)) {
+		ram.valid = true;
+		ram.free_bytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+		ram.min_free_bytes = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+		ram.total_bytes = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_8BIT);
+	}
+
+	return ram;
+}
+
+static persistent_status_t persistent_status_for_mac(const uint8_t mac[6])
+{
+	persistent_status_t status = {0};
+
+	if (!mac || !mac_eq(mac, s_local_mac)) {
+		return status;
+	}
+
+	uint32_t flash_size = 0;
+	const esp_partition_t *app_partition = esp_ota_get_running_partition();
+	if (esp_flash_get_size(NULL, &flash_size) == ESP_OK && app_partition) {
+		status.flash_valid = true;
+		status.flash_chip_bytes = flash_size;
+		status.app_partition_bytes = app_partition->size;
+
+		esp_partition_pos_t app_pos = {
+			.offset = app_partition->address,
+			.size = app_partition->size,
+		};
+		esp_image_metadata_t app_meta = {0};
+		if (esp_image_get_metadata(&app_pos, &app_meta) == ESP_OK) {
+			status.app_used_bytes = app_meta.image_len;
+		}
+	}
+
+	nvs_stats_t nvs_stats = {0};
+	if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
+		status.nvs_valid = true;
+		status.nvs_used_entries = (uint32_t)nvs_stats.used_entries;
+		status.nvs_free_entries = (uint32_t)nvs_stats.free_entries;
+		status.nvs_available_entries = (uint32_t)nvs_stats.available_entries;
+		status.nvs_total_entries = (uint32_t)nvs_stats.total_entries;
+	}
+
+	return status;
 }
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
@@ -1022,6 +1097,8 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 	int slot_count = mac_eq(mac, s_local_mac) ? STACK_MONITOR_MAX_TASKS : -1;
 	uint32_t uptime_s = 0;
 	bool uptime_valid = node_uptime_for_mac(mac, &uptime_s);
+	ram_status_t ram = ram_status_for_mac(mac);
+	persistent_status_t persistent = persistent_status_for_mac(mac);
 
 	size_t pos = 0;
 
@@ -1034,10 +1111,30 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		                 ",\"updated_ms\":0,\"age_ms\":0,"
 		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
 		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                 "\"uptime_s\":%lu,\"tasks\":[]}",
+		                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
+		                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
+		                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+		                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+		                 "\"app_partition_bytes\":%lu,"
+		                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+		                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+		                 "\"nvs_total_entries\":%lu,\"tasks\":[]}",
 		                 slot_count,
 		                 uptime_valid ? "true" : "false",
-		                 (unsigned long)uptime_s);
+		                 (unsigned long)uptime_s,
+		                 ram.valid ? "true" : "false",
+		                 (unsigned long)ram.free_bytes,
+		                 (unsigned long)ram.min_free_bytes,
+		                 (unsigned long)ram.total_bytes,
+		                 persistent.flash_valid ? "true" : "false",
+		                 (unsigned long)persistent.flash_chip_bytes,
+		                 (unsigned long)persistent.app_used_bytes,
+		                 (unsigned long)persistent.app_partition_bytes,
+		                 persistent.nvs_valid ? "true" : "false",
+		                 (unsigned long)persistent.nvs_used_entries,
+		                 (unsigned long)persistent.nvs_free_entries,
+		                 (unsigned long)persistent.nvs_available_entries,
+		                 (unsigned long)persistent.nvs_total_entries);
 	} else {
 		uint32_t now = ms_now();
 		uint32_t age_ms = (now >= snap.updated_ms) ? (now - snap.updated_ms) : 0;
@@ -1050,14 +1147,34 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
 		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
 		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                 "\"uptime_s\":%lu,\"tasks\":[",
+		                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
+		                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
+		                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+		                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+		                 "\"app_partition_bytes\":%lu,"
+		                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+		                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+		                 "\"nvs_total_entries\":%lu,\"tasks\":[",
 		                 (unsigned long)snap.updated_ms,
 		                 (unsigned long)age_ms,
 		                 snap.cpu_valid ? "true" : "false",
 		                 (unsigned long)snap.cpu_load_x10,
 		                 slot_count,
 		                 uptime_valid ? "true" : "false",
-		                 (unsigned long)uptime_s);
+		                 (unsigned long)uptime_s,
+		                 ram.valid ? "true" : "false",
+		                 (unsigned long)ram.free_bytes,
+		                 (unsigned long)ram.min_free_bytes,
+		                 (unsigned long)ram.total_bytes,
+		                 persistent.flash_valid ? "true" : "false",
+		                 (unsigned long)persistent.flash_chip_bytes,
+		                 (unsigned long)persistent.app_used_bytes,
+		                 (unsigned long)persistent.app_partition_bytes,
+		                 persistent.nvs_valid ? "true" : "false",
+		                 (unsigned long)persistent.nvs_used_entries,
+		                 (unsigned long)persistent.nvs_free_entries,
+		                 (unsigned long)persistent.nvs_available_entries,
+		                 (unsigned long)persistent.nvs_total_entries);
 
 		for (uint32_t i = 0; i < snap.count && i < STACK_MONITOR_MAX_TASKS; i++) {
 			const stack_monitor_task_info_t *t = &snap.tasks[i];
@@ -1102,6 +1219,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".taskMeta{text-align:right;color:#aaa;font-size:11px;line-height:1.25;white-space:nowrap}\n"
 		".taskMac{color:#ddd}\n"
 		".cpu{color:#9ad;margin-bottom:8px}\n"
+		".ram{color:#adb;margin:-4px 0 8px}\n"
+		".flash{color:#dba;margin:-4px 0 8px}\n"
 		"table{width:100%;border-collapse:collapse;font-size:12px}\n"
 		"th,td{border-bottom:1px solid #2c2c2c;padding:3px 4px;text-align:right;white-space:nowrap}\n"
 		"th:first-child,td:first-child{text-align:left;max-width:150px;overflow:hidden;text-overflow:ellipsis}\n"
@@ -1124,7 +1243,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"</div>\n"
 		"<div id='main'>\n"
 		"<div id='log'></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM free ? / min ? / total ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
@@ -1141,8 +1260,12 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function taskSlotsText(count,slots){return count+'/'+(slots>=0?slots:'?')}\n"
 		"function pad2(n){return String(n).padStart(2,'0')}\n"
 		"function fmtUptime(valid,sec){if(!valid)return 'up ?';sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;return 'up '+(d>0?d+'d ':'')+pad2(h)+':'+pad2(m)+':'+pad2(s)}\n"
+		"function fmtKb(bytes){return Math.round((Number(bytes)||0)/1024)+' KB'}\n"
+		"function fmtMb(bytes){return Math.round((Number(bytes)||0)/1048576)+' MB'}\n"
+		"function fmtRam(j){return j.ram_valid?'RAM free '+fmtKb(j.ram_free_bytes)+' / min '+fmtKb(j.ram_min_free_bytes)+' / total '+fmtKb(j.ram_total_bytes):'RAM free ? / min ? / total ?'}\n"
+		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
-		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
 		"  const c=rest[0];\n"
@@ -1244,6 +1367,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const box=document.getElementById('taskTable');\n"
 		"    const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
 		"    setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);\n"
+		"    document.getElementById('taskRam').textContent=fmtRam(j);\n"
+		"    document.getElementById('taskFlash').textContent=fmtFlash(j);\n"
 		"    if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';return;}\n"
 		"    const tasks=j.tasks||[];\n"
 		"    const slots=typeof j.slot_count==='number'?j.slot_count:-1;\n"
@@ -1256,7 +1381,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);\n"
 		"    setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
 		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?'}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}\n"
 		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
