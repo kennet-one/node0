@@ -211,4 +211,11 @@ menu "Example Configuration"
         default 443
         help
             HTTPS port used by the node0 log web UI.
+
+    config NODE0_OTA_PIN
+        string "node0 web OTA PIN"
+        default ""
+        help
+            PIN required by the node0 HTTPS OTA endpoint. Leave empty to keep
+            web OTA disabled. Do not commit real local PIN values.
 endmenu

@@ -12,17 +12,20 @@
 #include "esp_https_server.h"
 #include "esp_err.h"
 #include "esp_flash.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_image_format.h"
 #include "esp_mesh.h"
 #include "esp_ota_ops.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_system.h"
 #include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
+#include "freertos/semphr.h"
 
 #include "mesh_proto.h"
 #include "stack_monitor.h"
@@ -59,6 +62,12 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #ifndef LOG_HTTP_MAX_NODES
 	#define LOG_HTTP_MAX_NODES		24
 #endif
+
+#ifndef CONFIG_NODE0_OTA_PIN
+	#define CONFIG_NODE0_OTA_PIN		""
+#endif
+
+#define NODE0_OTA_BUF_SIZE		4096U
 
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
@@ -137,6 +146,30 @@ static taskmon_ent_t s_taskmon[LOG_HTTP_MAX_NODES];
 static portMUX_TYPE s_taskmon_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
+
+typedef enum {
+	NODE0_OTA_IDLE = 0,
+	NODE0_OTA_UPDATING,
+	NODE0_OTA_SUCCESS,
+	NODE0_OTA_FAILED,
+	NODE0_OTA_REBOOTING,
+} node0_ota_state_t;
+
+typedef struct {
+	node0_ota_state_t state;
+	uint32_t total_bytes;
+	uint32_t written_bytes;
+	uint32_t started_ms;
+	uint32_t finished_ms;
+	char last_error[96];
+	char last_result[96];
+} node0_ota_status_t;
+
+static SemaphoreHandle_t s_ota_mutex = NULL;
+static portMUX_TYPE s_ota_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static node0_ota_status_t s_ota_status = {
+	.state = NODE0_OTA_IDLE,
+};
 
 /* ----------------- Helpers ----------------- */
 
@@ -1055,9 +1088,12 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 	uint32_t local_uptime = local_uptime_s();
 
 	pos += snprintf(out + pos, NODES_JSON_MAX - pos,
-		"{\"selected_mac\":\"%02x%02x%02x%02x%02x%02x\",\"selected_tag\":\"%s\",\"nodes\":[",
+		"{\"selected_mac\":\"%02x%02x%02x%02x%02x%02x\",\"selected_tag\":\"%s\","
+		"\"local_mac\":\"%02x%02x%02x%02x%02x%02x\",\"nodes\":[",
 		s_sel_mac[0], s_sel_mac[1], s_sel_mac[2], s_sel_mac[3], s_sel_mac[4], s_sel_mac[5],
-		s_sel_tag
+		s_sel_tag,
+		s_local_mac[0], s_local_mac[1], s_local_mac[2],
+		s_local_mac[3], s_local_mac[4], s_local_mac[5]
 	);
 
 	// local
@@ -1246,6 +1282,389 @@ static size_t append_json_string(char *out, size_t cap, size_t pos, const char *
 	return pos;
 }
 
+static const char *ota_state_name(node0_ota_state_t state)
+{
+	switch (state) {
+	case NODE0_OTA_IDLE: return "idle";
+	case NODE0_OTA_UPDATING: return "updating";
+	case NODE0_OTA_SUCCESS: return "success";
+	case NODE0_OTA_FAILED: return "failed";
+	case NODE0_OTA_REBOOTING: return "rebooting";
+	default: return "unknown";
+	}
+}
+
+static const char *ota_img_state_name(esp_ota_img_states_t state)
+{
+	switch (state) {
+	case ESP_OTA_IMG_NEW: return "new";
+	case ESP_OTA_IMG_PENDING_VERIFY: return "pending_verify";
+	case ESP_OTA_IMG_VALID: return "valid";
+	case ESP_OTA_IMG_INVALID: return "invalid";
+	case ESP_OTA_IMG_ABORTED: return "aborted";
+	case ESP_OTA_IMG_UNDEFINED: return "undefined";
+	default: return "unknown";
+	}
+}
+
+static bool ota_enabled(void)
+{
+	return CONFIG_NODE0_OTA_PIN[0] != '\0';
+}
+
+static void ota_status_begin(uint32_t total_bytes)
+{
+	node0_ota_status_t status = {0};
+	status.state = NODE0_OTA_UPDATING;
+	status.total_bytes = total_bytes;
+	status.started_ms = ms_now();
+	strncpy(status.last_result, "upload started", sizeof(status.last_result) - 1);
+
+	portENTER_CRITICAL(&s_ota_state_lock);
+	s_ota_status = status;
+	portEXIT_CRITICAL(&s_ota_state_lock);
+}
+
+static void ota_status_progress(uint32_t written_bytes)
+{
+	portENTER_CRITICAL(&s_ota_state_lock);
+	s_ota_status.written_bytes = written_bytes;
+	portEXIT_CRITICAL(&s_ota_state_lock);
+}
+
+static void ota_status_finish(node0_ota_state_t state, const char *msg)
+{
+	portENTER_CRITICAL(&s_ota_state_lock);
+	s_ota_status.state = state;
+	s_ota_status.finished_ms = ms_now();
+	if (state == NODE0_OTA_FAILED) {
+		strncpy(s_ota_status.last_error, msg ? msg : "OTA failed",
+		        sizeof(s_ota_status.last_error) - 1);
+		s_ota_status.last_error[sizeof(s_ota_status.last_error) - 1] = '\0';
+	} else {
+		strncpy(s_ota_status.last_result, msg ? msg : "OK",
+		        sizeof(s_ota_status.last_result) - 1);
+		s_ota_status.last_result[sizeof(s_ota_status.last_result) - 1] = '\0';
+	}
+	portEXIT_CRITICAL(&s_ota_state_lock);
+}
+
+static esp_err_t http_json_error(httpd_req_t *req, const char *status, const char *msg)
+{
+	char out[192];
+	size_t pos = append_fmt(out, sizeof(out), 0, "{\"ok\":false,\"error\":");
+	pos = append_json_string(out, sizeof(out), pos, msg ? msg : "error");
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_status(req, status ? status : "500 Internal Server Error");
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_json_ok(httpd_req_t *req, const char *msg)
+{
+	char out[192];
+	size_t pos = append_fmt(out, sizeof(out), 0, "{\"ok\":true,\"message\":");
+	pos = append_json_string(out, sizeof(out), pos, msg ? msg : "OK");
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+static bool ota_check_pin(httpd_req_t *req)
+{
+	char pin[64] = {0};
+	if (!ota_enabled()) {
+		return false;
+	}
+	if (httpd_req_get_hdr_value_str(req, "X-OTA-PIN", pin, sizeof(pin)) != ESP_OK) {
+		return false;
+	}
+	return strcmp(pin, CONFIG_NODE0_OTA_PIN) == 0;
+}
+
+static bool ota_validate_first_chunk(const uint8_t *data, size_t len,
+                                     esp_app_desc_t *new_desc,
+                                     char *err, size_t err_len)
+{
+	if (!data || !new_desc) {
+		snprintf(err, err_len, "missing OTA data");
+		return false;
+	}
+
+	if (len < sizeof(esp_image_header_t)) {
+		snprintf(err, err_len, "image too small");
+		return false;
+	}
+
+	const esp_image_header_t *image_header = (const esp_image_header_t *)data;
+	if (image_header->magic != ESP_IMAGE_HEADER_MAGIC) {
+		snprintf(err, err_len, "invalid ESP image magic");
+		return false;
+	}
+
+	const size_t desc_off = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+	if (len < desc_off + sizeof(esp_app_desc_t)) {
+		snprintf(err, err_len, "image descriptor missing");
+		return false;
+	}
+
+	memcpy(new_desc, data + desc_off, sizeof(*new_desc));
+	if (new_desc->magic_word != ESP_APP_DESC_MAGIC_WORD) {
+		snprintf(err, err_len, "invalid app descriptor");
+		return false;
+	}
+
+	const esp_app_desc_t *running = esp_app_get_description();
+	if (!running ||
+	    strncmp(new_desc->project_name, running->project_name,
+	            sizeof(new_desc->project_name)) != 0) {
+		char got[33] = {0};
+		char expected[33] = {0};
+		memcpy(got, new_desc->project_name, sizeof(new_desc->project_name));
+		memcpy(expected, running ? running->project_name : "unknown",
+		       running ? sizeof(running->project_name) : strlen("unknown"));
+		snprintf(err, err_len, "wrong project: %s, expected %s", got, expected);
+		return false;
+	}
+
+	return true;
+}
+
+static void ota_restart_task(void *arg)
+{
+	(void)arg;
+	vTaskDelay(pdMS_TO_TICKS(1200));
+	esp_restart();
+}
+
+static esp_err_t http_ota_status_get(httpd_req_t *req)
+{
+	enum { OTA_STATUS_JSON_MAX = 1024 };
+	char out[OTA_STATUS_JSON_MAX];
+	node0_ota_status_t status;
+
+	portENTER_CRITICAL(&s_ota_state_lock);
+	status = s_ota_status;
+	portEXIT_CRITICAL(&s_ota_state_lock);
+
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+	const esp_app_desc_t *app = esp_app_get_description();
+
+	esp_ota_img_states_t img_state = ESP_OTA_IMG_UNDEFINED;
+	bool img_state_valid = running &&
+		esp_ota_get_state_partition(running, &img_state) == ESP_OK;
+
+	size_t pos = 0;
+	pos = append_fmt(out, sizeof(out), pos,
+	                 "{\"enabled\":%s,\"busy\":%s,\"state\":\"%s\","
+	                 "\"written_bytes\":%lu,\"total_bytes\":%lu,"
+	                 "\"running_label\":",
+	                 ota_enabled() ? "true" : "false",
+	                 status.state == NODE0_OTA_UPDATING ? "true" : "false",
+	                 ota_state_name(status.state),
+	                 (unsigned long)status.written_bytes,
+	                 (unsigned long)status.total_bytes);
+	pos = append_json_string(out, sizeof(out), pos, running ? running->label : "");
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"running_address\":%lu,\"running_size\":%lu,"
+	                 "\"update_label\":",
+	                 (unsigned long)(running ? running->address : 0),
+	                 (unsigned long)(running ? running->size : 0));
+	pos = append_json_string(out, sizeof(out), pos, update ? update->label : "");
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"update_size\":%lu,\"rollback_state\":",
+	                 (unsigned long)(update ? update->size : 0));
+	pos = append_json_string(out, sizeof(out), pos,
+	                         img_state_valid ? ota_img_state_name(img_state) : "unknown");
+	pos = append_fmt(out, sizeof(out), pos, ",\"project_name\":");
+	pos = append_json_string(out, sizeof(out), pos, app ? app->project_name : "");
+	pos = append_fmt(out, sizeof(out), pos, ",\"version\":");
+	pos = append_json_string(out, sizeof(out), pos, app ? app->version : "");
+	pos = append_fmt(out, sizeof(out), pos, ",\"last_result\":");
+	pos = append_json_string(out, sizeof(out), pos, status.last_result);
+	pos = append_fmt(out, sizeof(out), pos, ",\"last_error\":");
+	pos = append_json_string(out, sizeof(out), pos, status.last_error);
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_ota_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		ota_status_finish(NODE0_OTA_FAILED, "OTA disabled: set CONFIG_NODE0_OTA_PIN");
+		return http_json_error(req, "403 Forbidden", "OTA disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+
+	if (!ota_check_pin(req)) {
+		ota_status_finish(NODE0_OTA_FAILED, "bad OTA PIN");
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	if (!s_ota_mutex) {
+		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
+	}
+	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	}
+
+	esp_ota_handle_t ota_handle = 0;
+	const esp_partition_t *update_partition = NULL;
+	uint8_t *buf = NULL;
+	bool ota_started = false;
+	esp_err_t result = ESP_FAIL;
+	char err_msg[96] = "OTA failed";
+
+	do {
+		size_t total_len = req->content_len;
+		if (total_len == 0) {
+			snprintf(err_msg, sizeof(err_msg), "missing Content-Length");
+			break;
+		}
+
+		update_partition = esp_ota_get_next_update_partition(NULL);
+		if (!update_partition) {
+			snprintf(err_msg, sizeof(err_msg), "no OTA update partition");
+			break;
+		}
+		if (total_len > update_partition->size) {
+			snprintf(err_msg, sizeof(err_msg), "image too large for %s", update_partition->label);
+			break;
+		}
+
+		buf = (uint8_t *)malloc(NODE0_OTA_BUF_SIZE);
+		if (!buf) {
+			snprintf(err_msg, sizeof(err_msg), "no memory for OTA buffer");
+			break;
+		}
+
+		size_t first_want = total_len < NODE0_OTA_BUF_SIZE ? total_len : NODE0_OTA_BUF_SIZE;
+		int first_len = httpd_req_recv(req, (char *)buf, first_want);
+		if (first_len <= 0) {
+			snprintf(err_msg, sizeof(err_msg), "failed to read OTA image");
+			break;
+		}
+
+		esp_app_desc_t new_desc = {0};
+		if (!ota_validate_first_chunk(buf, (size_t)first_len, &new_desc,
+		                              err_msg, sizeof(err_msg))) {
+			break;
+		}
+
+		ESP_LOGI(TAG, "OTA upload: project=%s version=%s size=%lu target=%s",
+		         new_desc.project_name, new_desc.version,
+		         (unsigned long)total_len, update_partition->label);
+
+		ota_status_begin((uint32_t)total_len);
+
+		result = esp_ota_begin(update_partition, total_len, &ota_handle);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "esp_ota_begin: %s", esp_err_to_name(result));
+			break;
+		}
+		ota_started = true;
+
+		result = esp_ota_write(ota_handle, buf, first_len);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "esp_ota_write: %s", esp_err_to_name(result));
+			break;
+		}
+
+		size_t written = (size_t)first_len;
+		ota_status_progress((uint32_t)written);
+
+		while (written < total_len) {
+			size_t to_read = total_len - written;
+			if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
+
+			int r = httpd_req_recv(req, (char *)buf, to_read);
+			if (r <= 0) {
+				snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
+				break;
+			}
+
+			result = esp_ota_write(ota_handle, buf, r);
+			if (result != ESP_OK) {
+				snprintf(err_msg, sizeof(err_msg), "esp_ota_write: %s", esp_err_to_name(result));
+				break;
+			}
+
+			written += (size_t)r;
+			ota_status_progress((uint32_t)written);
+		}
+
+		if (written != total_len) {
+			result = ESP_FAIL;
+			break;
+		}
+
+		result = esp_ota_end(ota_handle);
+		ota_started = false;
+		ota_handle = 0;
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "esp_ota_end: %s", esp_err_to_name(result));
+			break;
+		}
+
+		result = esp_ota_set_boot_partition(update_partition);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "set boot partition: %s", esp_err_to_name(result));
+			break;
+		}
+
+		snprintf(err_msg, sizeof(err_msg), "OTA OK, rebooting into %s", update_partition->label);
+		ota_status_finish(NODE0_OTA_REBOOTING, err_msg);
+		ESP_LOGI(TAG, "%s", err_msg);
+
+		BaseType_t task_ok = xTaskCreate(ota_restart_task, "ota_reboot", 2048, NULL, 5, NULL);
+		if (task_ok != pdPASS) {
+			ESP_LOGW(TAG, "failed to create OTA reboot task; reboot manually");
+		}
+
+		free(buf);
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_ok(req, err_msg);
+	} while (0);
+
+	if (ota_started) {
+		esp_ota_abort(ota_handle);
+	}
+	if (buf) {
+		free(buf);
+	}
+
+	ota_status_finish(NODE0_OTA_FAILED, err_msg);
+	ESP_LOGW(TAG, "OTA failed: %s", err_msg);
+	xSemaphoreGive(s_ota_mutex);
+	return http_json_error(req, "400 Bad Request", err_msg);
+}
+
+static void ota_mark_running_app_valid_if_pending(void)
+{
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+
+	if (!running) return;
+	if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+	if (state != ESP_OTA_IMG_PENDING_VERIFY) return;
+
+	esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+	if (err == ESP_OK) {
+		ESP_LOGI(TAG, "OTA rollback: running app marked valid");
+	} else {
+		ESP_LOGE(TAG, "OTA rollback: mark valid failed: %s", esp_err_to_name(err));
+	}
+#endif
+}
+
 static esp_err_t http_tasks_get(httpd_req_t *req)
 {
 	enum { TASKS_JSON_MAX = 4096 };
@@ -1404,6 +1823,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".taskUptime{color:#aaa;white-space:nowrap}\n"
 		".taskMeta{text-align:right;color:#aaa;font-size:11px;line-height:1.25;white-space:nowrap}\n"
 		".taskMac{color:#ddd}\n"
+		".otaBox{margin-top:6px;text-align:right}\n"
+		".otaBox button{font-size:12px;padding:2px 7px}\n"
+		"#otaStatus{margin-top:4px;color:#aaa;max-width:150px;white-space:normal}\n"
+		"#otaProg{width:140px;height:8px;margin-top:4px;display:none}\n"
 		".cpu{color:#9ad;margin-bottom:8px}\n"
 		".ram{color:#adb;margin:-4px 0 8px}\n"
 		".flash{color:#dba;margin:-4px 0 8px}\n"
@@ -1429,7 +1852,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"</div>\n"
 		"<div id='main'>\n"
 		"<div id='log'></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM free ? / min ? / total ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><button id='otaBtn' onclick='startOta()' disabled>update</button><div id='otaStatus'>OTA ...</div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM free ? / min ? / total ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
@@ -1438,9 +1861,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let lastNodes='';\n"
 		"let lastTasks='';\n"
 		"let selectedMac='';\n"
+		"let localMac='';\n"
+		"let otaEnabled=false;\n"
+		"let otaBusy=false;\n"
+		"let otaStatusText='OTA ...';\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadTasks()}\n"
-		"function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){loadTasks();loadOtaStatus()}}\n"
+		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
 		"function taskSlotsText(count,slots){return count+'/'+(slots>=0?slots:'?')}\n"
@@ -1452,6 +1879,62 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
 		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
+		"function updateOtaUi(){\n"
+		"  const b=document.getElementById('otaBtn');const s=document.getElementById('otaStatus');\n"
+		"  if(!b||!s)return;\n"
+		"  if(!isLocalSelected()){b.disabled=true;s.textContent='OTA only for node0';return;}\n"
+		"  if(!otaEnabled){b.disabled=true;s.textContent='OTA disabled: set PIN';return;}\n"
+		"  b.disabled=otaBusy;s.textContent=otaStatusText||'OTA ready';\n"
+		"}\n"
+		"function otaSetStatus(text,showProg,pctVal){\n"
+		"  otaStatusText=text||'OTA ready';\n"
+		"  const p=document.getElementById('otaProg');\n"
+		"  if(p){p.style.display=showProg?'inline-block':'none';if(typeof pctVal==='number')p.value=Math.max(0,Math.min(100,pctVal));}\n"
+		"  updateOtaUi();\n"
+		"}\n"
+		"function idbReq(req){return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}\n"
+		"function otaDb(){return new Promise((resolve,reject)=>{const r=indexedDB.open('node0OtaDb',1);r.onupgradeneeded=()=>r.result.createObjectStore('files');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}\n"
+		"async function otaGetHandle(){try{const db=await otaDb();return await idbReq(db.transaction('files','readonly').objectStore('files').get('node0-bin'))}catch(e){return null}}\n"
+		"async function otaSaveHandle(h){try{const db=await otaDb();await idbReq(db.transaction('files','readwrite').objectStore('files').put(h,'node0-bin'))}catch(e){}}\n"
+		"function chooseFileInput(){return new Promise(resolve=>{const i=document.createElement('input');i.type='file';i.accept='.bin,application/octet-stream';i.onchange=()=>{const f=i.files&&i.files[0];if(f)localStorage.setItem('node0OtaLastFile',JSON.stringify({name:f.name,size:f.size,mtime:f.lastModified}));resolve(f||null)};i.click()})}\n"
+		"async function chooseOtaFile(){\n"
+		"  if(window.showOpenFilePicker&&window.indexedDB){\n"
+		"    const old=await otaGetHandle();\n"
+		"    if(old){try{let perm=await old.queryPermission({mode:'read'});if(perm!=='granted')perm=await old.requestPermission({mode:'read'});if(perm==='granted'){const f=await old.getFile();if(confirm('Use saved firmware file: '+f.name+'?\\nCancel to choose another file.'))return f;}}catch(e){}}\n"
+		"    try{const hs=await showOpenFilePicker({multiple:false,types:[{description:'ESP-IDF firmware',accept:{'application/octet-stream':['.bin']}}]});if(hs&&hs[0]){await otaSaveHandle(hs[0]);return await hs[0].getFile();}}catch(e){return null;}\n"
+		"  }\n"
+		"  return chooseFileInput();\n"
+		"}\n"
+		"function safeHeader(s){return String(s||'').replace(/[^\\x20-\\x7e]/g,'?').slice(0,80)}\n"
+		"async function loadOtaStatus(){\n"
+		"  if(otaBusy||!tasksVisible)return;\n"
+		"  try{const r=await fetch('/ota/status');const j=await r.json();otaEnabled=!!j.enabled;otaStatusText=otaEnabled?'OTA ready on '+(j.update_label||'ota'):'OTA disabled: set PIN';updateOtaUi();}catch(e){otaEnabled=false;otaStatusText='OTA status error';updateOtaUi();}\n"
+		"}\n"
+		"async function startOta(){\n"
+		"  if(otaBusy)return;\n"
+		"  if(!isLocalSelected()){alert('OTA is only available for local node0.');return;}\n"
+		"  await loadOtaStatus();\n"
+		"  if(!otaEnabled){alert('OTA is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
+		"  const file=await chooseOtaFile();\n"
+		"  if(!file)return;\n"
+		"  if(!file.name.toLowerCase().endsWith('.bin')&&!confirm('Selected file is not .bin. Continue anyway?'))return;\n"
+		"  const pin=prompt('OTA PIN');\n"
+		"  if(!pin)return;\n"
+		"  const phrase=prompt('Type UPDATE NODE0 to update node0 and reboot.');\n"
+		"  if(phrase!=='UPDATE NODE0'){alert('OTA cancelled.');return;}\n"
+		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to node0 and reboot?'))return;\n"
+		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
+		"  const xhr=new XMLHttpRequest();\n"
+		"  xhr.open('POST','/ota');\n"
+		"  xhr.setRequestHeader('Content-Type','application/octet-stream');\n"
+		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
+		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
+		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus('OTA uploading '+pct+'%',true,pct)}};\n"
+		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);setTimeout(()=>location.reload(),9000)}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0)}};\n"
+		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0)};\n"
+		"  xhr.send(file);\n"
+		"}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
 		"  const c=rest[0];\n"
@@ -1490,6 +1973,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  return out;\n"
 		"}\n"
 		"async function tick(){\n"
+		"  if(otaBusy)return;\n"
 		"  try{\n"
 		"    const r=await fetch('/log?from='+cursor);\n"
 		"    const next=r.headers.get('X-Log-Next');\n"
@@ -1504,6 +1988,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  }catch(e){document.getElementById('st').textContent='ERR'}\n"
 		"}\n"
 		"async function loadNodes(){\n"
+		"  if(otaBusy)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  if(document.activeElement===s) return;\n"
 		"  try{\n"
@@ -1513,6 +1998,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    lastNodes=txt;\n"
 		"    const j=JSON.parse(txt);\n"
 		"    const cur=j.selected_mac;\n"
+		"    localMac=j.local_mac||localMac;\n"
 		"    const prev=s.value;\n"
 		"    selectedMac=cur||prev||selectedMac;\n"
 		"    s.innerHTML='';\n"
@@ -1524,6 +2010,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    }\n"
 		"    s.value = cur || prev;\n"
 		"    selectedMac=s.value||selectedMac;\n"
+		"    updateOtaUi();\n"
 		"  }catch(e){}\n"
 		"}\n"
 		"async function onNodeSel(){\n"
@@ -1531,6 +2018,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const mac=s.value;\n"
 		"  selectedMac=mac;\n"
 		"  clearTasksPanel();\n"
+		"  updateOtaUi();\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetch('/select?mac='+mac);}catch(e){}\n"
@@ -1542,7 +2030,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  document.getElementById('log').innerHTML='';\n"
 		"}\n"
 		"async function loadTasks(){\n"
-		"  if(!tasksVisible) return;\n"
+		"  if(!tasksVisible||otaBusy) return;\n"
 		"  try{\n"
 		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
 		"    const r=await fetch('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''));\n"
@@ -1576,6 +2064,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
 		"setInterval(loadNodes,2000);\n"
 		"setInterval(loadTasks,2000);\n"
+		"setInterval(loadOtaStatus,5000);\n"
 		"loadNodes();\n"
 		"tick();\n"
 		"</script>\n"
@@ -1629,6 +2118,20 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_ota_status = {
+		.uri		= "/ota/status",
+		.method		= HTTP_GET,
+		.handler	= http_ota_status_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota = {
+		.uri		= "/ota",
+		.method		= HTTP_POST,
+		.handler	= http_ota_post,
+		.user_ctx	= NULL
+	};
+
 	esp_err_t err = httpd_register_uri_handler(server, &uri_root);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_log);
@@ -1639,7 +2142,11 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_select);
 	if (err != ESP_OK) return err;
-	return httpd_register_uri_handler(server, &uri_clear);
+	err = httpd_register_uri_handler(server, &uri_clear);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_status);
+	if (err != ESP_OK) return err;
+	return httpd_register_uri_handler(server, &uri_ota);
 }
 
 
@@ -1658,6 +2165,10 @@ esp_err_t log_http_server_init(void)
 
 	// vprintf hook
 	s_orig_vprintf = (vprintf_like_t)esp_log_set_vprintf(&log_http_vprintf);
+	s_ota_mutex = xSemaphoreCreateMutex();
+	if (!s_ota_mutex) {
+		ESP_LOGW(TAG, "OTA mutex allocation failed; web OTA disabled");
+	}
 
 	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
 	return ESP_OK;
@@ -1672,8 +2183,8 @@ esp_err_t log_http_server_start(void)
 	config.httpd.stack_size = 10240;
 	config.httpd.max_open_sockets = 2;
 	config.httpd.backlog_conn = 2;
-	config.httpd.recv_wait_timeout = 3;
-	config.httpd.send_wait_timeout = 3;
+	config.httpd.recv_wait_timeout = 10;
+	config.httpd.send_wait_timeout = 10;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;
@@ -1696,5 +2207,6 @@ esp_err_t log_http_server_start(void)
 	}
 
 	ESP_LOGI(TAG, "HTTPS log server started on port %d", CONFIG_NODE0_HTTPS_PORT);
+	ota_mark_running_app_valid_if_pending();
 	return ESP_OK;
 }
