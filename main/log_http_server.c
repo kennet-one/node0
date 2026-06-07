@@ -120,7 +120,9 @@ typedef struct {
 	bool used;
 	bool valid;
 	bool staging_active;
+	int slot_count;
 	ram_status_t ram;
+	persistent_status_t persistent;
 	stack_monitor_snapshot_t current;
 	stack_monitor_snapshot_t staging;
 } taskmon_ent_t;
@@ -229,7 +231,19 @@ static persistent_status_t persistent_status_for_mac(const uint8_t mac[6])
 {
 	persistent_status_t status = {0};
 
-	if (!mac || !mac_eq(mac, s_local_mac)) {
+	if (!mac) {
+		return status;
+	}
+
+	if (!mac_eq(mac, s_local_mac)) {
+		portENTER_CRITICAL(&s_taskmon_lock);
+		{
+			taskmon_ent_t *ent = taskmon_find_locked(mac, false);
+			if (ent && (ent->persistent.flash_valid || ent->persistent.nvs_valid)) {
+				status = ent->persistent;
+			}
+		}
+		portEXIT_CRITICAL(&s_taskmon_lock);
 		return status;
 	}
 
@@ -262,6 +276,24 @@ static persistent_status_t persistent_status_for_mac(const uint8_t mac[6])
 	return status;
 }
 
+static int taskmon_slot_count_for_mac(const uint8_t mac[6])
+{
+	int slot_count = -1;
+
+	if (!mac) return slot_count;
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, false);
+		if (ent && ent->slot_count >= 0) {
+			slot_count = ent->slot_count;
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+
+	return slot_count;
+}
+
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
 {
 	taskmon_ent_t *empty = NULL;
@@ -281,6 +313,7 @@ static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
 
 	memset(empty, 0, sizeof(*empty));
 	empty->used = true;
+	empty->slot_count = -1;
 	mac_copy(empty->mac, mac);
 	copy_tag(empty->tag, sizeof(empty->tag), "node");
 	return empty;
@@ -301,7 +334,10 @@ static void taskmon_start_locked(taskmon_ent_t *ent, const uint8_t mac[6], const
 	ent->staging.updated_ms = ms_now();
 	ent->staging.count = 0;
 	ent->staging.cpu_valid = false;
+	ent->slot_count = -1;
 	ent->ram.valid = false;
+	ent->persistent.flash_valid = false;
+	ent->persistent.nvs_valid = false;
 	ent->staging_active = true;
 	mac_copy(ent->mac, mac);
 	taskmon_update_tag_locked(ent, tag);
@@ -348,6 +384,16 @@ static void taskmon_set_cpu_locked(taskmon_ent_t *ent, const uint8_t mac[6],
 	taskmon_update_tag_locked(ent, tag);
 }
 
+static void taskmon_set_slot_count_locked(taskmon_ent_t *ent, const uint8_t mac[6],
+                                          const char *tag, int slot_count)
+{
+	if (!ent || slot_count < 0) return;
+
+	mac_copy(ent->mac, mac);
+	taskmon_update_tag_locked(ent, tag);
+	ent->slot_count = slot_count;
+}
+
 static void taskmon_set_ram_locked(taskmon_ent_t *ent, const uint8_t mac[6],
                                    const char *tag, const ram_status_t *ram)
 {
@@ -356,6 +402,19 @@ static void taskmon_set_ram_locked(taskmon_ent_t *ent, const uint8_t mac[6],
 	mac_copy(ent->mac, mac);
 	taskmon_update_tag_locked(ent, tag);
 	ent->ram = *ram;
+}
+
+static void taskmon_set_persistent_locked(taskmon_ent_t *ent, const uint8_t mac[6],
+                                          const char *tag, const persistent_status_t *persistent)
+{
+	if (!ent || !persistent ||
+	    (!persistent->flash_valid && !persistent->nvs_valid)) {
+		return;
+	}
+
+	mac_copy(ent->mac, mac);
+	taskmon_update_tag_locked(ent, tag);
+	ent->persistent = *persistent;
 }
 
 static bool taskmon_get_snapshot(const uint8_t mac[6], stack_monitor_snapshot_t *out,
@@ -503,6 +562,27 @@ static bool parse_taskmon_cpu(const char *line, uint32_t *cpu_load_x10)
 	return true;
 }
 
+static bool parse_taskmon_slots(const char *line, int *slot_count)
+{
+	if (!line || !slot_count) return false;
+
+	const char *p = strstr(line, "===== STACK MONITOR");
+	if (!p) return false;
+
+	p = strstr(p, "slots=");
+	if (!p) return false;
+	p += strlen("slots=");
+
+	char *end = NULL;
+	long value = strtol(p, &end, 10);
+	if (end == p || value < 0 || value > 1024) {
+		return false;
+	}
+
+	*slot_count = (int)value;
+	return true;
+}
+
 static bool parse_taskmon_ram(const char *line, ram_status_t *ram)
 {
 	if (!line || !ram) return false;
@@ -528,6 +608,41 @@ static bool parse_taskmon_ram(const char *line, ram_status_t *ram)
 	return true;
 }
 
+static bool parse_taskmon_persistent(const char *line, persistent_status_t *persistent)
+{
+	if (!line || !persistent) return false;
+
+	const char *body = body_after_marker(line, "[STACKMON]");
+	const char *p = body ? body : line;
+	while (*p == ' ') p++;
+	if (strncmp(p, "FLASH:", 6) != 0) return false;
+
+	unsigned chip = 0;
+	unsigned app_used = 0;
+	unsigned app_slot = 0;
+	unsigned nvs_used = 0;
+	unsigned nvs_free = 0;
+	unsigned nvs_avail = 0;
+	unsigned nvs_total = 0;
+	if (sscanf(p,
+	           "FLASH: chip=%u app_used=%u app_slot=%u nvs_used=%u nvs_free=%u nvs_avail=%u nvs_total=%u",
+	           &chip, &app_used, &app_slot, &nvs_used, &nvs_free, &nvs_avail, &nvs_total) != 7) {
+		return false;
+	}
+
+	memset(persistent, 0, sizeof(*persistent));
+	persistent->flash_valid = true;
+	persistent->flash_chip_bytes = chip;
+	persistent->app_used_bytes = app_used;
+	persistent->app_partition_bytes = app_slot;
+	persistent->nvs_valid = true;
+	persistent->nvs_used_entries = nvs_used;
+	persistent->nvs_free_entries = nvs_free;
+	persistent->nvs_available_entries = nvs_avail;
+	persistent->nvs_total_entries = nvs_total;
+	return true;
+}
+
 static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const char *line)
 {
 	if (!mac || !line) return false;
@@ -535,13 +650,18 @@ static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const cha
 	stack_monitor_task_info_t task;
 	uint32_t cpu_load_x10 = 0;
 	ram_status_t ram;
+	persistent_status_t persistent;
+	int slot_count = -1;
 	bool is_end = strstr(line, "===== END STACK MONITOR") != NULL;
 	bool is_start = !is_end && strstr(line, "===== STACK MONITOR") != NULL;
 	bool has_task = parse_taskmon_task(line, &task);
 	bool has_cpu = parse_taskmon_cpu(line, &cpu_load_x10);
+	bool has_slots = parse_taskmon_slots(line, &slot_count);
 	bool has_ram = parse_taskmon_ram(line, &ram);
+	bool has_persistent = parse_taskmon_persistent(line, &persistent);
 
-	if (!is_start && !is_end && !has_task && !has_cpu && !has_ram) {
+	if (!is_start && !is_end && !has_task && !has_cpu && !has_slots &&
+	    !has_ram && !has_persistent) {
 		return false;
 	}
 
@@ -554,6 +674,9 @@ static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const cha
 			if (is_start) {
 				taskmon_start_locked(ent, mac, tag);
 			}
+			if (has_slots) {
+				taskmon_set_slot_count_locked(ent, mac, tag, slot_count);
+			}
 			if (has_task) {
 				taskmon_add_task_locked(ent, mac, tag, &task);
 			}
@@ -562,6 +685,9 @@ static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const cha
 			}
 			if (has_ram) {
 				taskmon_set_ram_locked(ent, mac, tag, &ram);
+			}
+			if (has_persistent) {
+				taskmon_set_persistent_locked(ent, mac, tag, &persistent);
 			}
 			if (is_end) {
 				taskmon_publish_locked(ent);
@@ -1148,7 +1274,7 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 
 	char mac_hex[13];
 	mac_to_hex(mac, mac_hex);
-	int slot_count = mac_eq(mac, s_local_mac) ? STACK_MONITOR_MAX_TASKS : -1;
+	int slot_count = mac_eq(mac, s_local_mac) ? STACK_MONITOR_MAX_TASKS : taskmon_slot_count_for_mac(mac);
 	uint32_t uptime_s = 0;
 	bool uptime_valid = node_uptime_for_mac(mac, &uptime_s);
 	ram_status_t ram = ram_status_for_mac(mac);
