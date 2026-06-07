@@ -9,6 +9,7 @@
 
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_err.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -27,6 +28,11 @@
 #include "stack_monitor.h"
 
 static const char *TAG = "log_http";
+
+extern const unsigned char node0_https_servercert_pem_start[] asm("_binary_node0_https_servercert_pem_start");
+extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_https_servercert_pem_end");
+extern const unsigned char node0_https_prvtkey_pem_start[] asm("_binary_node0_https_prvtkey_pem_start");
+extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_https_prvtkey_pem_end");
 
 /* ----------------- Налаштування ----------------- */
 
@@ -1579,41 +1585,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
-
-/* ----------------- Public API ----------------- */
-
-esp_err_t log_http_server_init(void)
+static esp_err_t register_log_http_handlers(httpd_handle_t server)
 {
-	esp_wifi_get_mac(WIFI_IF_STA, s_local_mac);
-
-	// selected = local
-	mac_copy(s_sel_mac, s_local_mac);
-	strncpy(s_local_tag, "node0", sizeof(s_local_tag) - 1);
-	s_local_tag[sizeof(s_local_tag) - 1] = '\0';
-	strncpy(s_sel_tag, s_local_tag, sizeof(s_sel_tag) - 1);
-	s_sel_tag[sizeof(s_sel_tag) - 1] = '\0';
-
-	// vprintf hook
-	s_orig_vprintf = (vprintf_like_t)esp_log_set_vprintf(&log_http_vprintf);
-
-	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
-	return ESP_OK;
-}
-
-esp_err_t log_http_server_start(void)
-{
-	if (s_http_server) return ESP_OK;
-
-	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-	config.stack_size = 5128;
-	config.lru_purge_enable = true;
-
-	esp_err_t err = httpd_start(&s_http_server, &config);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
-		return err;
-	}
-
 	httpd_uri_t uri_root = {
 		.uri		= "/",
 		.method		= HTTP_GET,
@@ -1656,13 +1629,67 @@ esp_err_t log_http_server_start(void)
 		.user_ctx	= NULL
 	};
 
-	httpd_register_uri_handler(s_http_server, &uri_root);
-	httpd_register_uri_handler(s_http_server, &uri_log);
-	httpd_register_uri_handler(s_http_server, &uri_tasks);
-	httpd_register_uri_handler(s_http_server, &uri_nodes);
-	httpd_register_uri_handler(s_http_server, &uri_select);
-	httpd_register_uri_handler(s_http_server, &uri_clear);
+	esp_err_t err = httpd_register_uri_handler(server, &uri_root);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_log);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_tasks);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_nodes);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_select);
+	if (err != ESP_OK) return err;
+	return httpd_register_uri_handler(server, &uri_clear);
+}
 
-	ESP_LOGI(TAG, "HTTP log server started");
+
+/* ----------------- Public API ----------------- */
+
+esp_err_t log_http_server_init(void)
+{
+	esp_wifi_get_mac(WIFI_IF_STA, s_local_mac);
+
+	// selected = local
+	mac_copy(s_sel_mac, s_local_mac);
+	strncpy(s_local_tag, "node0", sizeof(s_local_tag) - 1);
+	s_local_tag[sizeof(s_local_tag) - 1] = '\0';
+	strncpy(s_sel_tag, s_local_tag, sizeof(s_sel_tag) - 1);
+	s_sel_tag[sizeof(s_sel_tag) - 1] = '\0';
+
+	// vprintf hook
+	s_orig_vprintf = (vprintf_like_t)esp_log_set_vprintf(&log_http_vprintf);
+
+	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
+	return ESP_OK;
+}
+
+esp_err_t log_http_server_start(void)
+{
+	if (s_http_server) return ESP_OK;
+
+	httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+	config.httpd.lru_purge_enable = true;
+	config.httpd.stack_size = 10240;
+	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
+	config.servercert = node0_https_servercert_pem_start;
+	config.servercert_len = node0_https_servercert_pem_end - node0_https_servercert_pem_start;
+	config.prvtkey_pem = node0_https_prvtkey_pem_start;
+	config.prvtkey_len = node0_https_prvtkey_pem_end - node0_https_prvtkey_pem_start;
+
+	esp_err_t err = httpd_ssl_start(&s_http_server, &config);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
+		return err;
+	}
+
+	err = register_log_http_handlers(s_http_server);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "register HTTPS handlers failed: %s", esp_err_to_name(err));
+		httpd_ssl_stop(s_http_server);
+		s_http_server = NULL;
+		return err;
+	}
+
+	ESP_LOGI(TAG, "HTTPS log server started on port %d", CONFIG_NODE0_HTTPS_PORT);
 	return ESP_OK;
 }

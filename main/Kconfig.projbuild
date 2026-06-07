@@ -204,4 +204,11 @@ menu "Example Configuration"
         default "192.168.1.1"
         help
             Main DNS server used by node0 when static IPv4 is enabled.
+
+    config NODE0_HTTPS_PORT
+        int "node0 HTTPS log server port"
+        range 1 65535
+        default 443
+        help
+            HTTPS port used by the node0 log web UI.
 endmenu
