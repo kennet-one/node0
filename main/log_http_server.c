@@ -53,7 +53,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #endif
 
 #ifndef WEB_POLL_MS
-	#define WEB_POLL_MS			500
+	#define WEB_POLL_MS			1000
 #endif
 
 #ifndef LOG_HTTP_MAX_NODES
@@ -1670,6 +1670,11 @@ esp_err_t log_http_server_start(void)
 	httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 10240;
+	config.httpd.max_open_sockets = 2;
+	config.httpd.backlog_conn = 2;
+	config.httpd.recv_wait_timeout = 3;
+	config.httpd.send_wait_timeout = 3;
+	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;
 	config.servercert_len = node0_https_servercert_pem_end - node0_https_servercert_pem_start;
