@@ -31,7 +31,7 @@
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
-#define NODE0_MTXON_STACK_EXTRA_WORDS (500U)
+#define NODE0_WIFI_STACK_EXTRA_WORDS (500U)
 //#define FIXED_ROOT  1   // на node0
 
 static const char *MESH_TAG = "node0";
@@ -67,8 +67,8 @@ static bool s_wifi_task_stack_patch_installed = false;
 static uint32_t node0_wifi_stack_depth_for_task(const char *name,
                                                 uint32_t stack_depth)
 {
-	if (name && strcmp(name, "MTXON") == 0) {
-		return stack_depth + NODE0_MTXON_STACK_EXTRA_WORDS;
+	if (name && (strcmp(name, "MTXON") == 0 || strcmp(name, "MRX") == 0)) {
+		return stack_depth + NODE0_WIFI_STACK_EXTRA_WORDS;
 	}
 
 	return stack_depth;
@@ -116,7 +116,7 @@ static void node0_install_wifi_task_stack_patch(void)
 
 	if (!g_wifi_osi_funcs._task_create ||
 	    !g_wifi_osi_funcs._task_create_pinned_to_core) {
-		ESP_LOGW(MESH_TAG, "MTXON stack patch skipped: Wi-Fi OS adapter missing task hooks");
+		ESP_LOGW(MESH_TAG, "Wi-Fi stack patch skipped: Wi-Fi OS adapter missing task hooks");
 		return;
 	}
 
@@ -127,8 +127,8 @@ static void node0_install_wifi_task_stack_patch(void)
 	s_wifi_task_stack_patch_installed = true;
 
 	ESP_LOGI(MESH_TAG,
-	         "MTXON stack patch installed: +%u words",
-	         (unsigned)NODE0_MTXON_STACK_EXTRA_WORDS);
+	         "Wi-Fi stack patch installed: MTXON/MRX +%u words",
+	         (unsigned)NODE0_WIFI_STACK_EXTRA_WORDS);
 }
 
 /* -------------------------------------------------------------------------- */

@@ -78,6 +78,7 @@ static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_lines[LOG_HTTP_LINES][LOG_HTTP_LINE_MAX];
 static uint32_t s_write_idx = 0;	// абсолютний лічильник рядків (cursor)
 static uint32_t s_total_lines = 0;
+static uint8_t s_http_wire_drop_budget = 0;
 
 typedef int (*vprintf_like_t)(const char *fmt, va_list ap);
 static vprintf_like_t s_orig_vprintf = NULL;
@@ -770,12 +771,86 @@ static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const cha
 	return true;
 }
 
+static bool starts_with_len(const char *s, size_t len, const char *prefix)
+{
+	size_t plen = strlen(prefix);
+	return s && len >= plen && memcmp(s, prefix, plen) == 0;
+}
+
+static const char *log_payload_start(const char *line, size_t len, size_t *out_len)
+{
+	const char *p = line;
+	size_t l = len;
+
+	while (l > 0 && (*p == ' ' || *p == '\t')) {
+		p++;
+		l--;
+	}
+
+	if (l > 2 && p[0] == '[') {
+		for (size_t i = 1; i < l && i < 40; i++) {
+			if (p[i] == ']') {
+				size_t skip = i + 1;
+				if (skip < l && p[skip] == ' ') {
+					skip++;
+				}
+				p += skip;
+				l -= skip;
+				while (l > 0 && (*p == ' ' || *p == '\t')) {
+					p++;
+					l--;
+				}
+				break;
+			}
+		}
+	}
+
+	if (out_len) {
+		*out_len = l;
+	}
+	return p;
+}
+
+static bool log_http_wire_status_line(const char *line, size_t len)
+{
+	return starts_with_len(line, len, "HTTP/1.0 ") ||
+	       starts_with_len(line, len, "HTTP/1.1 ");
+}
+
+static bool log_http_wire_header_line(const char *line, size_t len)
+{
+	static const char *const prefixes[] = {
+		"Content-Type:",
+		"Content-Length:",
+		"Transfer-Encoding:",
+		"X-Log-Next:",
+		"X-Log-Reset:",
+		"Cache-Control:",
+		"Connection:",
+		"Server:",
+		"Date:",
+	};
+
+	for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+		if (starts_with_len(line, len, prefixes[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool log_http_wire_chunk_end(const char *line, size_t len)
+{
+	return len == 1 && line[0] == '0';
+}
+
 static void log_buffer_clear(void)
 {
 	portENTER_CRITICAL(&s_log_lock);
 	{
 		s_write_idx = 0;
 		s_total_lines = 0;
+		s_http_wire_drop_budget = 0;
 		memset(s_lines, 0, sizeof(s_lines));
 	}
 	portEXIT_CRITICAL(&s_log_lock);
@@ -795,6 +870,27 @@ static void log_buffer_append_line(const char *line, size_t len)
 
 	portENTER_CRITICAL(&s_log_lock);
 	{
+		size_t payload_len = 0;
+		const char *payload = log_payload_start(line, len, &payload_len);
+		bool drop_line = false;
+
+		if (log_http_wire_status_line(payload, payload_len)) {
+			s_http_wire_drop_budget = 10;
+			drop_line = true;
+		} else if (s_http_wire_drop_budget > 0 &&
+		           (log_http_wire_header_line(payload, payload_len) ||
+		            log_http_wire_chunk_end(payload, payload_len))) {
+			s_http_wire_drop_budget--;
+			drop_line = true;
+		} else if (s_http_wire_drop_budget > 0) {
+			s_http_wire_drop_budget = 0;
+		}
+
+		if (drop_line) {
+			portEXIT_CRITICAL(&s_log_lock);
+			return;
+		}
+
 		uint32_t idx = s_write_idx % LOG_HTTP_LINES;
 
 		size_t copy_len = (len >= (LOG_HTTP_LINE_MAX - 1)) ? (LOG_HTTP_LINE_MAX - 1) : len;
