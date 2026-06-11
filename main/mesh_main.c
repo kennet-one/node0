@@ -487,6 +487,14 @@ static void mesh_rx_task(void *arg)
 			}
 
 			// 4) Старий TEXT (type=1) — твоя поточна логіка
+			if (h->type == MESH_OTA_TYPE_STATUS) {
+				if (data.size >= sizeof(mesh_ota_status_packet_t)) {
+					const mesh_ota_status_packet_t *p = (const mesh_ota_status_packet_t *)rx_buf;
+					log_http_server_remote_ota_status(p->h.src_mac, p);
+				}
+				continue;
+			}
+
 			if (h->type == MESH_PKT_TYPE_TEXT) {
 				if (data.size >= sizeof(mesh_packet_t)) {
 					const mesh_packet_t *p = (const mesh_packet_t *)rx_buf;

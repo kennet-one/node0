@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_image_format.h"
+#include "esp_mac.h"
 #include "esp_mesh.h"
 #include "esp_ota_ops.h"
 #include "esp_timer.h"
@@ -66,6 +68,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 
 #define NODE0_OTA_BUF_SIZE		4096U
 #define NODE0_OTA_RECV_TIMEOUT_RETRIES	3
+#define REMOTE_OTA_ACK_TIMEOUT_MS	8000U
 #define LOG_STREAM_TASK_STACK		6144U
 #define LOG_STREAM_HEARTBEAT_MS		2000U
 
@@ -161,6 +164,7 @@ static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
 static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...);
 static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
 static void log_stream_notify(void);
+static bool parse_mac_hex(const char *s, uint8_t mac[6]);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -183,6 +187,35 @@ typedef struct {
 static SemaphoreHandle_t s_ota_mutex = NULL;
 static portMUX_TYPE s_ota_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static node0_ota_status_t s_ota_status = {
+	.state = NODE0_OTA_IDLE,
+};
+
+typedef struct {
+	bool waiting;
+	uint8_t mac[6];
+	uint8_t op;
+	uint16_t seq;
+	mesh_ota_status_packet_t ack;
+} remote_ota_wait_t;
+
+typedef struct {
+	node0_ota_state_t state;
+	bool target_valid;
+	uint8_t target_mac[6];
+	char target_tag[16];
+	uint32_t total_bytes;
+	uint32_t written_bytes;
+	uint32_t started_ms;
+	uint32_t finished_ms;
+	char last_error[96];
+	char last_result[96];
+	char remote_message[MESH_OTA_STATUS_MSG_MAX];
+} remote_ota_status_t;
+
+static SemaphoreHandle_t s_remote_ota_ack_sem = NULL;
+static portMUX_TYPE s_remote_ota_lock = portMUX_INITIALIZER_UNLOCKED;
+static remote_ota_wait_t s_remote_ota_wait = {0};
+static remote_ota_status_t s_remote_ota_status = {
 	.state = NODE0_OTA_IDLE,
 };
 
@@ -234,6 +267,24 @@ static void copy_tag(char *dst, size_t dst_sz, const char *tag)
 		pos++;
 	}
 	dst[pos] = '\0';
+}
+
+static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz)
+{
+	size_t n = 0;
+
+	if (!dst || dst_sz == 0) {
+		return;
+	}
+
+	if (src && src_sz > 0) {
+		n = strnlen(src, src_sz);
+		if (n >= dst_sz) {
+			n = dst_sz - 1;
+		}
+		memcpy(dst, src, n);
+	}
+	dst[n] = '\0';
 }
 
 static void selection_snapshot(uint8_t mac[6], char *tag, size_t tag_sz)
@@ -1238,6 +1289,61 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 	}
 }
 
+void log_http_server_remote_ota_status(const uint8_t mac[6],
+                                       const mesh_ota_status_packet_t *status)
+{
+	if (!mac || !status) return;
+
+	bool give_ack = false;
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	{
+		if (s_remote_ota_status.target_valid &&
+		    mac_eq(mac, s_remote_ota_status.target_mac)) {
+			if (status->total > 0) {
+				s_remote_ota_status.total_bytes = status->total;
+			}
+			s_remote_ota_status.written_bytes = status->offset;
+
+			if (status->op != MESH_OTA_OP_DATA ||
+			    status->code != MESH_OTA_STATUS_OK) {
+				copy_packet_text(s_remote_ota_status.remote_message,
+				                 sizeof(s_remote_ota_status.remote_message),
+				                 status->message, sizeof(status->message));
+			}
+
+			if (status->code != MESH_OTA_STATUS_OK) {
+				s_remote_ota_status.state = NODE0_OTA_FAILED;
+				copy_packet_text(s_remote_ota_status.last_error,
+				                 sizeof(s_remote_ota_status.last_error),
+				                 status->message, sizeof(status->message));
+			}
+		}
+
+		if (s_remote_ota_wait.waiting &&
+		    mac_eq(mac, s_remote_ota_wait.mac) &&
+		    status->op == s_remote_ota_wait.op &&
+		    status->seq == s_remote_ota_wait.seq) {
+			s_remote_ota_wait.ack = *status;
+			s_remote_ota_wait.waiting = false;
+			give_ack = true;
+		}
+	}
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (give_ack && s_remote_ota_ack_sem) {
+		xSemaphoreGive(s_remote_ota_ack_sem);
+	}
+
+	if (status->op != MESH_OTA_OP_DATA || status->code != MESH_OTA_STATUS_OK) {
+		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
+		copy_packet_text(msg, sizeof(msg), status->message, sizeof(status->message));
+		ESP_LOGI(TAG, "remote OTA status from " MACSTR ": op=%u code=%u seq=%u %s",
+		         MAC2STR(mac), (unsigned)status->op, (unsigned)status->code,
+		         (unsigned)status->seq, msg);
+	}
+}
+
 /* ----------------- HTTP handlers ----------------- */
 
 static esp_err_t http_nodes_get(httpd_req_t *req)
@@ -1774,6 +1880,212 @@ static void ota_status_finish(node0_ota_state_t state, const char *msg)
 	portEXIT_CRITICAL(&s_ota_state_lock);
 }
 
+static bool remote_ota_supported_tag(const char *tag)
+{
+	return tag && strcmp(tag, "choinka") == 0;
+}
+
+static void remote_ota_status_begin(const uint8_t mac[6], const char *tag,
+                                    uint32_t total_bytes)
+{
+	remote_ota_status_t status;
+	memset(&status, 0, sizeof(status));
+	status.state = NODE0_OTA_UPDATING;
+	status.target_valid = true;
+	mac_copy(status.target_mac, mac);
+	copy_tag(status.target_tag, sizeof(status.target_tag), tag);
+	status.total_bytes = total_bytes;
+	status.started_ms = ms_now();
+	strncpy(status.last_result, "remote upload started",
+	        sizeof(status.last_result) - 1);
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_remote_ota_status = status;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static void remote_ota_status_progress(uint32_t written_bytes)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_remote_ota_status.written_bytes = written_bytes;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static void remote_ota_status_finish(node0_ota_state_t state, const char *msg)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_remote_ota_status.state = state;
+	s_remote_ota_status.finished_ms = ms_now();
+	if (state == NODE0_OTA_FAILED) {
+		strncpy(s_remote_ota_status.last_error, msg ? msg : "remote OTA failed",
+		        sizeof(s_remote_ota_status.last_error) - 1);
+		s_remote_ota_status.last_error[sizeof(s_remote_ota_status.last_error) - 1] = '\0';
+	} else {
+		strncpy(s_remote_ota_status.last_result, msg ? msg : "OK",
+		        sizeof(s_remote_ota_status.last_result) - 1);
+		s_remote_ota_status.last_result[sizeof(s_remote_ota_status.last_result) - 1] = '\0';
+	}
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static bool remote_ota_target_from_req(httpd_req_t *req, uint8_t mac[6],
+                                       char *tag, size_t tag_sz,
+                                       char *err, size_t err_sz)
+{
+	if (!mac || !tag || tag_sz == 0) {
+		snprintf(err, err_sz, "bad target");
+		return false;
+	}
+
+	selection_snapshot(mac, tag, tag_sz);
+
+	char q[80] = {0};
+	if (req && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[32] = {0};
+		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
+			uint8_t parsed[6];
+			if (!parse_mac_hex(v, parsed)) {
+				snprintf(err, err_sz, "bad target MAC");
+				return false;
+			}
+			mac_copy(mac, parsed);
+			if (!lookup_node_tag(mac, tag, tag_sz)) {
+				copy_tag(tag, tag_sz, "node");
+			}
+		}
+	}
+
+	if (mac_eq(mac, s_local_mac)) {
+		snprintf(err, err_sz, "target is local node0");
+		return false;
+	}
+
+	if (!lookup_node_tag(mac, tag, tag_sz)) {
+		snprintf(err, err_sz, "target node is unknown");
+		return false;
+	}
+
+	return true;
+}
+
+static uint16_t remote_ota_next_seq(void)
+{
+	static uint16_t seq = 0;
+	seq++;
+	if (seq == 0) {
+		seq = 1;
+	}
+	return seq;
+}
+
+static void mesh_ota_fill_header(mesh_pkt_hdr_t *h, uint8_t type)
+{
+	if (!h) return;
+
+	memset(h, 0, sizeof(*h));
+	h->magic = MESH_PKT_MAGIC;
+	h->version = MESH_PKT_VERSION;
+	h->type = type;
+	h->counter = ms_now();
+	esp_wifi_get_mac(WIFI_IF_STA, h->src_mac);
+}
+
+static esp_err_t mesh_ota_send_to(const uint8_t to_mac[6], const void *pkt, size_t pkt_len)
+{
+	if (!to_mac || !pkt || pkt_len == 0) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	mesh_data_t data;
+	memset(&data, 0, sizeof(data));
+	data.data = (uint8_t *)pkt;
+	data.size = pkt_len;
+	data.proto = MESH_PROTO_BIN;
+	data.tos = MESH_TOS_P2P;
+
+	mesh_addr_t dest;
+	memset(&dest, 0, sizeof(dest));
+	memcpy(dest.addr, to_mac, 6);
+
+	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+}
+
+static void remote_ota_clear_wait(void)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_remote_ota_wait.waiting = false;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static esp_err_t remote_ota_send_wait(const uint8_t mac[6], const void *pkt,
+                                      size_t pkt_len, uint8_t op, uint16_t seq,
+                                      mesh_ota_status_packet_t *ack,
+                                      char *err, size_t err_sz)
+{
+	if (!s_remote_ota_ack_sem) {
+		snprintf(err, err_sz, "remote OTA ACK semaphore unavailable");
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	while (xSemaphoreTake(s_remote_ota_ack_sem, 0) == pdTRUE) {
+	}
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
+	s_remote_ota_wait.waiting = true;
+	mac_copy(s_remote_ota_wait.mac, mac);
+	s_remote_ota_wait.op = op;
+	s_remote_ota_wait.seq = seq;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	esp_err_t send_err = mesh_ota_send_to(mac, pkt, pkt_len);
+	if (send_err != ESP_OK) {
+		remote_ota_clear_wait();
+		snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
+		return send_err;
+	}
+
+	if (xSemaphoreTake(s_remote_ota_ack_sem,
+	                   pdMS_TO_TICKS(REMOTE_OTA_ACK_TIMEOUT_MS)) != pdTRUE) {
+		remote_ota_clear_wait();
+		snprintf(err, err_sz, "remote OTA ACK timeout");
+		return ESP_ERR_TIMEOUT;
+	}
+
+	mesh_ota_status_packet_t got;
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	got = s_remote_ota_wait.ack;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (ack) {
+		*ack = got;
+	}
+
+	if (got.code != MESH_OTA_STATUS_OK) {
+		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
+		copy_packet_text(msg, sizeof(msg), got.message, sizeof(got.message));
+		snprintf(err, err_sz, "remote OTA error: %s", msg[0] ? msg : "unknown");
+		return ESP_FAIL;
+	}
+
+	return ESP_OK;
+}
+
+static void remote_ota_send_abort(const uint8_t mac[6], const char *reason)
+{
+	mesh_ota_abort_packet_t p;
+	memset(&p, 0, sizeof(p));
+
+	mesh_ota_fill_header(&p.h, MESH_OTA_TYPE_ABORT);
+	p.seq = remote_ota_next_seq();
+	if (reason) {
+		strncpy(p.reason, reason, sizeof(p.reason) - 1);
+		p.reason[sizeof(p.reason) - 1] = '\0';
+	}
+
+	mesh_ota_send_to(mac, &p, sizeof(p));
+}
+
 static esp_err_t http_json_error(httpd_req_t *req, const char *status, const char *msg)
 {
 	char out[192];
@@ -1829,6 +2141,7 @@ static int ota_recv_retry(httpd_req_t *req, uint8_t *buf, size_t len)
 
 static bool ota_validate_first_chunk(const uint8_t *data, size_t len,
                                      esp_app_desc_t *new_desc,
+                                     const char *expected_project,
                                      char *err, size_t err_len)
 {
 	if (!data || !new_desc) {
@@ -1860,14 +2173,16 @@ static bool ota_validate_first_chunk(const uint8_t *data, size_t len,
 	}
 
 	const esp_app_desc_t *running = esp_app_get_description();
-	if (!running ||
-	    strncmp(new_desc->project_name, running->project_name,
+	if (!expected_project || expected_project[0] == '\0') {
+		expected_project = running ? running->project_name : "";
+	}
+	if (strncmp(new_desc->project_name, expected_project,
 	            sizeof(new_desc->project_name)) != 0) {
 		char got[33] = {0};
 		char expected[33] = {0};
 		memcpy(got, new_desc->project_name, sizeof(new_desc->project_name));
-		memcpy(expected, running ? running->project_name : "unknown",
-		       running ? sizeof(running->project_name) : strlen("unknown"));
+		strncpy(expected, expected_project[0] ? expected_project : "unknown",
+		        sizeof(expected) - 1);
 		snprintf(err, err_len, "wrong project: %s, expected %s", got, expected);
 		return false;
 	}
@@ -2005,7 +2320,7 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 		}
 
 		esp_app_desc_t new_desc = {0};
-		if (!ota_validate_first_chunk(buf, first_have, &new_desc,
+		if (!ota_validate_first_chunk(buf, first_have, &new_desc, NULL,
 		                              err_msg, sizeof(err_msg))) {
 			break;
 		}
@@ -2094,6 +2409,288 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 
 	ota_status_finish(NODE0_OTA_FAILED, err_msg);
 	ESP_LOGW(TAG, "OTA failed: %s", err_msg);
+	xSemaphoreGive(s_ota_mutex);
+	return http_json_error(req, "400 Bad Request", err_msg);
+}
+
+static esp_err_t remote_ota_send_chunks_from_buffer(const uint8_t mac[6],
+                                                    const uint8_t *buf,
+                                                    size_t len,
+                                                    uint32_t total_len,
+                                                    uint32_t *written,
+                                                    char *err, size_t err_sz)
+{
+	if (!buf || !written) {
+		snprintf(err, err_sz, "bad remote OTA chunk buffer");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	size_t pos = 0;
+	while (pos < len) {
+		size_t remain = len - pos;
+		uint16_t chunk_len = (uint16_t)(remain > MESH_OTA_CHUNK_MAX
+		                                ? MESH_OTA_CHUNK_MAX
+		                                : remain);
+		if ((uint32_t)chunk_len > total_len - *written) {
+			snprintf(err, err_sz, "remote OTA chunk exceeds image size");
+			return ESP_ERR_INVALID_SIZE;
+		}
+
+		mesh_ota_data_packet_t p;
+		memset(&p, 0, sizeof(p));
+		mesh_ota_fill_header(&p.h, MESH_OTA_TYPE_DATA);
+		p.seq = remote_ota_next_seq();
+		p.len = chunk_len;
+		p.offset = *written;
+		memcpy(p.data, buf + pos, chunk_len);
+
+		mesh_ota_status_packet_t ack;
+		esp_err_t result = remote_ota_send_wait(
+			mac,
+			&p,
+			offsetof(mesh_ota_data_packet_t, data) + chunk_len,
+			MESH_OTA_OP_DATA,
+			p.seq,
+			&ack,
+			err,
+			err_sz);
+		if (result != ESP_OK) {
+			return result;
+		}
+
+		uint32_t expected = *written + chunk_len;
+		if (ack.offset != expected) {
+			snprintf(err, err_sz, "remote OTA offset mismatch %lu/%lu",
+			         (unsigned long)ack.offset, (unsigned long)expected);
+			return ESP_FAIL;
+		}
+
+		*written = ack.offset;
+		remote_ota_status_progress(*written);
+		pos += chunk_len;
+	}
+
+	return ESP_OK;
+}
+
+static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
+{
+	enum { OTA_STATUS_JSON_MAX = 1024 };
+	char out[OTA_STATUS_JSON_MAX];
+	char target_err[96] = {0};
+	uint8_t mac[6] = {0};
+	char tag[16] = "node";
+	bool target_ok = remote_ota_target_from_req(req, mac, tag, sizeof(tag),
+	                                            target_err, sizeof(target_err));
+	bool supported = target_ok && remote_ota_supported_tag(tag);
+
+	char mac_hex[13] = {0};
+	mac_to_hex(mac, mac_hex);
+
+	remote_ota_status_t status;
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	status = s_remote_ota_status;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	bool target_match = target_ok &&
+	                    status.target_valid &&
+	                    mac_eq(mac, status.target_mac);
+	node0_ota_state_t state = target_match ? status.state : NODE0_OTA_IDLE;
+	uint32_t total = target_match ? status.total_bytes : 0;
+	uint32_t written = target_match ? status.written_bytes : 0;
+	const char *last_result = target_match ? status.last_result : "";
+	const char *last_error = target_match ? status.last_error : "";
+	const char *remote_message = target_match ? status.remote_message : "";
+
+	size_t pos = 0;
+	pos = append_fmt(out, sizeof(out), pos,
+	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
+	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
+	                 "\"target_mac\":\"%s\",\"target_tag\":",
+	                 ota_enabled() ? "true" : "false",
+	                 supported ? "true" : "false",
+	                 state == NODE0_OTA_UPDATING ? "true" : "false",
+	                 ota_state_name(state),
+	                 (unsigned long)written,
+	                 (unsigned long)total,
+	                 mac_hex);
+	pos = append_json_string(out, sizeof(out), pos, target_ok ? tag : "");
+	pos = append_fmt(out, sizeof(out), pos, ",\"running_label\":\"remote\","
+	                 "\"update_label\":\"remote\",\"last_result\":");
+	pos = append_json_string(out, sizeof(out), pos, last_result);
+	pos = append_fmt(out, sizeof(out), pos, ",\"last_error\":");
+	pos = append_json_string(out, sizeof(out), pos,
+	                         target_ok ? last_error : target_err);
+	pos = append_fmt(out, sizeof(out), pos, ",\"remote_message\":");
+	pos = append_json_string(out, sizeof(out), pos, remote_message);
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_ota_remote_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		remote_ota_status_finish(NODE0_OTA_FAILED,
+		                         "OTA disabled: set CONFIG_NODE0_OTA_PIN");
+		return http_json_error(req, "403 Forbidden",
+		                       "OTA disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+
+	if (!ota_check_pin(req)) {
+		remote_ota_status_finish(NODE0_OTA_FAILED, "bad OTA PIN");
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	if (!s_ota_mutex) {
+		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
+	}
+	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	}
+
+	uint8_t target_mac[6] = {0};
+	char target_tag[16] = "node";
+	char err_msg[96] = "remote OTA failed";
+	uint8_t *buf = NULL;
+	bool remote_started = false;
+	esp_err_t result = ESP_FAIL;
+
+	do {
+		if (!remote_ota_target_from_req(req, target_mac, target_tag, sizeof(target_tag),
+		                                err_msg, sizeof(err_msg))) {
+			break;
+		}
+		if (!remote_ota_supported_tag(target_tag)) {
+			snprintf(err_msg, sizeof(err_msg), "remote OTA unsupported for %s", target_tag);
+			break;
+		}
+
+		size_t total_len = req->content_len;
+		if (total_len == 0 || total_len > UINT32_MAX) {
+			snprintf(err_msg, sizeof(err_msg), "bad Content-Length");
+			break;
+		}
+
+		buf = (uint8_t *)malloc(NODE0_OTA_BUF_SIZE);
+		if (!buf) {
+			snprintf(err_msg, sizeof(err_msg), "no memory for OTA buffer");
+			break;
+		}
+
+		const size_t validate_need =
+			sizeof(esp_image_header_t) +
+			sizeof(esp_image_segment_header_t) +
+			sizeof(esp_app_desc_t);
+		size_t first_want = total_len < NODE0_OTA_BUF_SIZE ? total_len : NODE0_OTA_BUF_SIZE;
+		size_t first_have = 0;
+		while (first_have < first_want && first_have < validate_need) {
+			int r = ota_recv_retry(req, buf + first_have, first_want - first_have);
+			if (r <= 0) {
+				break;
+			}
+			first_have += (size_t)r;
+		}
+		if (first_have == 0) {
+			snprintf(err_msg, sizeof(err_msg), "failed to read OTA image");
+			break;
+		}
+
+		esp_app_desc_t new_desc = {0};
+		if (!ota_validate_first_chunk(buf, first_have, &new_desc, target_tag,
+		                              err_msg, sizeof(err_msg))) {
+			break;
+		}
+
+		ESP_LOGI(TAG, "remote OTA upload -> " MACSTR " tag=%s project=%s version=%s size=%lu",
+		         MAC2STR(target_mac), target_tag, new_desc.project_name,
+		         new_desc.version, (unsigned long)total_len);
+
+		remote_ota_status_begin(target_mac, target_tag, (uint32_t)total_len);
+
+		mesh_ota_begin_packet_t begin;
+		memset(&begin, 0, sizeof(begin));
+		mesh_ota_fill_header(&begin.h, MESH_OTA_TYPE_BEGIN);
+		begin.seq = remote_ota_next_seq();
+		begin.chunk_size = MESH_OTA_CHUNK_MAX;
+		begin.image_size = (uint32_t)total_len;
+		copy_packet_text(begin.project_name, sizeof(begin.project_name),
+		                 new_desc.project_name, sizeof(new_desc.project_name));
+		copy_packet_text(begin.version, sizeof(begin.version),
+		                 new_desc.version, sizeof(new_desc.version));
+
+		mesh_ota_status_packet_t ack;
+		result = remote_ota_send_wait(target_mac, &begin, sizeof(begin),
+		                              MESH_OTA_OP_BEGIN, begin.seq,
+		                              &ack, err_msg, sizeof(err_msg));
+		if (result != ESP_OK) {
+			break;
+		}
+		remote_started = true;
+
+		uint32_t written = 0;
+		result = remote_ota_send_chunks_from_buffer(target_mac, buf, first_have,
+		                                            (uint32_t)total_len, &written,
+		                                            err_msg, sizeof(err_msg));
+		if (result != ESP_OK) {
+			break;
+		}
+
+		while (written < total_len) {
+			size_t to_read = total_len - written;
+			if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
+
+			int r = ota_recv_retry(req, buf, to_read);
+			if (r <= 0) {
+				snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
+				result = ESP_FAIL;
+				break;
+			}
+
+			result = remote_ota_send_chunks_from_buffer(target_mac, buf, (size_t)r,
+			                                            (uint32_t)total_len, &written,
+			                                            err_msg, sizeof(err_msg));
+			if (result != ESP_OK) {
+				break;
+			}
+		}
+		if (result != ESP_OK) {
+			break;
+		}
+
+		mesh_ota_end_packet_t end;
+		memset(&end, 0, sizeof(end));
+		mesh_ota_fill_header(&end.h, MESH_OTA_TYPE_END);
+		end.seq = remote_ota_next_seq();
+		end.image_size = (uint32_t)total_len;
+
+		result = remote_ota_send_wait(target_mac, &end, sizeof(end),
+		                              MESH_OTA_OP_END, end.seq,
+		                              &ack, err_msg, sizeof(err_msg));
+		if (result != ESP_OK) {
+			break;
+		}
+
+		snprintf(err_msg, sizeof(err_msg), "remote OTA OK, %s rebooting", target_tag);
+		remote_ota_status_finish(NODE0_OTA_REBOOTING, err_msg);
+		ESP_LOGI(TAG, "%s", err_msg);
+
+		free(buf);
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_ok(req, err_msg);
+	} while (0);
+
+	if (remote_started) {
+		remote_ota_send_abort(target_mac, err_msg);
+	}
+	if (buf) {
+		free(buf);
+	}
+
+	remote_ota_status_finish(NODE0_OTA_FAILED, err_msg);
+	ESP_LOGW(TAG, "remote OTA failed: %s", err_msg);
 	xSemaphoreGive(s_ota_mutex);
 	return http_json_error(req, "400 Bad Request", err_msg);
 }
@@ -2332,6 +2929,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let selectedMac='';\n"
 		"let localMac='';\n"
 		"let otaEnabled=false;\n"
+		"let otaSupported=false;\n"
 		"let otaBusy=false;\n"
 		"let otaStatusText='OTA ...';\n"
 		"let otaSlotText='A/B ?';\n"
@@ -2382,12 +2980,15 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
 		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
+		"function selectedNodeTag(){const s=document.getElementById('nodeSel');return s&&s.selectedOptions&&s.selectedOptions[0]?s.selectedOptions[0].textContent:'node'}\n"
+		"function selectedOtaTarget(){return isLocalSelected()?'node0':(selectedNodeTag()||'node')}\n"
+		"function otaFileKey(){return 'ota-bin-'+(isLocalSelected()?'node0':(selectedMac||selectedNodeTag()||'remote'))}\n"
 		"function updateOtaUi(){\n"
 		"  const b=document.getElementById('otaBtn');const s=document.getElementById('otaStatus');const local=isLocalSelected();\n"
 		"  if(!b||!s)return;\n"
-		"  if(!local){b.disabled=true;s.textContent='';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
+		"  if(!local&&!otaSupported){b.disabled=true;s.textContent='';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
 		"  if(!otaEnabled){b.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
-		"  b.disabled=otaBusy;s.textContent=otaStatusText||'ready';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  b.disabled=otaBusy||!otaSupported;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
 		"  otaStatusText=text||'OTA ready';\n"
@@ -2397,13 +2998,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"function idbReq(req){return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}\n"
 		"function otaDb(){return new Promise((resolve,reject)=>{const r=indexedDB.open('node0OtaDb',1);r.onupgradeneeded=()=>r.result.createObjectStore('files');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}\n"
-		"async function otaGetHandle(){try{const db=await otaDb();return await idbReq(db.transaction('files','readonly').objectStore('files').get('node0-bin'))}catch(e){return null}}\n"
-		"async function otaSaveHandle(h){try{const db=await otaDb();await idbReq(db.transaction('files','readwrite').objectStore('files').put(h,'node0-bin'))}catch(e){}}\n"
-		"function chooseFileInput(){return new Promise(resolve=>{const i=document.createElement('input');i.type='file';i.accept='.bin,application/octet-stream';i.onchange=()=>{const f=i.files&&i.files[0];if(f)localStorage.setItem('node0OtaLastFile',JSON.stringify({name:f.name,size:f.size,mtime:f.lastModified}));resolve(f||null)};i.click()})}\n"
+		"async function otaGetHandle(){try{const db=await otaDb();return await idbReq(db.transaction('files','readonly').objectStore('files').get(otaFileKey()))}catch(e){return null}}\n"
+		"async function otaSaveHandle(h){try{const db=await otaDb();await idbReq(db.transaction('files','readwrite').objectStore('files').put(h,otaFileKey()))}catch(e){}}\n"
+		"function chooseFileInput(){return new Promise(resolve=>{const i=document.createElement('input');i.type='file';i.accept='.bin,application/octet-stream';i.onchange=()=>{const f=i.files&&i.files[0];if(f)localStorage.setItem('otaLastFile-'+otaFileKey(),JSON.stringify({name:f.name,size:f.size,mtime:f.lastModified}));resolve(f||null)};i.click()})}\n"
 		"async function chooseOtaFile(){\n"
 		"  if(window.showOpenFilePicker&&window.indexedDB){\n"
 		"    const old=await otaGetHandle();\n"
-		"    if(old){try{let perm=await old.queryPermission({mode:'read'});if(perm!=='granted')perm=await old.requestPermission({mode:'read'});if(perm==='granted'){const f=await old.getFile();if(confirm('Use saved firmware file: '+f.name+'?\\nCancel to choose another file.'))return f;}}catch(e){}}\n"
+		"    if(old){try{let perm=await old.queryPermission({mode:'read'});if(perm!=='granted')perm=await old.requestPermission({mode:'read'});if(perm==='granted'){const f=await old.getFile();if(confirm('Use saved firmware file for '+selectedOtaTarget()+': '+f.name+'?\\nCancel to choose another file.'))return f;}}catch(e){}}\n"
 		"    try{const hs=await showOpenFilePicker({multiple:false,types:[{description:'ESP-IDF firmware',accept:{'application/octet-stream':['.bin']}}]});if(hs&&hs[0]){await otaSaveHandle(hs[0]);return await hs[0].getFile();}}catch(e){return null;}\n"
 		"  }\n"
 		"  return chooseFileInput();\n"
@@ -2411,32 +3012,34 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function safeHeader(s){return String(s||'').replace(/[^\\x20-\\x7e]/g,'?').slice(0,80)}\n"
 		"async function loadOtaStatus(){\n"
 		"  if(otaBusy||!tasksVisible||otaStatusBusy)return;\n"
-		"  if(!isLocalSelected()){otaEnabled=false;otaStatusText='';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();return;}\n"
+		"  const local=isLocalSelected();\n"
 		"  otaStatusBusy=true;\n"
-		"  try{const r=await fetchTimeout('/ota/status',6000);const j=await r.json();otaEnabled=!!j.enabled;updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';updateOtaUi();}catch(e){otaEnabled=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
+		"  try{const url=local?'/ota/status':'/ota/remote/status?mac='+encodeURIComponent(selectedMac||'');const r=await fetchTimeout(url,6000);const j=await r.json();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');otaStatusText=otaSupported?(j.busy?'remote updating':'ready'):'';}updateOtaUi();}catch(e){otaEnabled=false;otaSupported=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
 		"}\n"
 		"async function startOta(){\n"
 		"  if(otaBusy)return;\n"
-		"  if(!isLocalSelected()){alert('OTA is only available for local node0.');return;}\n"
+		"  const local=isLocalSelected();const target=selectedOtaTarget();\n"
 		"  await loadOtaStatus();\n"
+		"  if(!local&&!otaSupported){return;}\n"
 		"  if(!otaEnabled){alert('OTA is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
 		"  const file=await chooseOtaFile();\n"
 		"  if(!file)return;\n"
 		"  if(!file.name.toLowerCase().endsWith('.bin')&&!confirm('Selected file is not .bin. Continue anyway?'))return;\n"
 		"  const pin=prompt('OTA PIN');\n"
 		"  if(!pin)return;\n"
-		"  const phrase=prompt('Type UPDATE NODE0 to update node0 and reboot.');\n"
-		"  if(phrase!=='UPDATE NODE0'){alert('OTA cancelled.');return;}\n"
-		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to node0 and reboot?'))return;\n"
+		"  const confirmPhrase='UPDATE '+String(target||'node').toUpperCase();\n"
+		"  const phrase=prompt('Type '+confirmPhrase+' to update '+target+' and reboot.');\n"
+		"  if(phrase!==confirmPhrase){alert('OTA cancelled.');return;}\n"
+		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to '+target+' and reboot?'))return;\n"
 		"  stopLogStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
-		"  xhr.open('POST','/ota');\n"
+		"  xhr.open('POST',local?'/ota':'/ota/remote?mac='+encodeURIComponent(selectedMac||''));\n"
 		"  xhr.setRequestHeader('Content-Type','application/octet-stream');\n"
 		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
 		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
 		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus('OTA uploading '+pct+'%',true,pct)}};\n"
-		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);setTimeout(()=>location.reload(),9000)}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
+		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
 		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startLogStream()};\n"
 		"  xhr.send(file);\n"
 		"}\n"
@@ -2523,6 +3126,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const s=document.getElementById('nodeSel');\n"
 		"  const mac=s.value;\n"
 		"  selectedMac=mac;\n"
+		"  otaEnabled=false;otaSupported=false;otaStatusText='';setOtaSlot('A/B ?','otaSlotUnknown');\n"
 		"  clearTasksPanel();\n"
 		"  updateOtaUi();\n"
 		"  stopLogStream();\n"
@@ -2530,7 +3134,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
 		"  logStreamErrors=0;pollFallbackUntil=0;startLogStream();\n"
-		"  if(tasksVisible) loadTasks();\n"
+		"  if(tasksVisible){loadTasks();loadOtaStatus();}\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
@@ -2653,6 +3257,20 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_ota_remote_status = {
+		.uri		= "/ota/remote/status",
+		.method		= HTTP_GET,
+		.handler	= http_ota_remote_status_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota_remote = {
+		.uri		= "/ota/remote",
+		.method		= HTTP_POST,
+		.handler	= http_ota_remote_post,
+		.user_ctx	= NULL
+	};
+
 	esp_err_t err = httpd_register_uri_handler(server, &uri_root);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_log);
@@ -2669,7 +3287,11 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ota_status);
 	if (err != ESP_OK) return err;
-	return httpd_register_uri_handler(server, &uri_ota);
+	err = httpd_register_uri_handler(server, &uri_ota);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_remote_status);
+	if (err != ESP_OK) return err;
+	return httpd_register_uri_handler(server, &uri_ota_remote);
 }
 
 
@@ -2692,6 +3314,10 @@ esp_err_t log_http_server_init(void)
 	s_ota_mutex = xSemaphoreCreateMutex();
 	if (!s_ota_mutex) {
 		ESP_LOGW(TAG, "OTA mutex allocation failed; web OTA disabled");
+	}
+	s_remote_ota_ack_sem = xSemaphoreCreateBinary();
+	if (!s_remote_ota_ack_sem) {
+		ESP_LOGW(TAG, "remote OTA ACK semaphore allocation failed; remote OTA disabled");
 	}
 
 	s_log_stream_mutex = xSemaphoreCreateMutex();
@@ -2717,7 +3343,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = 2;
-	config.httpd.max_uri_handlers = 10;
+	config.httpd.max_uri_handlers = 12;
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 5;
 	config.httpd.send_wait_timeout = 5;
