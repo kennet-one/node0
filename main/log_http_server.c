@@ -1102,6 +1102,24 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 	}
 }
 
+static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
+{
+	bool rearm = false;
+
+	if (!mac) return false;
+
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		rearm = s_stream_active &&
+		        mac_eq(mac, s_sel_mac) &&
+		        mac_eq(mac, s_stream_mac) &&
+		        !mac_eq(mac, s_local_mac);
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
+	return rearm;
+}
+
 /* ----------------- vprintf hook (тільки local, якщо local вибраний) ----------------- */
 
 static int log_http_vprintf(const char *fmt, va_list ap)
@@ -1165,6 +1183,7 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	if (!mac) return;
 
 	uint32_t now = ms_now();
+	bool recorded = false;
 
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
@@ -1179,12 +1198,12 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 					s_nodes[i].uptime_s = uptime_s;
 					s_nodes[i].uptime_seen_ms = now;
 				}
-				portEXIT_CRITICAL(&s_nodes_lock);
-				return;
+				recorded = true;
+				break;
 			}
 		}
 
-		if (s_nodes_count < LOG_HTTP_MAX_NODES) {
+		if (!recorded && s_nodes_count < LOG_HTTP_MAX_NODES) {
 			mac_copy(s_nodes[s_nodes_count].mac, mac);
 			copy_tag(s_nodes[s_nodes_count].tag, sizeof(s_nodes[s_nodes_count].tag), tag);
 			s_nodes[s_nodes_count].last_seen_ms = now;
@@ -1192,9 +1211,14 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 			s_nodes[s_nodes_count].uptime_s = uptime_valid ? uptime_s : 0;
 			s_nodes[s_nodes_count].uptime_seen_ms = now;
 			s_nodes_count++;
+			recorded = true;
 		}
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
+
+	if (uptime_valid && selected_remote_stream_needs_rearm(mac)) {
+		mesh_send_log_ctrl(mac, true);
+	}
 }
 
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
