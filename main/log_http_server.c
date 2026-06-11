@@ -776,19 +776,14 @@ static void log_buffer_append_line(const char *line, size_t len)
 }
 
 
-static char *log_buffer_snapshot_since(uint32_t from, size_t *out_len, uint32_t *out_next, bool *out_reset)
+static void log_buffer_stream_range(uint32_t from, uint32_t *out_start,
+                                    uint32_t *out_next, bool *out_reset)
 {
-	char *snap = NULL;
-	size_t size = 0;
-
 	uint32_t next = 0;
 	uint32_t total = 0;
 	uint32_t earliest = 0;
-	uint32_t start_abs = 0;
-	uint32_t count = 0;
 	bool reset = false;
 
-	// 1) знімаємо стан (коротко) під lock
 	portENTER_CRITICAL(&s_log_lock);
 	{
 		next = s_write_idx;
@@ -797,64 +792,50 @@ static char *log_buffer_snapshot_since(uint32_t from, size_t *out_len, uint32_t 
 	}
 	portEXIT_CRITICAL(&s_log_lock);
 
-	// 2) нормалізація from
 	if (from < earliest || from > next) {
 		reset = true;
 		from = earliest;
 	}
-	start_abs = from;
-	count = (next > start_abs) ? (next - start_abs) : 0;
 
-	// 3) алокація під максимум
-	size = (size_t)count * (size_t)LOG_HTTP_LINE_MAX + 1;
-	snap = (char *)malloc(size);
-	if (!snap) {
-		if (out_len) *out_len = 0;
-		if (out_next) *out_next = next;
-		if (out_reset) *out_reset = true;
-		return NULL;
-	}
+	if (out_start) *out_start = from;
+	if (out_next) *out_next = next;
+	if (out_reset) *out_reset = reset;
+}
 
+static bool log_buffer_copy_abs_line(uint32_t abs_i, char *out, size_t out_sz,
+                                     size_t *out_len)
+{
+	if (!out || out_sz == 0) return false;
+
+	bool ok = false;
 	size_t pos = 0;
 
-	// 4) копіюємо рядки під lock (щоб не рвалися)
 	portENTER_CRITICAL(&s_log_lock);
 	{
-		// якщо за час алокації щось змінилось — перерахуй earliest/next “на льоту”
-		next = s_write_idx;
-		total = s_total_lines;
-		earliest = (next >= total) ? (next - total) : 0;
+		uint32_t next = s_write_idx;
+		uint32_t total = s_total_lines;
+		uint32_t earliest = (next >= total) ? (next - total) : 0;
 
-		// якщо наш start_abs вже випав — ресет
-		if (start_abs < earliest || start_abs > next) {
-			reset = true;
-			start_abs = earliest;
-		}
-
-		for (uint32_t abs_i = start_abs; abs_i < next; abs_i++) {
+		if (abs_i >= earliest && abs_i < next) {
 			uint32_t idx = abs_i % LOG_HTTP_LINES;
 			const char *line = s_lines[idx];
 			size_t l = strnlen(line, LOG_HTTP_LINE_MAX);
+			size_t copy_len = (l < out_sz - 1) ? l : (out_sz - 1);
 
-			if (pos + l + 2 >= size) break;
+			memcpy(out, line, copy_len);
+			pos = copy_len;
 
-			memcpy(snap + pos, line, l);
-			pos += l;
-
-			// newline нормалізація
-			if (pos == 0 || snap[pos - 1] != '\n') {
-				snap[pos++] = '\n';
+			if (pos < out_sz - 1 && (pos == 0 || out[pos - 1] != '\n')) {
+				out[pos++] = '\n';
 			}
+			ok = true;
 		}
 	}
 	portEXIT_CRITICAL(&s_log_lock);
 
-	snap[pos] = '\0';
-
+	out[pos] = '\0';
 	if (out_len) *out_len = pos;
-	if (out_next) *out_next = next;
-	if (out_reset) *out_reset = reset;
-	return snap;
+	return ok;
 }
 
 static bool build_time_prefix(char *out, size_t out_sz)
@@ -1225,15 +1206,10 @@ static esp_err_t http_log_get(httpd_req_t *req)
 		}
 	}
 
-	size_t len = 0;
+	uint32_t start = 0;
 	uint32_t next = 0;
 	bool reset = false;
-
-	char *snap = log_buffer_snapshot_since(from, &len, &next, &reset);
-	if (!snap) {
-		httpd_resp_set_type(req, "text/plain");
-		return httpd_resp_send(req, "no-mem\n", HTTPD_RESP_USE_STRLEN);
-	}
+	log_buffer_stream_range(from, &start, &next, &reset);
 
 	char hdr_next[32];
 	snprintf(hdr_next, sizeof(hdr_next), "%lu", (unsigned long)next);
@@ -1241,9 +1217,21 @@ static esp_err_t http_log_get(httpd_req_t *req)
 	httpd_resp_set_hdr(req, "X-Log-Reset", reset ? "1" : "0");
 
 	httpd_resp_set_type(req, "text/plain");
-	esp_err_t err = httpd_resp_send(req, snap, len);
-	free(snap);
-	return err;
+
+	char line[LOG_HTTP_LINE_MAX + 2];
+	for (uint32_t abs_i = start; abs_i < next; abs_i++) {
+		size_t len = 0;
+		if (!log_buffer_copy_abs_line(abs_i, line, sizeof(line), &len) || len == 0) {
+			continue;
+		}
+
+		esp_err_t err = httpd_resp_send_chunk(req, line, len);
+		if (err != ESP_OK) {
+			return err;
+		}
+	}
+
+	return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...)
