@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -47,12 +48,8 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 	#define LOG_HTTP_LINE_MAX		256
 #endif
 
-#ifndef LOG_HTTP_HEAP_MAX
-	#define LOG_HTTP_HEAP_MAX		512
-#endif
-
 #ifndef LOG_HTTP_STACK_TMP
-	#define LOG_HTTP_STACK_TMP		128
+	#define LOG_HTTP_STACK_TMP		LOG_HTTP_LINE_MAX
 #endif
 
 #ifndef WEB_POLL_MS
@@ -68,6 +65,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #endif
 
 #define NODE0_OTA_BUF_SIZE		4096U
+#define NODE0_OTA_RECV_TIMEOUT_RETRIES	3
 
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
@@ -128,6 +126,7 @@ typedef struct {
 static node_ent_t s_nodes[LOG_HTTP_MAX_NODES];
 static uint32_t s_nodes_count = 0;
 static portMUX_TYPE s_nodes_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_selection_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
 	uint8_t mac[6];
@@ -146,6 +145,8 @@ static taskmon_ent_t s_taskmon[LOG_HTTP_MAX_NODES];
 static portMUX_TYPE s_taskmon_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
+static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...);
+static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -202,8 +203,36 @@ static void mac_to_hex(const uint8_t mac[6], char out[13])
 static void copy_tag(char *dst, size_t dst_sz, const char *tag)
 {
 	if (!dst || dst_sz == 0) return;
-	strncpy(dst, (tag && tag[0]) ? tag : "node", dst_sz - 1);
-	dst[dst_sz - 1] = '\0';
+
+	const char *src = (tag && tag[0]) ? tag : "node";
+	size_t pos = 0;
+	while (src[pos] && pos < dst_sz - 1) {
+		unsigned char c = (unsigned char)src[pos];
+		dst[pos] = (c < 32 || c == '"' || c == '\\') ? '_' : (char)c;
+		pos++;
+	}
+	dst[pos] = '\0';
+}
+
+static void selection_snapshot(uint8_t mac[6], char *tag, size_t tag_sz)
+{
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		if (mac) {
+			mac_copy(mac, s_sel_mac);
+		}
+		if (tag && tag_sz > 0) {
+			copy_tag(tag, tag_sz, s_sel_tag);
+		}
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+}
+
+static bool selection_is_local(void)
+{
+	uint8_t selected[6];
+	selection_snapshot(selected, NULL, 0);
+	return mac_eq(selected, s_local_mac);
 }
 
 static uint32_t uptime_advanced_s(uint32_t uptime_s, uint32_t uptime_seen_ms, uint32_t now_ms)
@@ -492,8 +521,11 @@ static bool lookup_node_tag(const uint8_t mac[6], char *tag, size_t tag_sz)
 		return true;
 	}
 
-	if (mac_eq(mac, s_sel_mac)) {
-		copy_tag(tag, tag_sz, s_sel_tag);
+	uint8_t selected_mac[6];
+	char selected_tag[16];
+	selection_snapshot(selected_mac, selected_tag, sizeof(selected_tag));
+	if (mac_eq(mac, selected_mac)) {
+		copy_tag(tag, tag_sz, selected_tag);
 		return true;
 	}
 
@@ -891,35 +923,52 @@ static void mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 
 static void select_stream_node(const uint8_t mac[6], const char *tag)
 {
-	// якщо вже вибрано це саме — нічого не робимо (щоб не смикати CTRL)
-	if (mac_eq(mac, s_sel_mac)) {
-		if (tag && tag[0]) {
-			strncpy(s_sel_tag, tag, sizeof(s_sel_tag) - 1);
-			s_sel_tag[sizeof(s_sel_tag) - 1] = '\0';
+	if (!mac) return;
+
+	char clean_tag[16];
+	copy_tag(clean_tag, sizeof(clean_tag), tag);
+
+	uint8_t old_stream_mac[6] = {0};
+	uint8_t new_stream_mac[6] = {0};
+	bool disable_old_stream = false;
+	bool enable_new_stream = false;
+
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		if (mac_eq(mac, s_sel_mac)) {
+			copy_tag(s_sel_tag, sizeof(s_sel_tag), clean_tag);
+			portEXIT_CRITICAL(&s_selection_lock);
+			return;
 		}
-		return;
+
+		if (s_stream_active) {
+			disable_old_stream = true;
+			mac_copy(old_stream_mac, s_stream_mac);
+		}
+
+		mac_copy(s_sel_mac, mac);
+		copy_tag(s_sel_tag, sizeof(s_sel_tag), clean_tag);
+
+		if (mac_eq(mac, s_local_mac)) {
+			s_stream_active = false;
+			memset(s_stream_mac, 0, sizeof(s_stream_mac));
+		} else {
+			s_stream_active = true;
+			mac_copy(s_stream_mac, mac);
+			mac_copy(new_stream_mac, mac);
+			enable_new_stream = true;
+		}
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
+	if (disable_old_stream) {
+		mesh_send_log_ctrl(old_stream_mac, false);
 	}
 
-	// Вимкнути попередній remote стрім
-	if (s_stream_active) {
-		mesh_send_log_ctrl(s_stream_mac, false);
-		s_stream_active = false;
-		memset(s_stream_mac, 0, sizeof(s_stream_mac));
-	}
-
-	// Встановити вибір
-	mac_copy(s_sel_mac, mac);
-	strncpy(s_sel_tag, tag ? tag : "node", sizeof(s_sel_tag) - 1);
-	s_sel_tag[sizeof(s_sel_tag) - 1] = '\0';
-
-	// Очистити буфер під нову ноду
 	log_buffer_clear();
 
-	// Якщо вибір не local — увімкнути стрім на тій ноді
-	if (!mac_eq(s_sel_mac, s_local_mac)) {
-		mesh_send_log_ctrl(s_sel_mac, true);
-		s_stream_active = true;
-		mac_copy(s_stream_mac, s_sel_mac);
+	if (enable_new_stream) {
+		mesh_send_log_ctrl(new_stream_mac, true);
 	}
 }
 
@@ -938,7 +987,7 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 	}
 
 	// 2) У буфер пишемо ТІЛЬКИ якщо зараз вибрана local нода
-	if (!mac_eq(s_sel_mac, s_local_mac)) {
+	if (!selection_is_local()) {
 		return ret;
 	}
 
@@ -972,30 +1021,9 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 		return ret;
 	}
 
-	size_t need = copy_t + (size_t)w + 1;
-	if (need > LOG_HTTP_HEAP_MAX) need = LOG_HTTP_HEAP_MAX;
-
-	char *heap_buf = (char *)malloc(need);
-	if (!heap_buf) {
-		if (!taskmon_ingest_line(s_local_mac, s_local_tag, stack_buf)) {
-			log_buffer_append_line(stack_buf, cap - 1);
-		}
-		return ret;
+	if (!taskmon_ingest_line(s_local_mac, s_local_tag, stack_buf)) {
+		log_buffer_append_line(stack_buf, strnlen(stack_buf, cap));
 	}
-
-	memcpy(heap_buf, tprefix, copy_t);
-	heap_buf[copy_t] = '\0';
-
-	va_list ap_copy3;
-	va_copy(ap_copy3, ap);
-	vsnprintf(heap_buf + copy_t, need - copy_t, fmt, ap_copy3);
-	va_end(ap_copy3);
-
-	if (!taskmon_ingest_line(s_local_mac, s_local_tag, heap_buf)) {
-		log_buffer_append_line(heap_buf, strnlen(heap_buf, need));
-	}
-	free(heap_buf);
-
 	return ret;
 }
 
@@ -1047,7 +1075,9 @@ void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
 {
 	if (!mac || !line) return;
-	if (!mac_eq(mac, s_sel_mac)) return;
+	uint8_t selected_mac[6];
+	selection_snapshot(selected_mac, NULL, 0);
+	if (!mac_eq(mac, selected_mac)) return;
 
 	if (!taskmon_ingest_line(mac, tag, line)) {
 		log_buffer_append_line(line, strnlen(line, 2048));
@@ -1059,20 +1089,21 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 static esp_err_t http_nodes_get(httpd_req_t *req)
 {
 	enum { NODES_JSON_MAX = 4096 };
-	char *out = (char *)malloc(NODES_JSON_MAX);
-	if (!out) {
-		httpd_resp_set_type(req, "text/plain");
-		return httpd_resp_send(req, "no-mem\n", HTTPD_RESP_USE_STRLEN);
-	}
+	char out[NODES_JSON_MAX];
+	out[0] = '\0';
 
 	size_t pos = 0;
 	uint32_t local_uptime = local_uptime_s();
+	uint8_t selected_mac[6];
+	char selected_tag[16];
+	selection_snapshot(selected_mac, selected_tag, sizeof(selected_tag));
 
 	pos += snprintf(out + pos, NODES_JSON_MAX - pos,
 		"{\"selected_mac\":\"%02x%02x%02x%02x%02x%02x\",\"selected_tag\":\"%s\","
 		"\"local_mac\":\"%02x%02x%02x%02x%02x%02x\",\"nodes\":[",
-		s_sel_mac[0], s_sel_mac[1], s_sel_mac[2], s_sel_mac[3], s_sel_mac[4], s_sel_mac[5],
-		s_sel_tag,
+		selected_mac[0], selected_mac[1], selected_mac[2],
+		selected_mac[3], selected_mac[4], selected_mac[5],
+		selected_tag,
 		s_local_mac[0], s_local_mac[1], s_local_mac[2],
 		s_local_mac[3], s_local_mac[4], s_local_mac[5]
 	);
@@ -1086,7 +1117,7 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 		(unsigned long)local_uptime
 	);
 
-	bool sel_in_list = mac_eq(s_sel_mac, s_local_mac);
+	bool sel_in_list = mac_eq(selected_mac, s_local_mac);
 	uint32_t now = ms_now();
 
 	portENTER_CRITICAL(&s_nodes_lock);
@@ -1097,7 +1128,7 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 			// не дублюємо local
 			if (mac_eq(s_nodes[i].mac, s_local_mac)) continue;
 
-			if (mac_eq(s_nodes[i].mac, s_sel_mac)) sel_in_list = true;
+			if (mac_eq(s_nodes[i].mac, selected_mac)) sel_in_list = true;
 
 			bool uptime_valid = s_nodes[i].uptime_valid;
 			uint32_t uptime_s = uptime_valid
@@ -1118,14 +1149,14 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 	portEXIT_CRITICAL(&s_nodes_lock);
 
 	// якщо вибрана remote нода не в списку — додамо як option (щоб не скидалось)
-	if (!sel_in_list && !mac_eq(s_sel_mac, (uint8_t[6]){0,0,0,0,0,0})) {
+	if (!sel_in_list && !mac_eq(selected_mac, (uint8_t[6]){0,0,0,0,0,0})) {
 		if (pos + 192 < NODES_JSON_MAX) {
 			pos += snprintf(out + pos, NODES_JSON_MAX - pos,
 				",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":\"%s\","
 				"\"uptime_valid\":false,\"uptime_s\":0}",
-				s_sel_mac[0], s_sel_mac[1], s_sel_mac[2],
-				s_sel_mac[3], s_sel_mac[4], s_sel_mac[5],
-				s_sel_tag
+				selected_mac[0], selected_mac[1], selected_mac[2],
+				selected_mac[3], selected_mac[4], selected_mac[5],
+				selected_tag
 			);
 		}
 	}
@@ -1133,15 +1164,18 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 	pos += snprintf(out + pos, NODES_JSON_MAX - pos, "]}");
 
 	httpd_resp_set_type(req, "application/json");
-	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
-	free(out);
-	return err;
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
 static bool parse_mac_hex(const char *s, uint8_t mac[6])
 {
 	if (!s) return false;
-	if (strlen(s) < 12) return false;
+	if (strlen(s) != 12) return false;
+
+	for (int i = 0; i < 12; i++) {
+		if (!isxdigit((unsigned char)s[i])) return false;
+	}
 
 	for (int i = 0; i < 6; i++) {
 		unsigned v = 0;
@@ -1163,14 +1197,12 @@ static esp_err_t http_select_get(httpd_req_t *req)
 				char tag[16] = "node";
 
 				if (mac_eq(mac, s_local_mac)) {
-					strncpy(tag, s_local_tag, sizeof(tag) - 1);
-					tag[sizeof(tag) - 1] = '\0';
+					copy_tag(tag, sizeof(tag), s_local_tag);
 				} else {
 					portENTER_CRITICAL(&s_nodes_lock);
 					for (uint32_t i = 0; i < s_nodes_count; i++) {
 						if (mac_eq(s_nodes[i].mac, mac)) {
-							strncpy(tag, s_nodes[i].tag, sizeof(tag) - 1);
-							tag[sizeof(tag) - 1] = '\0';
+							copy_tag(tag, sizeof(tag), s_nodes[i].tag);
 							break;
 						}
 					}
@@ -1183,6 +1215,7 @@ static esp_err_t http_select_get(httpd_req_t *req)
 	}
 
 	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	return httpd_resp_send(req, "OK\n", HTTPD_RESP_USE_STRLEN);
 }
 
@@ -1190,6 +1223,7 @@ static esp_err_t http_clear_get(httpd_req_t *req)
 {
 	log_buffer_clear();
 	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	return httpd_resp_send(req, "OK\n", HTTPD_RESP_USE_STRLEN);
 }
 
@@ -1217,6 +1251,7 @@ static esp_err_t http_log_get(httpd_req_t *req)
 	httpd_resp_set_hdr(req, "X-Log-Reset", reset ? "1" : "0");
 
 	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
 	char line[LOG_HTTP_LINE_MAX + 2];
 	for (uint32_t abs_i = start; abs_i < next; abs_i++) {
@@ -1372,6 +1407,22 @@ static bool ota_check_pin(httpd_req_t *req)
 		return false;
 	}
 	return strcmp(pin, CONFIG_NODE0_OTA_PIN) == 0;
+}
+
+static int ota_recv_retry(httpd_req_t *req, uint8_t *buf, size_t len)
+{
+	if (!req || !buf || len == 0) {
+		return -1;
+	}
+
+	for (int tries = 0; tries < NODE0_OTA_RECV_TIMEOUT_RETRIES; tries++) {
+		int r = httpd_req_recv(req, (char *)buf, len);
+		if (r != HTTPD_SOCK_ERR_TIMEOUT) {
+			return r;
+		}
+	}
+
+	return HTTPD_SOCK_ERR_TIMEOUT;
 }
 
 static bool ota_validate_first_chunk(const uint8_t *data, size_t len,
@@ -1533,15 +1584,26 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 			break;
 		}
 
+		const size_t validate_need =
+			sizeof(esp_image_header_t) +
+			sizeof(esp_image_segment_header_t) +
+			sizeof(esp_app_desc_t);
 		size_t first_want = total_len < NODE0_OTA_BUF_SIZE ? total_len : NODE0_OTA_BUF_SIZE;
-		int first_len = httpd_req_recv(req, (char *)buf, first_want);
-		if (first_len <= 0) {
+		size_t first_have = 0;
+		while (first_have < first_want && first_have < validate_need) {
+			int r = ota_recv_retry(req, buf + first_have, first_want - first_have);
+			if (r <= 0) {
+				break;
+			}
+			first_have += (size_t)r;
+		}
+		if (first_have == 0) {
 			snprintf(err_msg, sizeof(err_msg), "failed to read OTA image");
 			break;
 		}
 
 		esp_app_desc_t new_desc = {0};
-		if (!ota_validate_first_chunk(buf, (size_t)first_len, &new_desc,
+		if (!ota_validate_first_chunk(buf, first_have, &new_desc,
 		                              err_msg, sizeof(err_msg))) {
 			break;
 		}
@@ -1559,20 +1621,20 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 		}
 		ota_started = true;
 
-		result = esp_ota_write(ota_handle, buf, first_len);
+		result = esp_ota_write(ota_handle, buf, first_have);
 		if (result != ESP_OK) {
 			snprintf(err_msg, sizeof(err_msg), "esp_ota_write: %s", esp_err_to_name(result));
 			break;
 		}
 
-		size_t written = (size_t)first_len;
+		size_t written = first_have;
 		ota_status_progress((uint32_t)written);
 
 		while (written < total_len) {
 			size_t to_read = total_len - written;
 			if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
 
-			int r = httpd_req_recv(req, (char *)buf, to_read);
+			int r = ota_recv_retry(req, buf, to_read);
 			if (r <= 0) {
 				snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
 				break;
@@ -1656,14 +1718,11 @@ static void ota_mark_running_app_valid_if_pending(void)
 static esp_err_t http_tasks_get(httpd_req_t *req)
 {
 	enum { TASKS_JSON_MAX = 4096 };
-	char *out = (char *)malloc(TASKS_JSON_MAX);
-	if (!out) {
-		httpd_resp_set_type(req, "text/plain");
-		return httpd_resp_send(req, "no-mem\n", HTTPD_RESP_USE_STRLEN);
-	}
+	char out[TASKS_JSON_MAX];
+	out[0] = '\0';
 
 	uint8_t mac[6];
-	mac_copy(mac, s_sel_mac);
+	selection_snapshot(mac, NULL, 0);
 
 	char q[64] = {0};
 	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
@@ -1784,9 +1843,8 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 	}
 
 	httpd_resp_set_type(req, "application/json");
-	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
-	free(out);
-	return err;
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t http_root_get(httpd_req_t *req)
@@ -1853,6 +1911,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let otaEnabled=false;\n"
 		"let otaBusy=false;\n"
 		"let otaStatusText='OTA ...';\n"
+		"let logBusy=false;\n"
+		"let nodesBusy=false;\n"
+		"let tasksBusyReq=false;\n"
+		"let otaStatusBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){loadTasks();loadOtaStatus()}}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
@@ -1865,6 +1927,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function fmtMb(bytes){return Math.round((Number(bytes)||0)/1048576)+' MB'}\n"
 		"function fmtRam(j){return j.ram_valid?'RAM free '+fmtKb(j.ram_free_bytes)+' / min '+fmtKb(j.ram_min_free_bytes)+' / total '+fmtKb(j.ram_total_bytes):'RAM free ? / min ? / total ?'}\n"
 		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
+		"async function fetchTimeout(url,ms){\n"
+		"  const opt={cache:'no-store'};let timer=null;\n"
+		"  if(window.AbortController){const c=new AbortController();opt.signal=c.signal;timer=setTimeout(()=>c.abort(),ms);}\n"
+		"  try{return await fetch(url,opt);}finally{if(timer)clearTimeout(timer);}\n"
+		"}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
 		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
@@ -1896,8 +1963,9 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"function safeHeader(s){return String(s||'').replace(/[^\\x20-\\x7e]/g,'?').slice(0,80)}\n"
 		"async function loadOtaStatus(){\n"
-		"  if(otaBusy||!tasksVisible)return;\n"
-		"  try{const r=await fetch('/ota/status');const j=await r.json();otaEnabled=!!j.enabled;otaStatusText=otaEnabled?'OTA ready on '+(j.update_label||'ota'):'OTA disabled: set PIN';updateOtaUi();}catch(e){otaEnabled=false;otaStatusText='OTA status error';updateOtaUi();}\n"
+		"  if(otaBusy||!tasksVisible||otaStatusBusy)return;\n"
+		"  otaStatusBusy=true;\n"
+		"  try{const r=await fetchTimeout('/ota/status',6000);const j=await r.json();otaEnabled=!!j.enabled;otaStatusText=otaEnabled?'OTA ready on '+(j.update_label||'ota'):'OTA disabled: set PIN';updateOtaUi();}catch(e){otaEnabled=false;otaStatusText='OTA status error';updateOtaUi();}finally{otaStatusBusy=false;}\n"
 		"}\n"
 		"async function startOta(){\n"
 		"  if(otaBusy)return;\n"
@@ -1961,9 +2029,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  return out;\n"
 		"}\n"
 		"async function tick(){\n"
-		"  if(otaBusy)return;\n"
+		"  if(otaBusy||logBusy)return;\n"
+		"  logBusy=true;\n"
 		"  try{\n"
-		"    const r=await fetch('/log?from='+cursor);\n"
+		"    const r=await fetchTimeout('/log?from='+cursor,7000);\n"
 		"    const next=r.headers.get('X-Log-Next');\n"
 		"    const reset=r.headers.get('X-Log-Reset');\n"
 		"    const t=await r.text();\n"
@@ -1973,18 +2042,19 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    if(next) cursor=parseInt(next);\n"
 		"    if(follow) el.scrollTop=el.scrollHeight;\n"
 		"    document.getElementById('st').textContent='OK';\n"
-		"  }catch(e){document.getElementById('st').textContent='ERR'}\n"
+		"  }catch(e){document.getElementById('st').textContent='ERR'}finally{logBusy=false;}\n"
 		"}\n"
 		"async function loadNodes(){\n"
-		"  if(otaBusy)return;\n"
+		"  if(otaBusy||nodesBusy)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  if(document.activeElement===s) return;\n"
+		"  nodesBusy=true;\n"
 		"  try{\n"
-		"    const r=await fetch('/nodes');\n"
+		"    const r=await fetchTimeout('/nodes',6000);\n"
 		"    const txt=await r.text();\n"
 		"    if(txt===lastNodes) return;\n"
-		"    lastNodes=txt;\n"
 		"    const j=JSON.parse(txt);\n"
+		"    lastNodes=txt;\n"
 		"    const cur=j.selected_mac;\n"
 		"    localMac=j.local_mac||localMac;\n"
 		"    const prev=s.value;\n"
@@ -1999,7 +2069,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    s.value = cur || prev;\n"
 		"    selectedMac=s.value||selectedMac;\n"
 		"    updateOtaUi();\n"
-		"  }catch(e){}\n"
+		"  }catch(e){}finally{nodesBusy=false;}\n"
 		"}\n"
 		"async function onNodeSel(){\n"
 		"  const s=document.getElementById('nodeSel');\n"
@@ -2009,23 +2079,24 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  updateOtaUi();\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
-		"  try{await fetch('/select?mac='+mac);}catch(e){}\n"
+		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
 		"  if(tasksVisible) loadTasks();\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
-		"  try{await fetch('/clear');}catch(e){}\n"
+		"  try{await fetchTimeout('/clear',6000);}catch(e){}\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"}\n"
 		"async function loadTasks(){\n"
-		"  if(!tasksVisible||otaBusy) return;\n"
+		"  if(!tasksVisible||otaBusy||tasksBusyReq) return;\n"
+		"  tasksBusyReq=true;\n"
 		"  try{\n"
 		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
-		"    const r=await fetch('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''));\n"
+		"    const r=await fetchTimeout('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''),6000);\n"
 		"    const txt=await r.text();\n"
 		"    if(txt===lastTasks) return;\n"
-		"    lastTasks=txt;\n"
 		"    const j=JSON.parse(txt);\n"
+		"    lastTasks=txt;\n"
 		"    const box=document.getElementById('taskTable');\n"
 		"    const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
 		"    setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);\n"
@@ -2043,22 +2114,23 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);\n"
 		"    setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
 		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
-		"setInterval(loadNodes,2000);\n"
-		"setInterval(loadTasks,2000);\n"
-		"setInterval(loadOtaStatus,5000);\n"
+		"setInterval(loadNodes,5000);\n"
+		"setInterval(loadTasks,5000);\n"
+		"setInterval(loadOtaStatus,10000);\n"
 		"loadNodes();\n"
 		"tick();\n"
 		"</script>\n"
 		"</body></html>\n";
 
 	httpd_resp_set_type(req, "text/html");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -2144,12 +2216,13 @@ esp_err_t log_http_server_init(void)
 {
 	esp_wifi_get_mac(WIFI_IF_STA, s_local_mac);
 
-	// selected = local
-	mac_copy(s_sel_mac, s_local_mac);
 	strncpy(s_local_tag, "node0", sizeof(s_local_tag) - 1);
 	s_local_tag[sizeof(s_local_tag) - 1] = '\0';
-	strncpy(s_sel_tag, s_local_tag, sizeof(s_sel_tag) - 1);
-	s_sel_tag[sizeof(s_sel_tag) - 1] = '\0';
+
+	portENTER_CRITICAL(&s_selection_lock);
+	mac_copy(s_sel_mac, s_local_mac);
+	copy_tag(s_sel_tag, sizeof(s_sel_tag), s_local_tag);
+	portEXIT_CRITICAL(&s_selection_lock);
 
 	// vprintf hook
 	s_orig_vprintf = (vprintf_like_t)esp_log_set_vprintf(&log_http_vprintf);
@@ -2168,11 +2241,15 @@ esp_err_t log_http_server_start(void)
 
 	httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
 	config.httpd.lru_purge_enable = true;
-	config.httpd.stack_size = 10240;
+	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = 2;
 	config.httpd.backlog_conn = 2;
-	config.httpd.recv_wait_timeout = 10;
-	config.httpd.send_wait_timeout = 10;
+	config.httpd.recv_wait_timeout = 5;
+	config.httpd.send_wait_timeout = 5;
+	config.httpd.keep_alive_enable = true;
+	config.httpd.keep_alive_idle = 5;
+	config.httpd.keep_alive_interval = 3;
+	config.httpd.keep_alive_count = 2;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;

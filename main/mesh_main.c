@@ -168,6 +168,24 @@ static esp_err_t node0_restart_dhcp_client(void);
 static esp_err_t node0_apply_static_ip(void);
 #endif
 
+static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz)
+{
+	size_t n = 0;
+
+	if (!dst || dst_sz == 0) {
+		return;
+	}
+
+	if (src && src_sz > 0) {
+		n = strnlen(src, src_sz);
+		if (n >= dst_sz) {
+			n = dst_sz - 1;
+		}
+		memcpy(dst, src, n);
+	}
+	dst[n] = '\0';
+}
+
 // -----------------------------SINGLE_SENDER---------------------------------------
 static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
 
@@ -442,10 +460,14 @@ static void mesh_rx_task(void *arg)
 			if (h->type == MESH_LOG_TYPE_NODEINFO) {
 				if (data.size >= sizeof(mesh_nodeinfo_v2_packet_t)) {
 					const mesh_nodeinfo_v2_packet_t *p = (const mesh_nodeinfo_v2_packet_t *)rx_buf;
-					log_http_server_node_seen_uptime(p->h.src_mac, p->tag, true, p->uptime_s);
+					char tag[sizeof(p->tag) + 1];
+					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
+					log_http_server_node_seen_uptime(p->h.src_mac, tag, true, p->uptime_s);
 				} else if (data.size >= sizeof(mesh_nodeinfo_packet_t)) {
 					const mesh_nodeinfo_packet_t *p = (const mesh_nodeinfo_packet_t *)rx_buf;
-					log_http_server_node_seen(p->h.src_mac, p->tag);
+					char tag[sizeof(p->tag) + 1];
+					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
+					log_http_server_node_seen(p->h.src_mac, tag);
 				}
 				continue;
 			}
@@ -454,8 +476,12 @@ static void mesh_rx_task(void *arg)
 			if (h->type == MESH_LOG_TYPE_LINE) {
 				if (data.size >= sizeof(mesh_log_line_packet_t)) {
 					const mesh_log_line_packet_t *p = (const mesh_log_line_packet_t *)rx_buf;
-					log_http_server_node_seen(p->h.src_mac, p->tag);          // щоб нода була у списку
-					log_http_server_remote_line(p->h.src_mac, p->tag, p->line); // буферизація (всередині є фільтр по selected)
+					char tag[sizeof(p->tag) + 1];
+					char line[sizeof(p->line) + 1];
+					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
+					copy_packet_text(line, sizeof(line), p->line, sizeof(p->line));
+					log_http_server_node_seen(p->h.src_mac, tag);          // щоб нода була у списку
+					log_http_server_remote_line(p->h.src_mac, tag, line); // буферизація (всередині є фільтр по selected)
 				}
 				continue;
 			}

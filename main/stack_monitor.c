@@ -62,8 +62,14 @@ static void stack_monitor_task(void *arg)
 		count = uxTaskGetSystemState(cur,
 				STACK_MONITOR_MAX_TASKS,
 				&total_time);
+		if (count > STACK_MONITOR_MAX_TASKS) {
+			count = STACK_MONITOR_MAX_TASKS;
+		}
 
-		ESP_LOGI(TAG, "===== STACK MONITOR: %u task(s) =====", (unsigned)count);
+		ESP_LOGI(TAG,
+		         "===== STACK MONITOR: %u task(s), slots=%u =====",
+		         (unsigned)count,
+		         (unsigned)STACK_MONITOR_MAX_TASKS);
 
 		snapshot.updated_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 		snapshot.count = count;
