@@ -66,6 +66,8 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 
 #define NODE0_OTA_BUF_SIZE		4096U
 #define NODE0_OTA_RECV_TIMEOUT_RETRIES	3
+#define LOG_STREAM_TASK_STACK		6144U
+#define LOG_STREAM_HEARTBEAT_MS		2000U
 
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
@@ -79,6 +81,16 @@ static char s_lines[LOG_HTTP_LINES][LOG_HTTP_LINE_MAX];
 static uint32_t s_write_idx = 0;	// абсолютний лічильник рядків (cursor)
 static uint32_t s_total_lines = 0;
 static uint8_t s_http_wire_drop_budget = 0;
+
+typedef struct {
+	httpd_req_t *req;
+	uint32_t cursor;
+	bool headers_sent;
+} log_stream_state_t;
+
+static SemaphoreHandle_t s_log_stream_mutex = NULL;
+static TaskHandle_t s_log_stream_task = NULL;
+static log_stream_state_t s_log_stream = {0};
 
 typedef int (*vprintf_like_t)(const char *fmt, va_list ap);
 static vprintf_like_t s_orig_vprintf = NULL;
@@ -148,6 +160,7 @@ static portMUX_TYPE s_taskmon_lock = portMUX_INITIALIZER_UNLOCKED;
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
 static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...);
 static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
+static void log_stream_notify(void);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -183,6 +196,14 @@ static uint32_t ms_now(void)
 static uint32_t local_uptime_s(void)
 {
 	return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static void log_stream_notify(void)
+{
+	TaskHandle_t task = s_log_stream_task;
+	if (task) {
+		xTaskNotifyGive(task);
+	}
 }
 
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
@@ -854,6 +875,7 @@ static void log_buffer_clear(void)
 		memset(s_lines, 0, sizeof(s_lines));
 	}
 	portEXIT_CRITICAL(&s_log_lock);
+	log_stream_notify();
 }
 
 static void log_buffer_append_line(const char *line, size_t len)
@@ -901,6 +923,7 @@ static void log_buffer_append_line(const char *line, size_t len)
 		if (s_total_lines < LOG_HTTP_LINES) s_total_lines++;
 	}
 	portEXIT_CRITICAL(&s_log_lock);
+	log_stream_notify();
 }
 
 
@@ -928,6 +951,17 @@ static void log_buffer_stream_range(uint32_t from, uint32_t *out_start,
 	if (out_start) *out_start = from;
 	if (out_next) *out_next = next;
 	if (out_reset) *out_reset = reset;
+}
+
+static uint32_t log_buffer_next_cursor(void)
+{
+	uint32_t next = 0;
+
+	portENTER_CRITICAL(&s_log_lock);
+	next = s_write_idx;
+	portEXIT_CRITICAL(&s_log_lock);
+
+	return next;
 }
 
 static bool log_buffer_copy_abs_line(uint32_t abs_i, char *out, size_t out_sz,
@@ -1363,6 +1397,254 @@ static esp_err_t http_log_get(httpd_req_t *req)
 	}
 
 	return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static uint32_t http_log_cursor_from_query(httpd_req_t *req, uint32_t fallback)
+{
+	char q[64] = {0};
+	uint32_t from = fallback;
+
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[32] = {0};
+		if (httpd_query_key_value(q, "from", v, sizeof(v)) == ESP_OK) {
+			from = (uint32_t)strtoul(v, NULL, 10);
+		}
+	}
+
+	return from;
+}
+
+static uint32_t http_log_stream_cursor(httpd_req_t *req)
+{
+	uint32_t from = http_log_cursor_from_query(req, log_buffer_next_cursor());
+	char last_id[32] = {0};
+	size_t last_id_len = httpd_req_get_hdr_value_len(req, "Last-Event-ID");
+
+	if (last_id_len > 0 && last_id_len < sizeof(last_id) &&
+	    httpd_req_get_hdr_value_str(req, "Last-Event-ID", last_id, sizeof(last_id)) == ESP_OK) {
+		uint32_t last = (uint32_t)strtoul(last_id, NULL, 10);
+		if (last > from) {
+			from = last;
+		}
+	}
+
+	return from;
+}
+
+static esp_err_t http_log_stream_busy(httpd_req_t *req)
+{
+	httpd_resp_set_status(req, "503 Stream Busy");
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, "log stream busy\n", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t log_stream_send_preamble(httpd_req_t *req)
+{
+	static const char preamble[] = ": node0 log stream\n\n";
+	httpd_resp_set_type(req, "text/event-stream");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_hdr(req, "Connection", "keep-alive");
+	return httpd_resp_send_chunk(req, preamble, sizeof(preamble) - 1);
+}
+
+static esp_err_t log_stream_send_reset(httpd_req_t *req, uint32_t cursor)
+{
+	char msg[80];
+	int n = snprintf(msg, sizeof(msg),
+	                 "event: reset\nid: %lu\ndata: reset\n\n",
+	                 (unsigned long)cursor);
+	if (n < 0) {
+		return ESP_FAIL;
+	}
+	size_t len = ((size_t)n < sizeof(msg)) ? (size_t)n : (sizeof(msg) - 1);
+	return httpd_resp_send_chunk(req, msg, len);
+}
+
+static esp_err_t log_stream_send_heartbeat(httpd_req_t *req)
+{
+	static const char heartbeat[] = ": ping\n\n";
+	return httpd_resp_send_chunk(req, heartbeat, sizeof(heartbeat) - 1);
+}
+
+static esp_err_t log_stream_send_line(httpd_req_t *req, uint32_t next_cursor,
+                                      const char *line, size_t len)
+{
+	char out[LOG_HTTP_LINE_MAX + 80];
+	int n = snprintf(out, sizeof(out), "id: %lu\ndata: ",
+	                 (unsigned long)next_cursor);
+
+	if (n < 0) {
+		return ESP_FAIL;
+	}
+
+	size_t pos = ((size_t)n < sizeof(out)) ? (size_t)n : (sizeof(out) - 1);
+
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+		len--;
+	}
+
+	for (size_t i = 0; i < len && pos < sizeof(out) - 3; i++) {
+		char c = line[i];
+		if (c == '\n' || c == '\r') {
+			c = ' ';
+		}
+		out[pos++] = c;
+	}
+
+	out[pos++] = '\n';
+	out[pos++] = '\n';
+	out[pos] = '\0';
+
+	return httpd_resp_send_chunk(req, out, pos);
+}
+
+static void log_stream_complete(httpd_req_t *req)
+{
+	if (!req) {
+		return;
+	}
+
+	esp_err_t err = httpd_req_async_handler_complete(req);
+	if (err != ESP_OK) {
+		ESP_LOGD(TAG, "log stream async complete failed: %s", esp_err_to_name(err));
+	}
+}
+
+static void log_stream_task(void *arg)
+{
+	(void)arg;
+	char line[LOG_HTTP_LINE_MAX + 2];
+
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LOG_STREAM_HEARTBEAT_MS));
+
+		httpd_req_t *req = NULL;
+		uint32_t cursor = 0;
+		bool headers_sent = false;
+
+		if (!s_log_stream_mutex ||
+		    xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			continue;
+		}
+
+		req = s_log_stream.req;
+		cursor = s_log_stream.cursor;
+		headers_sent = s_log_stream.headers_sent;
+		xSemaphoreGive(s_log_stream_mutex);
+
+		if (!req) {
+			continue;
+		}
+
+		esp_err_t err = ESP_OK;
+
+		if (!headers_sent) {
+			err = log_stream_send_preamble(req);
+			if (err == ESP_OK &&
+			    xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_log_stream.req == req) {
+					s_log_stream.headers_sent = true;
+				}
+				xSemaphoreGive(s_log_stream_mutex);
+			}
+		}
+
+		uint32_t start = 0;
+		uint32_t next = 0;
+		bool reset = false;
+
+		if (err == ESP_OK) {
+			log_buffer_stream_range(cursor, &start, &next, &reset);
+			if (reset) {
+				err = log_stream_send_reset(req, start);
+			}
+		}
+
+		if (err == ESP_OK) {
+			for (uint32_t abs_i = start; abs_i < next; abs_i++) {
+				size_t len = 0;
+				if (!log_buffer_copy_abs_line(abs_i, line, sizeof(line), &len) || len == 0) {
+					continue;
+				}
+
+				err = log_stream_send_line(req, abs_i + 1, line, len);
+				if (err != ESP_OK) {
+					break;
+				}
+			}
+		}
+
+		if (err == ESP_OK && start == next && !reset) {
+			err = log_stream_send_heartbeat(req);
+		}
+
+		if (err == ESP_OK) {
+			if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_log_stream.req == req) {
+					s_log_stream.cursor = next;
+				}
+				xSemaphoreGive(s_log_stream_mutex);
+			}
+			continue;
+		}
+
+		if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+			if (s_log_stream.req == req) {
+				memset(&s_log_stream, 0, sizeof(s_log_stream));
+			}
+			xSemaphoreGive(s_log_stream_mutex);
+		}
+		log_stream_complete(req);
+	}
+}
+
+static esp_err_t http_log_stream_get(httpd_req_t *req)
+{
+	if (!s_log_stream_mutex || !s_log_stream_task) {
+		httpd_resp_set_status(req, "503 Stream Unavailable");
+		httpd_resp_set_type(req, "text/plain");
+		httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+		return httpd_resp_send(req, "log stream unavailable\n", HTTPD_RESP_USE_STRLEN);
+	}
+
+	uint32_t from = http_log_stream_cursor(req);
+
+	if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+		return http_log_stream_busy(req);
+	}
+
+	bool busy = (s_log_stream.req != NULL);
+	xSemaphoreGive(s_log_stream_mutex);
+
+	if (busy) {
+		return http_log_stream_busy(req);
+	}
+
+	httpd_req_t *async_req = NULL;
+	esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+		log_stream_complete(async_req);
+		return ESP_FAIL;
+	}
+
+	if (s_log_stream.req != NULL) {
+		xSemaphoreGive(s_log_stream_mutex);
+		log_stream_complete(async_req);
+		return ESP_OK;
+	}
+
+	s_log_stream.req = async_req;
+	s_log_stream.cursor = from;
+	s_log_stream.headers_sent = false;
+	xSemaphoreGive(s_log_stream_mutex);
+
+	log_stream_notify();
+	return ESP_OK;
 }
 
 static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...)
@@ -1955,6 +2237,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"#top{height:42px;padding:8px 10px;box-sizing:border-box;background:#1b1b1b;display:flex;gap:10px;align-items:center}\n"
 		"#main{display:flex;height:calc(100vh - 42px);min-height:0}\n"
 		"#log{flex:1;overflow:auto;padding:10px;white-space:pre;min-width:0}\n"
+		".logMode{margin-left:auto;display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border:1px solid #444;border-radius:999px;background:#141414;color:#aaa;font-size:12px;text-transform:uppercase;letter-spacing:0}\n"
+		".streamDot{width:8px;height:8px;border-radius:50%;background:#777;box-shadow:0 0 8px #777}\n"
+		".streamLive{border-color:#15633a;color:#7dffb2}.streamLive .streamDot{background:#00ff7f;box-shadow:0 0 12px #00ff7f}\n"
+		".streamPoll{border-color:#76611a;color:#ffd666}.streamPoll .streamDot{background:#ffcc00;box-shadow:0 0 10px #ffcc00}\n"
+		".streamRetry{border-color:#1f5d80;color:#7fd7ff}.streamRetry .streamDot{background:#39bfff;box-shadow:0 0 12px #39bfff}\n"
+		".streamErr{border-color:#743030;color:#ff8a8a}.streamErr .streamDot{background:#ff4d4d;box-shadow:0 0 10px #ff4d4d}\n"
+		".streamOff{border-color:#333;color:#888}.streamOff .streamDot{background:#666;box-shadow:none}\n"
 		"#tasks{display:none;width:370px;overflow:auto;border-left:1px solid #333;background:#151515;padding:10px;box-sizing:border-box}\n"
 		"body.showTasks #tasks{display:block}\n"
 		".ln{white-space:pre;margin:0;padding:0}\n"
@@ -1991,6 +2280,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<button onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
 		"<select id='nodeSel'></select>\n"
 		"<span id='st'>...</span>\n"
+		"<span id='logMode' class='logMode streamOff' title='log transport'><span class='streamDot'></span><span id='logModeText'>off</span></span>\n"
 		"</div>\n"
 		"<div id='main'>\n"
 		"<div id='log'></div>\n"
@@ -2011,6 +2301,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let nodesBusy=false;\n"
 		"let tasksBusyReq=false;\n"
 		"let otaStatusBusy=false;\n"
+		"let controlPollBusy=false;\n"
+		"let logStream=null;\n"
+		"let logStreamReady=false;\n"
+		"let logStreamErrors=0;\n"
+		"let pollFallbackUntil=0;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){loadTasks();loadOtaStatus()}}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
@@ -2027,6 +2322,19 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const opt={cache:'no-store'};let timer=null;\n"
 		"  if(window.AbortController){const c=new AbortController();opt.signal=c.signal;timer=setTimeout(()=>c.abort(),ms);}\n"
 		"  try{return await fetch(url,opt);}finally{if(timer)clearTimeout(timer);}\n"
+		"}\n"
+		"function setLogMode(cls,text){const el=document.getElementById('logMode');const t=document.getElementById('logModeText');if(el)el.className='logMode '+cls;if(t)t.textContent=text||''}\n"
+		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(follow)el.scrollTop=el.scrollHeight}\n"
+		"function stopLogStream(){if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
+		"function startLogStream(){\n"
+		"  if(otaBusy||logStream)return;\n"
+		"  if(!window.EventSource){setLogMode('streamPoll','poll');return;}\n"
+		"  setLogMode('streamRetry','stream');\n"
+		"  try{logStream=new EventSource('/log/stream?from='+cursor);}catch(e){setLogMode('streamPoll','poll');pollFallbackUntil=Date.now()+15000;return;}\n"
+		"  logStream.onopen=()=>{logStreamReady=true;logStreamErrors=0;setLogMode('streamLive','stream');document.getElementById('st').textContent='LIVE'};\n"
+		"  logStream.onmessage=(e)=>{if(e.lastEventId)cursor=parseInt(e.lastEventId)||cursor;appendLogText((e.data||'')+'\\n',false);document.getElementById('st').textContent='LIVE'};\n"
+		"  logStream.addEventListener('reset',(e)=>{if(e.lastEventId)cursor=parseInt(e.lastEventId)||0;appendLogText('',true);setLogMode('streamLive','stream')});\n"
+		"  logStream.onerror=()=>{logStreamReady=false;logStreamErrors++;setLogMode(logStreamErrors>=3?'streamPoll':'streamRetry',logStreamErrors>=3?'poll':'retry');document.getElementById('st').textContent='RETRY';if(logStreamErrors>=3){stopLogStream();pollFallbackUntil=Date.now()+15000;tick();}};\n"
 		"}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
 		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
@@ -2076,6 +2384,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const phrase=prompt('Type UPDATE NODE0 to update node0 and reboot.');\n"
 		"  if(phrase!=='UPDATE NODE0'){alert('OTA cancelled.');return;}\n"
 		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to node0 and reboot?'))return;\n"
+		"  stopLogStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
 		"  xhr.open('POST','/ota');\n"
@@ -2083,8 +2392,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
 		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
 		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus('OTA uploading '+pct+'%',true,pct)}};\n"
-		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);setTimeout(()=>location.reload(),9000)}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0)}};\n"
-		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0)};\n"
+		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);setTimeout(()=>location.reload(),9000)}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
+		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startLogStream()};\n"
 		"  xhr.send(file);\n"
 		"}\n"
 		"function lvlClassByRest(rest){\n"
@@ -2126,19 +2435,18 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"async function tick(){\n"
 		"  if(otaBusy||logBusy)return;\n"
+		"  if(window.EventSource&&Date.now()>pollFallbackUntil){if(!logStream)startLogStream();if(logStream)return;}\n"
 		"  logBusy=true;\n"
 		"  try{\n"
+		"    setLogMode('streamPoll','poll');\n"
 		"    const r=await fetchTimeout('/log?from='+cursor,7000);\n"
 		"    const next=r.headers.get('X-Log-Next');\n"
 		"    const reset=r.headers.get('X-Log-Reset');\n"
 		"    const t=await r.text();\n"
-		"    const el=document.getElementById('log');\n"
-		"    if(reset==='1') el.innerHTML='';\n"
-		"    if(t && t.length>0) el.insertAdjacentHTML('beforeend', renderChunk(t));\n"
+		"    appendLogText(t,reset==='1');\n"
 		"    if(next) cursor=parseInt(next);\n"
-		"    if(follow) el.scrollTop=el.scrollHeight;\n"
 		"    document.getElementById('st').textContent='OK';\n"
-		"  }catch(e){document.getElementById('st').textContent='ERR'}finally{logBusy=false;}\n"
+		"  }catch(e){setLogMode('streamErr','error');document.getElementById('st').textContent='ERR'}finally{logBusy=false;}\n"
 		"}\n"
 		"async function loadNodes(){\n"
 		"  if(otaBusy||nodesBusy)return;\n"
@@ -2173,15 +2481,18 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  selectedMac=mac;\n"
 		"  clearTasksPanel();\n"
 		"  updateOtaUi();\n"
+		"  stopLogStream();\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
+		"  logStreamErrors=0;pollFallbackUntil=0;startLogStream();\n"
 		"  if(tasksVisible) loadTasks();\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
 		"  try{await fetchTimeout('/clear',6000);}catch(e){}\n"
 		"  document.getElementById('log').innerHTML='';\n"
+		"  logStreamErrors=0;\n"
 		"}\n"
 		"async function loadTasks(){\n"
 		"  if(!tasksVisible||otaBusy||tasksBusyReq) return;\n"
@@ -2212,14 +2523,17 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
 		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
+		"async function controlPoll(){\n"
+		"  if(controlPollBusy||otaBusy)return;\n"
+		"  controlPollBusy=true;\n"
+		"  try{await loadNodes();await loadTasks();await loadOtaStatus();}finally{controlPollBusy=false;}\n"
+		"}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
-		"setInterval(loadNodes,5000);\n"
-		"setInterval(loadTasks,5000);\n"
-		"setInterval(loadOtaStatus,10000);\n"
+		"setInterval(controlPoll,5000);\n"
 		"loadNodes();\n"
 		"tick();\n"
 		"</script>\n"
@@ -2243,6 +2557,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/log",
 		.method		= HTTP_GET,
 		.handler	= http_log_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_log_stream = {
+		.uri		= "/log/stream",
+		.method		= HTTP_GET,
+		.handler	= http_log_stream_get,
 		.user_ctx	= NULL
 	};
 
@@ -2292,6 +2613,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_log);
 	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_log_stream);
+	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_tasks);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
@@ -2327,6 +2650,17 @@ esp_err_t log_http_server_init(void)
 		ESP_LOGW(TAG, "OTA mutex allocation failed; web OTA disabled");
 	}
 
+	s_log_stream_mutex = xSemaphoreCreateMutex();
+	if (!s_log_stream_mutex) {
+		ESP_LOGW(TAG, "log stream mutex allocation failed; /log/stream disabled");
+	} else if (xTaskCreate(log_stream_task, "log_stream", LOG_STREAM_TASK_STACK,
+	                       NULL, 4, &s_log_stream_task) != pdPASS) {
+		ESP_LOGW(TAG, "log stream task allocation failed; /log/stream disabled");
+		s_log_stream_task = NULL;
+		vSemaphoreDelete(s_log_stream_mutex);
+		s_log_stream_mutex = NULL;
+	}
+
 	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
 	return ESP_OK;
 }
@@ -2339,6 +2673,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = 2;
+	config.httpd.max_uri_handlers = 10;
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 5;
 	config.httpd.send_wait_timeout = 5;
