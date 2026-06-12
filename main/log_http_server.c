@@ -74,8 +74,11 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_OTA_RETRY_DELAY_MS	120U
 #define LOG_STREAM_TASK_STACK		6144U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
-#define HTTPS_MAX_OPEN_SOCKETS		3
+#define MESH_STREAM_TASK_STACK		6144U
+#define MESH_STREAM_HEARTBEAT_MS	10000U
+#define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
+#define MESH_STATUS_JSON_MAX		12288U
 #define UI_CONTROL_POLL_MS		10000
 #define REMOTE_LOG_REARM_MIN_MS		15000U
 #define NODEINFO_STALE_MS		75000U
@@ -104,6 +107,17 @@ static SemaphoreHandle_t s_log_stream_mutex = NULL;
 static TaskHandle_t s_log_stream_task = NULL;
 static log_stream_state_t s_log_stream = {0};
 
+typedef struct {
+	httpd_req_t *req;
+	uint32_t seq;
+	bool headers_sent;
+} mesh_stream_state_t;
+
+static SemaphoreHandle_t s_mesh_stream_mutex = NULL;
+static TaskHandle_t s_mesh_stream_task = NULL;
+static mesh_stream_state_t s_mesh_stream = {0};
+static uint32_t s_mesh_stream_seq = 1;
+
 typedef int (*vprintf_like_t)(const char *fmt, va_list ap);
 static vprintf_like_t s_orig_vprintf = NULL;
 
@@ -127,6 +141,14 @@ typedef struct {
 	char tag[16];
 	uint32_t last_seen_ms;
 	uint32_t last_route_ms;
+	uint32_t topology_seen_ms;
+	uint8_t parent_mac[6];
+	uint8_t root_mac[6];
+	uint16_t layer;
+	uint16_t max_layer;
+	int8_t parent_rssi;
+	uint8_t child_count;
+	uint32_t capabilities;
 	bool uptime_valid;
 	uint32_t uptime_s;
 	uint32_t uptime_seen_ms;
@@ -176,11 +198,16 @@ static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
 static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...);
 static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
 static void log_stream_notify(void);
+static void mesh_stream_notify(void);
 static bool parse_mac_hex(const char *s, uint8_t mac[6]);
 static void copy_tag(char *dst, size_t dst_sz, const char *tag);
+static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz);
 static size_t append_nodes_json(char *out, size_t cap, size_t pos);
 static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
                                          const uint8_t mac[6], uint32_t now);
+static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos,
+                                               const node_ent_t *node,
+                                               uint32_t now);
 static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
                                         const uint8_t mac[6]);
 static size_t append_local_ota_json(char *out, size_t cap, size_t pos);
@@ -265,6 +292,14 @@ static void log_stream_notify(void)
 	}
 }
 
+static void mesh_stream_notify(void)
+{
+	TaskHandle_t task = s_mesh_stream_task;
+	if (task) {
+		xTaskNotifyGive(task);
+	}
+}
+
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
 {
 	return memcmp(a, b, 6) == 0;
@@ -331,6 +366,7 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 		}
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
+	mesh_stream_notify();
 
 	for (int i = 0; i < route_count; i++) {
 		const uint8_t *mac = routes[i].addr;
@@ -1228,6 +1264,10 @@ static bool build_time_prefix(char *out, size_t out_sz)
 
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 {
+	if (mesh_v2_root_send_log_ctrl(to_mac, enable) == ESP_OK) {
+		return ESP_OK;
+	}
+
 	mesh_log_ctrl_packet_t p;
 	memset(&p, 0, sizeof(p));
 
@@ -1486,11 +1526,70 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	}
 
 	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
+	mesh_stream_notify();
 }
 
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
 {
 	log_http_server_node_seen_uptime(mac, tag, false, 0);
+}
+
+void log_http_server_node_topology(const uint8_t mac[6],
+                                   const mesh_v2_topology_payload_t *topology)
+{
+	if (!mac || !topology) return;
+
+	uint32_t now = ms_now();
+	bool recorded = false;
+	char tag[MESH_V2_TAG_MAX + 1];
+	copy_packet_text(tag, sizeof(tag), topology->tag, sizeof(topology->tag));
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac)) {
+				if (tag[0]) {
+					copy_tag(s_nodes[i].tag, sizeof(s_nodes[i].tag), tag);
+				}
+				s_nodes[i].last_seen_ms = now;
+				s_nodes[i].topology_seen_ms = now;
+				mac_copy(s_nodes[i].parent_mac, topology->parent_mac);
+				mac_copy(s_nodes[i].root_mac, topology->root_mac);
+				s_nodes[i].layer = topology->layer;
+				s_nodes[i].max_layer = topology->max_layer;
+				s_nodes[i].parent_rssi = topology->parent_rssi;
+				s_nodes[i].child_count = topology->child_count;
+				s_nodes[i].capabilities = topology->capabilities;
+				s_nodes[i].uptime_valid = true;
+				s_nodes[i].uptime_s = topology->uptime_s;
+				s_nodes[i].uptime_seen_ms = now;
+				recorded = true;
+				break;
+			}
+		}
+
+		if (!recorded && s_nodes_count < LOG_HTTP_MAX_NODES) {
+			node_ent_t *ent = &s_nodes[s_nodes_count++];
+			memset(ent, 0, sizeof(*ent));
+			mac_copy(ent->mac, mac);
+			copy_tag(ent->tag, sizeof(ent->tag), tag);
+			ent->last_seen_ms = now;
+			ent->topology_seen_ms = now;
+			mac_copy(ent->parent_mac, topology->parent_mac);
+			mac_copy(ent->root_mac, topology->root_mac);
+			ent->layer = topology->layer;
+			ent->max_layer = topology->max_layer;
+			ent->parent_rssi = topology->parent_rssi;
+			ent->child_count = topology->child_count;
+			ent->capabilities = topology->capabilities;
+			ent->uptime_valid = true;
+			ent->uptime_s = topology->uptime_s;
+			ent->uptime_seen_ms = now;
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	mesh_stream_notify();
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -2123,7 +2222,9 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	if (mac && mac_eq(mac, s_local_mac)) {
 		pos = append_json_string(out, cap, pos, "local");
 	} else {
-		pos = append_json_string(out, cap, pos, has_v2 ? "v2" : "v1");
+		pos = append_json_string(out, cap, pos,
+		                         (has_v2 && st.tunnel_seen) ? "tunnel" :
+		                         (has_v2 ? "v2" : "v1"));
 	}
 
 	if (!has_v2) {
@@ -2131,25 +2232,32 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  ",\"v2_session\":0,\"expected_seq\":0,"
 		                  "\"gap_count\":0,\"replay_count\":0,"
 		                  "\"lost_count\":0,\"last_v2_ms\":0,"
-		                  "\"v2_age_ms\":-1,\"has_gap\":false");
+		                  "\"last_tunnel_ms\":0,\"v2_age_ms\":-1,"
+		                  "\"tunnel_age_ms\":-1,\"has_gap\":false");
 	}
 
 	if (st.last_v2_ms != 0) {
 		v2_age_ms = (long)(uint32_t)(now - st.last_v2_ms);
 	}
+	long tunnel_age_ms = st.last_tunnel_ms != 0
+		? (long)(uint32_t)(now - st.last_tunnel_ms)
+		: -1;
 
 	return append_fmt(out, cap, pos,
 	                  ",\"v2_session\":%lu,\"expected_seq\":%lu,"
 	                  "\"gap_count\":%lu,\"replay_count\":%lu,"
 	                  "\"lost_count\":%lu,\"last_v2_ms\":%lu,"
-	                  "\"v2_age_ms\":%ld,\"has_gap\":%s",
+	                  "\"last_tunnel_ms\":%lu,\"v2_age_ms\":%ld,"
+	                  "\"tunnel_age_ms\":%ld,\"has_gap\":%s",
 	                  (unsigned long)st.session_id,
 	                  (unsigned long)st.expected_seq,
 	                  (unsigned long)st.gap_count,
 	                  (unsigned long)st.replay_count,
 	                  (unsigned long)st.lost_count,
 	                  (unsigned long)st.last_v2_ms,
+	                  (unsigned long)st.last_tunnel_ms,
 	                  v2_age_ms,
+	                  tunnel_age_ms,
 	                  st.has_gap ? "true" : "false");
 }
 
@@ -2195,6 +2303,37 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	                  offline ? "true" : "false");
 }
 
+static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos,
+                                               const node_ent_t *node,
+                                               uint32_t now)
+{
+	if (!node || node->topology_seen_ms == 0) {
+		return append_fmt(out, cap, pos,
+		                  ",\"topology_valid\":false,\"topology_age_ms\":-1,"
+		                  "\"parent_mac\":\"\",\"root_mac\":\"\","
+		                  "\"layer\":0,\"max_layer\":0,\"parent_rssi\":-127,"
+		                  "\"child_count\":0,\"capabilities\":0");
+	}
+
+	long age_ms = (long)(uint32_t)(now - node->topology_seen_ms);
+	return append_fmt(out, cap, pos,
+	                  ",\"topology_valid\":true,\"topology_age_ms\":%ld,"
+	                  "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                  "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                  "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
+	                  "\"child_count\":%u,\"capabilities\":%lu",
+	                  age_ms,
+	                  node->parent_mac[0], node->parent_mac[1], node->parent_mac[2],
+	                  node->parent_mac[3], node->parent_mac[4], node->parent_mac[5],
+	                  node->root_mac[0], node->root_mac[1], node->root_mac[2],
+	                  node->root_mac[3], node->root_mac[4], node->root_mac[5],
+	                  (unsigned)node->layer,
+	                  (unsigned)node->max_layer,
+	                  (int)node->parent_rssi,
+	                  (unsigned)node->child_count,
+	                  (unsigned long)node->capabilities);
+}
+
 static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 {
 	enum { NODE_JSON_MARGIN = 512 };
@@ -2235,6 +2374,16 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	                 ",\"uptime_valid\":true,\"uptime_s\":%lu",
 	                 (unsigned long)local_uptime);
 	pos = append_node_v2_json_fields(out, cap, pos, s_local_mac, now);
+	node_ent_t local_node;
+	memset(&local_node, 0, sizeof(local_node));
+	mac_copy(local_node.mac, s_local_mac);
+	copy_tag(local_node.tag, sizeof(local_node.tag), s_local_tag);
+	local_node.topology_seen_ms = now;
+	local_node.layer = 1;
+	local_node.max_layer = CONFIG_MESH_MAX_LAYER;
+	local_node.parent_rssi = 0;
+	local_node.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
+	pos = append_node_topology_json_fields(out, cap, pos, &local_node, now);
 	pos = append_node_health_json_fields(out, cap, pos, s_local_mac,
 	                                     true, now, now, now);
 	pos = append_fmt(out, cap, pos, "}");
@@ -2267,6 +2416,7 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 			                 uptime_valid ? "true" : "false",
 			                 (unsigned long)uptime_s);
 			pos = append_node_v2_json_fields(out, cap, pos, s_nodes[i].mac, now);
+			pos = append_node_topology_json_fields(out, cap, pos, &s_nodes[i], now);
 			pos = append_node_health_json_fields(out, cap, pos, s_nodes[i].mac,
 			                                     route_seen,
 			                                     s_nodes[i].last_route_ms,
@@ -2290,6 +2440,7 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 		pos = append_fmt(out, cap, pos,
 		                 ",\"uptime_valid\":false,\"uptime_s\":0");
 		pos = append_node_v2_json_fields(out, cap, pos, selected_mac, now);
+		pos = append_node_topology_json_fields(out, cap, pos, NULL, now);
 		pos = append_node_health_json_fields(out, cap, pos, selected_mac,
 		                                     route_seen, 0, 0, now);
 		pos = append_fmt(out, cap, pos, "}");
@@ -3531,6 +3682,203 @@ static esp_err_t http_ui_status_get(httpd_req_t *req)
 	return err;
 }
 
+static size_t append_mesh_status_json(char *out, size_t cap, size_t pos, uint32_t seq)
+{
+	pos = append_fmt(out, cap, pos,
+	                 "{\"type\":\"mesh_status\",\"seq\":%lu,\"now_ms\":%lu,\"mesh\":",
+	                 (unsigned long)seq,
+	                 (unsigned long)ms_now());
+	pos = append_nodes_json(out, cap, pos);
+	return append_fmt(out, cap, pos, "}");
+}
+
+static esp_err_t http_mesh_status_get(httpd_req_t *req)
+{
+	char *out = (char *)malloc(MESH_STATUS_JSON_MAX);
+	if (!out) {
+		return http_json_error(req, "500 Internal Server Error",
+		                       "no memory for mesh status");
+	}
+
+	size_t pos = append_mesh_status_json(out, MESH_STATUS_JSON_MAX, 0, s_mesh_stream_seq);
+	if (pos >= MESH_STATUS_JSON_MAX - 2) {
+		free(out);
+		return http_json_error(req, "500 Internal Server Error",
+		                       "mesh status JSON truncated");
+	}
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	free(out);
+	return err;
+}
+
+static esp_err_t mesh_stream_send_preamble(httpd_req_t *req)
+{
+	static const char preamble[] = ": node0 mesh stream\n\n";
+	httpd_resp_set_type(req, "text/event-stream");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_hdr(req, "Connection", "keep-alive");
+	return httpd_resp_send_chunk(req, preamble, strlen(preamble));
+}
+
+static esp_err_t mesh_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
+{
+	char *json = (char *)malloc(MESH_STATUS_JSON_MAX);
+	if (!json) {
+		return ESP_ERR_NO_MEM;
+	}
+
+	size_t pos = append_mesh_status_json(json, MESH_STATUS_JSON_MAX, 0, seq);
+	if (pos >= MESH_STATUS_JSON_MAX - 2) {
+		free(json);
+		return ESP_ERR_NO_MEM;
+	}
+
+	size_t frame_cap = pos + 80;
+	char *frame = (char *)malloc(frame_cap);
+	if (!frame) {
+		free(json);
+		return ESP_ERR_NO_MEM;
+	}
+
+	int n = snprintf(frame, frame_cap,
+	                 "event: mesh\nid: %lu\ndata: %s\n\n",
+	                 (unsigned long)seq, json);
+	free(json);
+	if (n < 0 || (size_t)n >= frame_cap) {
+		free(frame);
+		return ESP_FAIL;
+	}
+
+	esp_err_t err = httpd_resp_send_chunk(req, frame, (size_t)n);
+	free(frame);
+	return err;
+}
+
+static void mesh_stream_complete(httpd_req_t *req)
+{
+	if (!req) {
+		return;
+	}
+	esp_err_t err = httpd_req_async_handler_complete(req);
+	if (err != ESP_OK) {
+		ESP_LOGD(TAG, "mesh stream async complete failed: %s", esp_err_to_name(err));
+	}
+}
+
+static void mesh_stream_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		httpd_req_t *req = NULL;
+		bool headers_sent = false;
+		uint32_t seq = 0;
+
+		if (!s_mesh_stream_mutex ||
+		    xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MESH_STREAM_HEARTBEAT_MS));
+			continue;
+		}
+		req = s_mesh_stream.req;
+		headers_sent = s_mesh_stream.headers_sent;
+		seq = s_mesh_stream.seq;
+		xSemaphoreGive(s_mesh_stream_mutex);
+
+		if (!req) {
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+			continue;
+		}
+
+		esp_err_t err = ESP_OK;
+		if (!headers_sent) {
+			err = mesh_stream_send_preamble(req);
+			if (err == ESP_OK &&
+			    xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_mesh_stream.req == req) {
+					s_mesh_stream.headers_sent = true;
+				}
+				xSemaphoreGive(s_mesh_stream_mutex);
+			}
+		}
+
+		if (err == ESP_OK) {
+			err = mesh_stream_send_snapshot(req, seq);
+		}
+
+		if (err == ESP_OK) {
+			if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_mesh_stream.req == req) {
+					s_mesh_stream.seq = ++s_mesh_stream_seq;
+				}
+				xSemaphoreGive(s_mesh_stream_mutex);
+			}
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MESH_STREAM_HEARTBEAT_MS));
+			continue;
+		}
+
+		if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+			if (s_mesh_stream.req == req) {
+				memset(&s_mesh_stream, 0, sizeof(s_mesh_stream));
+			}
+			xSemaphoreGive(s_mesh_stream_mutex);
+		}
+		mesh_stream_complete(req);
+	}
+}
+
+static esp_err_t http_mesh_stream_busy(httpd_req_t *req)
+{
+	httpd_resp_set_status(req, "503 Stream Busy");
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, "mesh stream busy\n", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_mesh_stream_get(httpd_req_t *req)
+{
+	if (!s_mesh_stream_mutex || !s_mesh_stream_task) {
+		httpd_resp_set_status(req, "503 Stream Unavailable");
+		httpd_resp_set_type(req, "text/plain");
+		httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+		return httpd_resp_send(req, "mesh stream unavailable\n", HTTPD_RESP_USE_STRLEN);
+	}
+
+	if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+		return http_mesh_stream_busy(req);
+	}
+	bool busy = (s_mesh_stream.req != NULL);
+	xSemaphoreGive(s_mesh_stream_mutex);
+	if (busy) {
+		return http_mesh_stream_busy(req);
+	}
+
+	httpd_req_t *async_req = NULL;
+	esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+		mesh_stream_complete(async_req);
+		return ESP_FAIL;
+	}
+	if (s_mesh_stream.req != NULL) {
+		xSemaphoreGive(s_mesh_stream_mutex);
+		mesh_stream_complete(async_req);
+		return ESP_OK;
+	}
+	s_mesh_stream.req = async_req;
+	s_mesh_stream.seq = s_mesh_stream_seq++;
+	s_mesh_stream.headers_sent = false;
+	xSemaphoreGive(s_mesh_stream_mutex);
+
+	mesh_stream_notify();
+	return ESP_OK;
+}
+
 static esp_err_t http_root_get(httpd_req_t *req)
 {
 	static const char html[] =
@@ -3553,6 +3901,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".streamOff{border-color:#333;color:#888}.streamOff .streamDot{background:#666;box-shadow:none}\n"
 		"#tasks{display:none;width:370px;overflow:auto;border-left:1px solid #333;background:#151515;padding:10px;box-sizing:border-box}\n"
 		"body.showTasks #tasks{display:block}\n"
+		"#mesh{display:none;width:370px;overflow:auto;border-left:1px solid #333;background:#12171a;padding:10px;box-sizing:border-box}\n"
+		"body.showMesh #mesh{display:block}\n"
 		".ln{white-space:pre;margin:0;padding:0}\n"
 		"button,select{font-family:monospace;font-size:14px;background:#24282d;color:#e8edf2;border:1px solid #3a424a;border-radius:7px;min-height:28px;box-sizing:border-box}\n"
 		"button{padding:4px 10px;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 1px 3px rgba(0,0,0,.25);transition:background .12s,border-color .12s,color .12s,transform .08s}\n"
@@ -3580,6 +3930,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".cpu{color:#9ad;margin-bottom:8px}\n"
 		".ram{color:#adb;margin:-4px 0 8px}\n"
 		".flash{color:#dba;margin:-4px 0 8px}\n"
+		".meshTop{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;color:#eef}\n"
+		".meshTree{font-size:12px;line-height:1.35}\n"
+		".meshItem{border-left:1px solid #33414a;margin-left:8px;padding:4px 0 4px 10px}\n"
+		".meshName{color:#8bd0ff;font-weight:bold}.meshLocal .meshName{color:#00ff7f}\n"
+		".meshMeta{color:#aab;font-size:11px}.meshBad{color:#ff8a8a}.meshWarn{color:#ffd666}\n"
 		"table{width:100%;border-collapse:collapse;font-size:12px}\n"
 		"th,td{border-bottom:1px solid #2c2c2c;padding:3px 4px;text-align:right;white-space:nowrap}\n"
 		"th:first-child,td:first-child{text-align:left;max-width:150px;overflow:hidden;text-overflow:ellipsis}\n"
@@ -3590,24 +3945,27 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".lvD{color:#66a3ff}\n"
 		".lvV{color:#aaaaaa}\n"
 		".ts{color:#66a3ff}\n"
-		"@media(max-width:760px){#tasks{position:fixed;right:0;top:42px;bottom:0;width:90vw;z-index:5;box-shadow:-8px 0 20px #000}}\n"
+		"@media(max-width:760px){#tasks,#mesh{position:fixed;right:0;top:42px;bottom:0;width:90vw;z-index:5;box-shadow:-8px 0 20px #000}}\n"
 		"</style></head>\n"
 		"<body>\n"
 		"<div id='top'>\n"
 		"<button onclick='toggleFollow()'>follow: <span id=\"f\">ON</span></button>\n"
 		"<button onclick='clearServer()'>clear</button>\n"
 		"<button onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
+		"<button onclick='toggleMesh()'>mesh: <span id=\"mm\">OFF</span></button>\n"
 		"<select id='nodeSel'></select>\n"
 		"<span id='logMode' class='logMode streamOff' title='log transport'><span class='streamDot'></span></span>\n"
 		"<span id='st'>...</span>\n"
 		"</div>\n"
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
+		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
 		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM free ? / min ? / total ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
 		"let tasksVisible=false;\n"
+		"let meshVisible=false;\n"
 		"let cursor=0;\n"
 		"let lastNodes='';\n"
 		"let lastTasks='';\n"
@@ -3625,12 +3983,14 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let otaStatusBusy=false;\n"
 		"let controlPollBusy=false;\n"
 		"let logStream=null;\n"
+		"let meshStream=null;\n"
 		"let logStreamReady=false;\n"
 		"let logStreamErrors=0;\n"
 		"let pollFallbackUntil=0;\n"
 		"let reselectBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadUiStatus()}\n"
+		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible)startMeshStream();else stopMeshStream()}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
@@ -3649,6 +4009,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function setLogMode(cls,text){const el=document.getElementById('logMode');if(el){el.className='logMode '+cls;el.title='log transport: '+(text||'off')}}\n"
 		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(follow)el.scrollTop=el.scrollHeight}\n"
 		"function stopLogStream(){if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
+		"function stopMeshStream(){if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
 		"function otaSlotName(label){if(label==='ota_0')return 'A';if(label==='ota_1')return 'B';return '?'}\n"
 		"function otaSlotClassFor(label){if(label==='ota_0')return 'otaSlotA';if(label==='ota_1')return 'otaSlotB';return 'otaSlotUnknown'}\n"
 		"function setOtaSlot(text,cls){otaSlotText=text||'A/B ?';otaSlotClass=cls||'otaSlotUnknown';const el=document.getElementById('otaSlot');if(el){el.textContent=otaSlotText;el.className='otaSlot '+otaSlotClass}}\n"
@@ -3664,9 +4025,14 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const nodes=j.nodes||[];const serverCur=j.selected_mac;localMac=j.local_mac||localMac;const prev=s.value;let cur=serverCur||prev||selectedMac;const remembered=rememberedNode();\n"
 		"  if(remembered&&remembered!==serverCur&&nodeInList(nodes,remembered)&&!reselectBusy){cur=remembered;setTimeout(()=>reselectNode(remembered),0)}\n"
 		"  selectedMac=cur||selectedMac;s.innerHTML='';\n"
-		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=n.has_gap?'gap':(n.offline?'offline':(n.stale?'stale':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':''))));o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
+		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=n.has_gap?'gap':(n.offline?'offline':(n.stale?'stale':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))));o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
 		"  s.value=cur||prev;selectedMac=s.value||selectedMac;updateOtaUi();\n"
 		"}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':n.stale?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
+		"function applyMeshStatus(j){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for mesh';st.textContent='live '+(j.seq||'')}\n"
+		"async function loadMeshStatus(){try{const r=await fetchTimeout('/mesh/status',6000);applyMeshStatus(await r.json())}catch(e){document.getElementById('meshState').textContent='err'}}\n"
+		"function startMeshStream(){if(!meshVisible||meshStream)return;if(!window.EventSource){loadMeshStatus();return;}document.getElementById('meshState').textContent='connect';try{meshStream=new EventSource('/mesh/stream')}catch(e){meshStream=null;loadMeshStatus();return;}meshStream.addEventListener('mesh',e=>{try{applyMeshStatus(JSON.parse(e.data||'{}'))}catch(x){}});meshStream.onopen=()=>{document.getElementById('meshState').textContent='live'};meshStream.onerror=()=>{document.getElementById('meshState').textContent='retry';stopMeshStream();if(meshVisible)setTimeout(()=>{loadMeshStatus();startMeshStream()},3000)}}\n"
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
@@ -3749,7 +4115,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const phrase=prompt('Type '+confirmPhrase+' to update '+target+' and reboot.');\n"
 		"  if(phrase!==confirmPhrase){alert('OTA cancelled.');return;}\n"
 		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to '+target+' and reboot?'))return;\n"
-		"  stopLogStream();\n"
+		"  stopLogStream();stopMeshStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
 		"  xhr.open('POST',local?'/ota':'/ota/remote?mac='+encodeURIComponent(selectedMac||''));\n"
@@ -3922,6 +4288,20 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_mesh_status = {
+		.uri		= "/mesh/status",
+		.method		= HTTP_GET,
+		.handler	= http_mesh_status_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_mesh_stream = {
+		.uri		= "/mesh/stream",
+		.method		= HTTP_GET,
+		.handler	= http_mesh_stream_get,
+		.user_ctx	= NULL
+	};
+
 	httpd_uri_t uri_nodes = {
 		.uri		= "/nodes",
 		.method		= HTTP_GET,
@@ -3981,6 +4361,10 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ui_status);
 	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_mesh_status);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_mesh_stream);
+	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_select);
@@ -4033,6 +4417,17 @@ esp_err_t log_http_server_init(void)
 		s_log_stream_mutex = NULL;
 	}
 
+	s_mesh_stream_mutex = xSemaphoreCreateMutex();
+	if (!s_mesh_stream_mutex) {
+		ESP_LOGW(TAG, "mesh stream mutex allocation failed; /mesh/stream disabled");
+	} else if (xTaskCreate(mesh_stream_task, "mesh_stream", MESH_STREAM_TASK_STACK,
+	                       NULL, 4, &s_mesh_stream_task) != pdPASS) {
+		ESP_LOGW(TAG, "mesh stream task allocation failed; /mesh/stream disabled");
+		s_mesh_stream_task = NULL;
+		vSemaphoreDelete(s_mesh_stream_mutex);
+		s_mesh_stream_mutex = NULL;
+	}
+
 	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
 	return ESP_OK;
 }
@@ -4045,7 +4440,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
-	config.httpd.max_uri_handlers = 12;
+	config.httpd.max_uri_handlers = 14;
 	config.httpd.backlog_conn = 1;
 	config.httpd.recv_wait_timeout = 5;
 	config.httpd.send_wait_timeout = 5;
