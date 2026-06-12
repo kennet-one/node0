@@ -108,8 +108,24 @@ static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 		return ESP_OK;
 	}
 
+	uint8_t local_mac[6] = {0};
+	esp_wifi_get_mac(WIFI_IF_STA, local_mac);
+
+	int target_count = 0;
+	for (int i = 0; i < route_table_size; i++) {
+		if (memcmp(route_table[i].addr, local_mac, 6) != 0) {
+			target_count++;
+		}
+	}
+	if (target_count <= 0) {
+		return ESP_OK;
+	}
+
 	esp_err_t last_err = ESP_OK;
 	for (int i = 0; i < route_table_size; i++) {
+		if (memcmp(route_table[i].addr, local_mac, 6) == 0) {
+			continue;
+		}
 		esp_err_t e = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
 		if (e != ESP_OK) last_err = e;
 	}
@@ -120,7 +136,6 @@ static void mesh_time_root_task(void *arg)
 {
 	// Перший "тик" робимо швидко, щоб після появи часу ноди не чекали 60с
 	TickType_t last = xTaskGetTickCount();
-	bool first_sent = false;
 
 	while (true) {
 
@@ -141,7 +156,6 @@ static void mesh_time_root_task(void *arg)
 			ESP_LOGW(TAG, "TIME TX err=%s seq=%" PRIu32, esp_err_to_name(err), s_seq);
 		}
 
-		first_sent = true;
 		last = xTaskGetTickCount();
 	}
 }
@@ -150,10 +164,17 @@ esp_err_t mesh_time_sync_root_start(uint32_t period_ms)
 {
 	//mesh_time_sync_init();
 
+	if (s_root_task_started) {
+		return ESP_OK;
+	}
+
+	mesh_time_sync_root_set_period_ms(period_ms);
+
 	if (xTaskCreate(mesh_time_root_task, "mesh_time_tx", 4096, NULL, 4, NULL) != pdPASS) {
 		return ESP_ERR_NO_MEM;
 	}
 
+	s_root_task_started = true;
 	ESP_LOGI(TAG, "TIME task started, period=%u ms", (unsigned)s_period_ms);
 	return ESP_OK;
 }

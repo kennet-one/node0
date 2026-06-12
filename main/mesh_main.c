@@ -24,6 +24,7 @@
 #include "log_time_vprintf.h"
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
+#include "mesh_v2_link.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -186,7 +187,10 @@ static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t s
 	dst[n] = '\0';
 }
 
+#define I_AM_SINGLE_SENDER     0      // debug single-target sender; production node0 must keep this disabled
+
 // -----------------------------SINGLE_SENDER---------------------------------------
+#if I_AM_SINGLE_SENDER
 static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
 
 static esp_err_t mesh_send_single(const uint8_t to_mac[6],
@@ -206,6 +210,7 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
     // звичайний p2p-send – mesh сам прокладе маршрут
     return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
+#endif
 
 
 static esp_err_t node0_restart_dhcp_client(void)
@@ -314,8 +319,7 @@ static esp_err_t node0_apply_static_ip(void)
 #define SINGLE_TX_INTERVAL_MS  5000   // 5 секунд
 
 // щоб можна було вмикати/вимикати відправника на різних білдах
-#define I_AM_SINGLE_SENDER     1      // на вузлі, який ШЛЕ, став 1; на інших 0
-
+#if I_AM_SINGLE_SENDER
 static void mesh_single_tx_task(void *arg)
 {
     mesh_packet_t pkt;
@@ -363,6 +367,7 @@ static void mesh_single_tx_task(void *arg)
 
     vTaskDelete(NULL);
 }
+#endif
 
 
 /* -------------------------------------------------------------------------- */
@@ -453,6 +458,11 @@ static void mesh_rx_task(void *arg)
 
 		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
 
+		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION_V2) {
+			mesh_v2_root_handle_rx(&from, rx_buf, data.size);
+			continue;
+		}
+
 		// наш протокол?
 		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION) {
 
@@ -535,7 +545,9 @@ static esp_err_t mesh_comm_start(void)
 		started = true;
 		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
+#if I_AM_SINGLE_SENDER
         xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
+#endif
         stack_monitor_start(3);
 	}
 	return ESP_OK;

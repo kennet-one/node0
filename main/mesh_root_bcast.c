@@ -78,11 +78,26 @@ void mesh_root_broadcast_text(const char *payload)
 		return;
 	}
 
+	int target_count = 0;
+	for (int i = 0; i < route_table_size; ++i) {
+		if (memcmp(route_table[i].addr, pkt.src_mac, 6) != 0) {
+			target_count++;
+		}
+	}
+
+	if (target_count == 0) {
+		ESP_LOGW(TAG, "no remote children in routing table, nothing to broadcast");
+		return;
+	}
+
 	ESP_LOGI(TAG,
 	         "ROOT UART BCAST: to %d nodes, payload=\"%s\"",
-	         route_table_size, pkt.payload);
+	         target_count, pkt.payload);
 
 	for (int i = 0; i < route_table_size; ++i) {
+		if (memcmp(route_table[i].addr, pkt.src_mac, 6) == 0) {
+			continue;
+		}
 		err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
 		if (err != ESP_OK) {
 			ESP_LOGE(TAG,
