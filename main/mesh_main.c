@@ -27,17 +27,17 @@
 #include "mesh_v2_link.h"
 
 /* -------------------------------------------------------------------------- */
-/*  Константи / глобальні змінні                                              */
+/*  Constants / globals                                                       */
 /* -------------------------------------------------------------------------- */
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
 #define NODE0_WIFI_STACK_EXTRA_WORDS (500U)
-//#define FIXED_ROOT  1   // на node0
+//#define FIXED_ROOT  1   // node0 only
 
 static const char *MESH_TAG = "node0";
 
-/* Один і той самий MESH_ID на всі ноди в цій мережі */
+/* Same MESH_ID on every node in this mesh network. */
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77 };
 
 static bool       is_running        = true;
@@ -133,21 +133,21 @@ static void node0_install_wifi_task_stack_patch(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Мінімальний власний протокол                                              */
+/*  Minimal local protocol                                                    */
 /* -------------------------------------------------------------------------- */
 /*
- * Формат нашого пакету:
- *  magic    - 0xA5 (для перевірки, що це "наш" пакет)
- *  version  - версія протоколу (1)
- *  type     - тип (1 = просто текстове "Hello N")
- *  reserved - вирівнювання, запас
- *  counter  - лічильник пакета від цієї ноди
- *  src_mac  - MAC відправника
- *  payload  - невеликий текст (рядок з '\0' в кінці)
+ * Packet format:
+ *  magic    - 0xA5, identifies our packet
+ *  version  - protocol version
+ *  type     - packet type
+ *  reserved - alignment / future use
+ *  counter  - per-node packet counter
+ *  src_mac  - sender MAC
+ *  payload  - small zero-terminated text payload
  */
 
 /* -------------------------------------------------------------------------- */
-/*  Прототипи                                                                 */
+/*  Prototypes                                                                */
 /* -------------------------------------------------------------------------- */
 
 static void mesh_event_handler(void *arg,
@@ -199,7 +199,7 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
     mesh_addr_t dest = {0};
     mesh_data_t data;
 
-    // заповнюємо адресу призначення
+    // Fill destination address.
     memcpy(dest.addr, to_mac, 6);
 
     data.data  = (uint8_t *)pkt;
@@ -207,7 +207,7 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
     data.proto = MESH_PROTO_BIN;
     data.tos   = MESH_TOS_P2P;
 
-    // звичайний p2p-send – mesh сам прокладе маршрут
+    // Normal P2P send; ESP-MESH resolves the route.
     return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 #endif
@@ -316,9 +316,9 @@ static esp_err_t node0_apply_static_ip(void)
 #endif
 
 
-#define SINGLE_TX_INTERVAL_MS  5000   // 5 секунд
+#define SINGLE_TX_INTERVAL_MS  5000   // 5 seconds
 
-// щоб можна було вмикати/вимикати відправника на різних білдах
+// Keep this toggle so the debug sender can be enabled per build.
 #if I_AM_SINGLE_SENDER
 static void mesh_single_tx_task(void *arg)
 {
@@ -329,10 +329,10 @@ static void mesh_single_tx_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
 
     while (is_running) {
-        // чекаємо рівно 5 сек від попереднього “тика”
+        // Wait exactly one interval after the previous tick.
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SINGLE_TX_INTERVAL_MS));
 
-        // якщо нода ще не в mesh – нічого не робимо
+        // Do nothing before the node is in the mesh.
         if (!is_mesh_connected) {
             continue;
         }
@@ -345,7 +345,7 @@ static void mesh_single_tx_task(void *arg)
         pkt.type    = MESH_PKT_TYPE_TEXT;
         pkt.counter = counter;
 
-        // MAC цієї ноди – для логів
+        // This node MAC for diagnostics.
         esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
 
         snprintf(pkt.payload, sizeof(pkt.payload),
@@ -371,7 +371,7 @@ static void mesh_single_tx_task(void *arg)
 
 
 /* -------------------------------------------------------------------------- */
-/*  TX task – періодично шлемо пакет на root                                  */
+/*  TX task: periodically send a packet to root                                */
 /* -------------------------------------------------------------------------- */
 
 static void mesh_tx_task(void *arg)
@@ -389,7 +389,7 @@ static void mesh_tx_task(void *arg)
 	while (is_running) {
 		vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
 
-		// Шлемо тільки, якщо ми підключені до mesh і ми НЕ root
+		// Send only when connected to mesh and not acting as root.
 		if (!is_mesh_connected || esp_mesh_is_root()) {
 			continue;
 		}
@@ -402,7 +402,7 @@ static void mesh_tx_task(void *arg)
 		pkt.type    = MESH_PKT_TYPE_TEXT;
 		pkt.counter = counter;
 
-		// MAC цієї ноди (STA інтерфейс)
+		// This node MAC on the STA interface.
 		esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
 
 		snprintf(pkt.payload, sizeof(pkt.payload),
@@ -410,7 +410,7 @@ static void mesh_tx_task(void *arg)
 
 		data.size = sizeof(pkt);
 
-		// 00:00:00:00:00:00 => "відправити на root"
+		// 00:00:00:00:00:00 means "send to root".
 		memset(&dest, 0, sizeof(dest));
 
 		err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
@@ -428,7 +428,7 @@ static void mesh_tx_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  RX task – слухаємо пакети від інших нод                                   */
+/*  RX task: receive packets from other nodes                                  */
 /* -------------------------------------------------------------------------- */
 static void mesh_rx_task(void *arg)
 {
@@ -463,10 +463,10 @@ static void mesh_rx_task(void *arg)
 			continue;
 		}
 
-		// наш протокол?
+		// Our protocol?
 		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION) {
 
-			// 1) NodeInfo (tag) — для меню
+			// 1) NodeInfo for menu/listing.
 			if (h->type == MESH_LOG_TYPE_NODEINFO) {
 				if (data.size >= sizeof(mesh_nodeinfo_v2_packet_t)) {
 					const mesh_nodeinfo_v2_packet_t *p = (const mesh_nodeinfo_v2_packet_t *)rx_buf;
@@ -482,7 +482,7 @@ static void mesh_rx_task(void *arg)
 				continue;
 			}
 
-			// 2) Log line — пишемо в буфер тільки якщо ця нода вибрана
+			// 2) Log line. The web log layer filters by selected node.
 			if (h->type == MESH_LOG_TYPE_LINE) {
 				if (data.size >= sizeof(mesh_log_line_packet_t)) {
 					const mesh_log_line_packet_t *p = (const mesh_log_line_packet_t *)rx_buf;
@@ -490,13 +490,13 @@ static void mesh_rx_task(void *arg)
 					char line[sizeof(p->line) + 1];
 					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
 					copy_packet_text(line, sizeof(line), p->line, sizeof(p->line));
-					log_http_server_node_seen(p->h.src_mac, tag);          // щоб нода була у списку
-					log_http_server_remote_line(p->h.src_mac, tag, line); // буферизація (всередині є фільтр по selected)
+					log_http_server_node_seen(p->h.src_mac, tag);          // keep node visible in the list
+					log_http_server_remote_line(p->h.src_mac, tag, line); // buffered only when selected
 				}
 				continue;
 			}
 
-			// 4) Старий TEXT (type=1) — твоя поточна логіка
+			// 4) Legacy TEXT packet.
 			if (h->type == MESH_OTA_TYPE_STATUS) {
 				if (data.size >= sizeof(mesh_ota_status_packet_t)) {
 					const mesh_ota_status_packet_t *p = (const mesh_ota_status_packet_t *)rx_buf;
@@ -515,18 +515,18 @@ static void mesh_rx_task(void *arg)
 					ESP_LOGI(MESH_TAG, "RX TEXT: cnt=%lu from " MACSTR " payload=\"%s\"",
 						(unsigned long)p->counter, MAC2STR(from.addr), payload);
 
-					// якщо ще треба твій legacy_handle_text() — викликай тут
+					// Hook legacy_handle_text() here if needed again.
 					legacy_handle_text(payload);
 				}
 				continue;
 			}
 
-			// інші типи нашого протоколу
+			// Other packet types in our protocol.
 			ESP_LOGI(MESH_TAG, "RX type=%u from " MACSTR " len=%u", h->type, MAC2STR(from.addr), (unsigned)data.size);
 			continue;
 		}
 
-		// не наш протокол — можеш або ігнор, або стару обробку
+		// Unknown protocol; keep ignoring it for now.
 		ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " len=%u", MAC2STR(from.addr), (unsigned)data.size);
 	}
 	vTaskDelete(NULL);
@@ -534,7 +534,7 @@ static void mesh_rx_task(void *arg)
 
 
 /* -------------------------------------------------------------------------- */
-/*  Запуск задач TX/RX один раз                                               */
+/*  Start TX/RX tasks once                                                     */
 /* -------------------------------------------------------------------------- */
 
 static esp_err_t mesh_comm_start(void)
@@ -607,6 +607,7 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGW(MESH_TAG,
 		         "<MESH_EVENT_ROUTING_TABLE_ADD> add %d, new:%d, layer:%d",
 		         rt->rt_size_change, rt->rt_size_new, mesh_layer);
+		log_http_server_refresh_routes();
 	}
 	break;
 
@@ -725,7 +726,7 @@ static void mesh_event_handler(void *arg,
 }
 
 /* -------------------------------------------------------------------------- */
-/*  IP events (коли root отримує IP від роутера)                              */
+/*  IP events: root received router-facing IP                                  */
 /* -------------------------------------------------------------------------- */
 
 static void ip_event_handler(void *arg,
@@ -742,7 +743,7 @@ static void ip_event_handler(void *arg,
 
 	mesh_time_sync_root_start(5000);
 
-	// Якщо ми root – запускаємо HTTP-сервер
+	// Start the web server only on root.
 	if (esp_mesh_is_root()) {
 		log_http_server_start();
 	}
@@ -750,19 +751,19 @@ static void ip_event_handler(void *arg,
 
 
 /* -------------------------------------------------------------------------- */
-/*  app_main – ініціалізація mesh + Wi-Fi                                     */
+/*  app_main: mesh + Wi-Fi init                                                */
 /* -------------------------------------------------------------------------- */
 
 void app_main(void)
 {
-	//ESP_ERROR_CHECK(mesh_light_init());   // якщо не треба LED – можна забрати
+	//ESP_ERROR_CHECK(mesh_light_init());   // optional LED init
 	log_time_vprintf_start();
 	
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-	// Створюємо netif для mesh (sta + softAP, але зберігаємо тільки sta)
+	// Create mesh netifs; keep the STA netif handle.
 	ESP_ERROR_CHECK(
 	    esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
 
@@ -781,11 +782,11 @@ void app_main(void)
 	ESP_ERROR_CHECK(
 	    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
 	                               &mesh_event_handler, NULL));
-    // --- налаштування типу вузла / фіксований root ---
+    // --- node type / fixed root setup ---
 
-        // Ця прошивка буде завжди root (якщо може підключитися до роутера)
-    ESP_ERROR_CHECK(esp_mesh_fix_root(true));       // не віддаємо роль root
-    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));  // я – root
+        // This firmware always acts as root when it can reach the router.
+    ESP_ERROR_CHECK(esp_mesh_fix_root(true));       // do not give up root role
+    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));  // this node is root
 
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
@@ -801,7 +802,7 @@ void app_main(void)
 	// mesh_id
 	memcpy(cfg.mesh_id.addr, MESH_ID, 6);
 
-	// роутер (твій домашній Wi-Fi з menuconfig)
+	// Router-facing Wi-Fi credentials from menuconfig.
 	cfg.channel        = CONFIG_MESH_CHANNEL;
 	cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
 	memcpy(cfg.router.ssid,
@@ -811,7 +812,7 @@ void app_main(void)
 	       CONFIG_MESH_ROUTER_PASSWD,
 	       strlen(CONFIG_MESH_ROUTER_PASSWD));
 
-	// mesh AP (для дітей)
+	// Mesh AP for child nodes.
 	ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
 	cfg.mesh_ap.max_connection        = CONFIG_MESH_AP_CONNECTIONS;
 	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
@@ -821,6 +822,7 @@ void app_main(void)
 
 	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 
+	log_http_server_init();
 	ESP_ERROR_CHECK(esp_mesh_start());
 
 	ESP_LOGI(MESH_TAG,
@@ -833,7 +835,6 @@ void app_main(void)
 
 	uart_bridge_init();
 	uart_bridge_start();
-	log_http_server_init();
 	mesh_time_sync_init();
 	
 }

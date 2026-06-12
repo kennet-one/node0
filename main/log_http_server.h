@@ -13,16 +13,19 @@ extern "C" {
 esp_err_t log_http_server_init(void);
 esp_err_t log_http_server_start(void);
 
-// Викликає root при RX: NODEINFO
+// Called by root RX path for NODEINFO.
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag);
 void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
                                       bool uptime_valid, uint32_t uptime_s);
 
-// Викликає root при RX: LOG_LINE
+// Called by root RX path for LOG_LINE.
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line);
 
 void log_http_server_remote_ota_status(const uint8_t mac[6],
                                        const mesh_ota_status_packet_t *status);
+
+// Called by mesh events when the routing table changes.
+void log_http_server_refresh_routes(void);
 
 #ifdef __cplusplus
 }

@@ -41,7 +41,7 @@ extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_h
 extern const unsigned char node0_https_prvtkey_pem_start[] asm("_binary_node0_https_prvtkey_pem_start");
 extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_https_prvtkey_pem_end");
 
-/* ----------------- Налаштування ----------------- */
+/* ----------------- Configuration ----------------- */
 
 #ifndef LOG_HTTP_LINES
 	#define LOG_HTTP_LINES			220
@@ -73,7 +73,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_OTA_SEND_RETRIES		3
 #define REMOTE_OTA_RETRY_DELAY_MS	120U
 #define LOG_STREAM_TASK_STACK		6144U
-#define LOG_STREAM_HEARTBEAT_MS		2000U
+#define LOG_STREAM_HEARTBEAT_MS		10000U
 #define HTTPS_MAX_OPEN_SOCKETS		3
 #define UI_STATUS_JSON_MAX		12288U
 #define UI_CONTROL_POLL_MS		10000
@@ -84,13 +84,13 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
 
-/* ----------------- Стан ----------------- */
+/* ----------------- State ----------------- */
 
 static httpd_handle_t s_http_server = NULL;
 
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_lines[LOG_HTTP_LINES][LOG_HTTP_LINE_MAX];
-static uint32_t s_write_idx = 0;	// абсолютний лічильник рядків (cursor)
+static uint32_t s_write_idx = 0;	// absolute line cursor
 static uint32_t s_total_lines = 0;
 static uint8_t s_http_wire_drop_budget = 0;
 
@@ -107,21 +107,21 @@ static log_stream_state_t s_log_stream = {0};
 typedef int (*vprintf_like_t)(const char *fmt, va_list ap);
 static vprintf_like_t s_orig_vprintf = NULL;
 
-// локальна нода
+// Local node.
 static uint8_t s_local_mac[6] = {0};
 static char s_local_tag[16] = "node0";
 
-// вибраний стрім (по замовчуванню local)
+// Selected stream, local by default.
 static uint8_t s_sel_mac[6] = {0};
 static char s_sel_tag[16] = "node0";
 
-// хто зараз реально стрімить (remote), щоб вимкнути попереднього
+// Currently active remote stream; used to disable the previous one.
 static uint8_t s_stream_mac[6] = {0};
 static bool s_stream_active = false;
 static uint8_t s_last_rearm_mac[6] = {0};
 static uint32_t s_last_rearm_ms = 0;
 
-// список нод
+// Known node list.
 typedef struct {
 	uint8_t mac[6];
 	char tag[16];
@@ -188,6 +188,9 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
                                              const uint8_t mac[6]);
 static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s);
+static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
+static bool selected_remote_stream_needs_rearm(const uint8_t mac[6]);
+static void selected_remote_stream_mark_rearm(const uint8_t mac[6]);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -328,6 +331,28 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 		}
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
+
+	for (int i = 0; i < route_count; i++) {
+		const uint8_t *mac = routes[i].addr;
+		if (!mac_eq(mac, s_local_mac) && selected_remote_stream_needs_rearm(mac)) {
+			if (mesh_send_log_ctrl(mac, true) == ESP_OK) {
+				selected_remote_stream_mark_rearm(mac);
+			}
+		}
+	}
+}
+
+void log_http_server_refresh_routes(void)
+{
+	mesh_addr_t routes[LOG_HTTP_MAX_NODES];
+	int route_count = 0;
+
+	if (esp_mesh_get_routing_table(routes, sizeof(routes), &route_count) != ESP_OK) {
+		return;
+	}
+	if (route_count > LOG_HTTP_MAX_NODES) route_count = LOG_HTTP_MAX_NODES;
+
+	note_route_table_nodes(routes, route_count, ms_now());
 }
 
 static bool node_route_current(const uint8_t mac[6])
@@ -342,6 +367,38 @@ static bool node_route_current(const uint8_t mac[6])
 	}
 	if (route_count > LOG_HTTP_MAX_NODES) route_count = LOG_HTTP_MAX_NODES;
 	return route_table_contains(routes, route_count, mac);
+}
+
+static bool node_has_fresh_telemetry(const uint8_t mac[6], uint32_t max_age_ms)
+{
+	if (!mac || mac_eq(mac, s_local_mac)) return true;
+
+	uint32_t now = ms_now();
+	bool fresh = false;
+
+	mesh_v2_root_stats_t v2;
+	if (mesh_v2_root_stats_for_mac(mac, &v2) &&
+	    v2.last_v2_ms != 0 &&
+	    (uint32_t)(now - v2.last_v2_ms) <= max_age_ms) {
+		fresh = true;
+	}
+
+	if (!fresh) {
+		portENTER_CRITICAL(&s_nodes_lock);
+		{
+			for (uint32_t i = 0; i < s_nodes_count; i++) {
+				if (mac_eq(s_nodes[i].mac, mac) &&
+				    s_nodes[i].last_seen_ms != 0 &&
+				    (uint32_t)(now - s_nodes[i].last_seen_ms) <= max_age_ms) {
+					fresh = true;
+					break;
+				}
+			}
+		}
+		portEXIT_CRITICAL(&s_nodes_lock);
+	}
+
+	return fresh;
 }
 
 static void mac_to_hex(const uint8_t mac[6], char out[13])
@@ -1028,12 +1085,12 @@ static void log_buffer_append_line(const char *line, size_t len)
 {
 	if (!line || len == 0) return;
 
-	// прибрати кінцеві \r \n
+	// Trim trailing CR/LF.
 	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
 		len--;
 	}
 
-	// якщо після trim нічого не лишилось — не пишемо
+	// Skip lines that became empty after trimming.
 	if (len == 0) return;
 
 	portENTER_CRITICAL(&s_log_lock);
@@ -1169,7 +1226,7 @@ static bool build_time_prefix(char *out, size_t out_sz)
 
 /* ----------------- Mesh CTRL (root -> node) ----------------- */
 
-static void mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
+static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 {
 	mesh_log_ctrl_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -1193,8 +1250,7 @@ static void mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 	memset(&dest, 0, sizeof(dest));
 	memcpy(dest.addr, to_mac, 6);
 
-	// НЕ логати тут (щоб не рекурсія у vprintf)
-	esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 
 static void select_stream_node(const uint8_t mac[6], const char *tag)
@@ -1249,7 +1305,7 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 
 selected:
 	if (disable_old_stream) {
-		mesh_send_log_ctrl(old_stream_mac, false);
+		(void)mesh_send_log_ctrl(old_stream_mac, false);
 	}
 
 	log_buffer_clear();
@@ -1270,7 +1326,8 @@ selected:
 	if (enable_new_stream) {
 		char tprefix[40];
 		char line[LOG_HTTP_LINE_MAX];
-		const char *reason = node_route_current(new_stream_mac)
+		const char *reason = (node_route_current(new_stream_mac) ||
+		                      node_has_fresh_telemetry(new_stream_mac, NODEINFO_STALE_MS))
 			? "waiting for log stream"
 			: "waiting for node route";
 		build_time_prefix(tprefix, sizeof(tprefix));
@@ -1282,11 +1339,9 @@ selected:
 		         new_stream_mac[3], new_stream_mac[4], new_stream_mac[5],
 		         reason);
 		log_buffer_append_line(line, strnlen(line, sizeof(line)));
-		mesh_send_log_ctrl(new_stream_mac, true);
-		portENTER_CRITICAL(&s_selection_lock);
-		mac_copy(s_last_rearm_mac, new_stream_mac);
-		s_last_rearm_ms = ms_now();
-		portEXIT_CRITICAL(&s_selection_lock);
+		if (mesh_send_log_ctrl(new_stream_mac, true) == ESP_OK) {
+			selected_remote_stream_mark_rearm(new_stream_mac);
+		}
 	}
 }
 
@@ -1308,8 +1363,6 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 			                 (uint32_t)(now - s_last_rearm_ms) < REMOTE_LOG_REARM_MIN_MS;
 			if (!throttled) {
 				rearm = true;
-				mac_copy(s_last_rearm_mac, mac);
-				s_last_rearm_ms = now;
 			}
 		}
 	}
@@ -1318,7 +1371,19 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 	return rearm;
 }
 
-/* ----------------- vprintf hook (тільки local, якщо local вибраний) ----------------- */
+static void selected_remote_stream_mark_rearm(const uint8_t mac[6])
+{
+	if (!mac) return;
+
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		mac_copy(s_last_rearm_mac, mac);
+		s_last_rearm_ms = ms_now();
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+}
+
+/* ----------------- vprintf hook for the selected local node ----------------- */
 
 static int log_http_vprintf(const char *fmt, va_list ap)
 {
@@ -1332,7 +1397,7 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 		va_end(ap_copy);
 	}
 
-	// 2) У буфер пишемо ТІЛЬКИ якщо зараз вибрана local нода
+	// 2) Buffer local logs only while the local node is selected.
 	if (!selection_is_local()) {
 		return ret;
 	}
@@ -1373,7 +1438,7 @@ static int log_http_vprintf(const char *fmt, va_list ap)
 	return ret;
 }
 
-/* ----------------- Public API (з mesh RX) ----------------- */
+/* ----------------- Public API called from mesh RX ----------------- */
 
 void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
                                       bool uptime_valid, uint32_t uptime_s)
@@ -1415,7 +1480,9 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	portEXIT_CRITICAL(&s_nodes_lock);
 
 	if (uptime_valid && selected_remote_stream_needs_rearm(mac)) {
-		mesh_send_log_ctrl(mac, true);
+		if (mesh_send_log_ctrl(mac, true) == ESP_OK) {
+			selected_remote_stream_mark_rearm(mac);
+		}
 	}
 
 	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
@@ -2112,12 +2179,15 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	}
 
 	bool stale = remote && (!has_telemetry || best_age > NODEINFO_STALE_MS);
-	bool offline = remote && !route_seen && stale &&
+	bool fresh_telemetry = remote && has_telemetry && best_age <= NODEINFO_STALE_MS;
+	bool link_seen = route_seen || fresh_telemetry;
+	bool offline = remote && !link_seen && stale &&
 		(!has_route_history || (uint32_t)route_age_ms > NODE_OFFLINE_MS);
 
 	return append_fmt(out, cap, pos,
-	                  ",\"route_seen\":%s,\"route_age_ms\":%ld,"
+	                  ",\"route_seen\":%s,\"route_table_seen\":%s,\"route_age_ms\":%ld,"
 	                  "\"nodeinfo_age_ms\":%ld,\"stale\":%s,\"offline\":%s",
+	                  link_seen ? "true" : "false",
 	                  route_seen ? "true" : "false",
 	                  route_age_ms,
 	                  nodeinfo_age_ms,
@@ -3707,7 +3777,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  for(let raw of lines){\n"
 		"    if(raw===undefined||raw===null) continue;\n"
 		"    raw=raw.replace(/\\r/g,'');\n"
-		"    if(raw.trim().length===0) continue; // <-- прибирає фейкові пусті рядки\n"
+		"    if(raw.trim().length===0) continue; // drop fake empty chunk lines\n"
 		"\n"
 		"    let ts='';\n"
 		"    let rest=raw;\n"
