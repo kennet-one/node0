@@ -69,8 +69,13 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define NODE0_OTA_BUF_SIZE		4096U
 #define NODE0_OTA_RECV_TIMEOUT_RETRIES	3
 #define REMOTE_OTA_ACK_TIMEOUT_MS	8000U
+#define REMOTE_OTA_SEND_RETRIES		3
+#define REMOTE_OTA_RETRY_DELAY_MS	120U
 #define LOG_STREAM_TASK_STACK		6144U
 #define LOG_STREAM_HEARTBEAT_MS		2000U
+#define HTTPS_MAX_OPEN_SOCKETS		3
+#define UI_STATUS_JSON_MAX		8192U
+#define UI_CONTROL_POLL_MS		10000
 
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
@@ -165,6 +170,14 @@ static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...
 static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
 static void log_stream_notify(void);
 static bool parse_mac_hex(const char *s, uint8_t mac[6]);
+static size_t append_nodes_json(char *out, size_t cap, size_t pos);
+static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
+                                        const uint8_t mac[6]);
+static size_t append_local_ota_json(char *out, size_t cap, size_t pos);
+static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
+                                             const uint8_t mac[6]);
+static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
+                                      uint32_t uptime_s);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -1118,8 +1131,16 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 	{
 		if (mac_eq(mac, s_sel_mac)) {
 			copy_tag(s_sel_tag, sizeof(s_sel_tag), clean_tag);
+			if (mac_eq(mac, s_local_mac)) {
+				portEXIT_CRITICAL(&s_selection_lock);
+				return;
+			}
+			s_stream_active = true;
+			mac_copy(s_stream_mac, mac);
+			mac_copy(new_stream_mac, mac);
+			enable_new_stream = true;
 			portEXIT_CRITICAL(&s_selection_lock);
-			return;
+			goto selected;
 		}
 
 		if (s_stream_active) {
@@ -1142,6 +1163,7 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
 
+selected:
 	if (disable_old_stream) {
 		mesh_send_log_ctrl(old_stream_mac, false);
 	}
@@ -1149,6 +1171,16 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 	log_buffer_clear();
 
 	if (enable_new_stream) {
+		char tprefix[40];
+		char line[LOG_HTTP_LINE_MAX];
+		build_time_prefix(tprefix, sizeof(tprefix));
+		snprintf(line, sizeof(line),
+		         "%sI (0) log_http: selected %s [%02x%02x%02x%02x%02x%02x], waiting for remote log stream",
+		         tprefix,
+		         clean_tag,
+		         new_stream_mac[0], new_stream_mac[1], new_stream_mac[2],
+		         new_stream_mac[3], new_stream_mac[4], new_stream_mac[5]);
+		log_buffer_append_line(line, strnlen(line, sizeof(line)));
 		mesh_send_log_ctrl(new_stream_mac, true);
 	}
 }
@@ -1270,6 +1302,8 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	if (uptime_valid && selected_remote_stream_needs_rearm(mac)) {
 		mesh_send_log_ctrl(mac, true);
 	}
+
+	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
 }
 
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
@@ -1928,6 +1962,326 @@ static void remote_ota_status_finish(node0_ota_state_t state, const char *msg)
 	portEXIT_CRITICAL(&s_remote_ota_lock);
 }
 
+static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
+                                      uint32_t uptime_s)
+{
+	if (!mac || !uptime_valid) {
+		return;
+	}
+
+	char result[96];
+	snprintf(result, sizeof(result),
+	         "remote OTA booted, uptime %lus",
+	         (unsigned long)uptime_s);
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	if (s_remote_ota_status.target_valid &&
+	    mac_eq(mac, s_remote_ota_status.target_mac) &&
+	    s_remote_ota_status.state == NODE0_OTA_REBOOTING) {
+		s_remote_ota_status.state = NODE0_OTA_SUCCESS;
+		s_remote_ota_status.finished_ms = ms_now();
+		strncpy(s_remote_ota_status.last_result, result,
+		        sizeof(s_remote_ota_status.last_result) - 1);
+		s_remote_ota_status.last_result[sizeof(s_remote_ota_status.last_result) - 1] = '\0';
+		s_remote_ota_status.last_error[0] = '\0';
+	}
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static size_t append_nodes_json(char *out, size_t cap, size_t pos)
+{
+	uint32_t local_uptime = local_uptime_s();
+	uint8_t selected_mac[6];
+	char selected_tag[16];
+	static const uint8_t zero_mac[6] = {0};
+
+	selection_snapshot(selected_mac, selected_tag, sizeof(selected_tag));
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"selected_mac\":\"%02x%02x%02x%02x%02x%02x\",\"selected_tag\":",
+	                 selected_mac[0], selected_mac[1], selected_mac[2],
+	                 selected_mac[3], selected_mac[4], selected_mac[5]);
+	pos = append_json_string(out, cap, pos, selected_tag);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"local_mac\":\"%02x%02x%02x%02x%02x%02x\",\"nodes\":[",
+	                 s_local_mac[0], s_local_mac[1], s_local_mac[2],
+	                 s_local_mac[3], s_local_mac[4], s_local_mac[5]);
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":",
+	                 s_local_mac[0], s_local_mac[1], s_local_mac[2],
+	                 s_local_mac[3], s_local_mac[4], s_local_mac[5]);
+	pos = append_json_string(out, cap, pos, s_local_tag);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"uptime_valid\":true,\"uptime_s\":%lu}",
+	                 (unsigned long)local_uptime);
+
+	bool sel_in_list = mac_eq(selected_mac, s_local_mac);
+	uint32_t now = ms_now();
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (pos + 192 >= cap) break;
+			if (mac_eq(s_nodes[i].mac, s_local_mac)) continue;
+
+			if (mac_eq(s_nodes[i].mac, selected_mac)) sel_in_list = true;
+
+			bool uptime_valid = s_nodes[i].uptime_valid;
+			uint32_t uptime_s = uptime_valid
+				? uptime_advanced_s(s_nodes[i].uptime_s, s_nodes[i].uptime_seen_ms, now)
+				: 0;
+
+			pos = append_fmt(out, cap, pos,
+			                 ",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":",
+			                 s_nodes[i].mac[0], s_nodes[i].mac[1], s_nodes[i].mac[2],
+			                 s_nodes[i].mac[3], s_nodes[i].mac[4], s_nodes[i].mac[5]);
+			pos = append_json_string(out, cap, pos, s_nodes[i].tag);
+			pos = append_fmt(out, cap, pos,
+			                 ",\"uptime_valid\":%s,\"uptime_s\":%lu}",
+			                 uptime_valid ? "true" : "false",
+			                 (unsigned long)uptime_s);
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	if (!sel_in_list && !mac_eq(selected_mac, zero_mac) && pos + 192 < cap) {
+		pos = append_fmt(out, cap, pos,
+		                 ",{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":",
+		                 selected_mac[0], selected_mac[1], selected_mac[2],
+		                 selected_mac[3], selected_mac[4], selected_mac[5]);
+		pos = append_json_string(out, cap, pos, selected_tag);
+		pos = append_fmt(out, cap, pos,
+		                 ",\"uptime_valid\":false,\"uptime_s\":0}");
+	}
+
+	return append_fmt(out, cap, pos, "]}");
+}
+
+static size_t append_local_ota_json(char *out, size_t cap, size_t pos)
+{
+	node0_ota_status_t status;
+
+	portENTER_CRITICAL(&s_ota_state_lock);
+	status = s_ota_status;
+	portEXIT_CRITICAL(&s_ota_state_lock);
+
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+	const esp_app_desc_t *app = esp_app_get_description();
+
+	esp_ota_img_states_t img_state = ESP_OTA_IMG_UNDEFINED;
+	bool img_state_valid = running &&
+		esp_ota_get_state_partition(running, &img_state) == ESP_OK;
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"enabled\":%s,\"busy\":%s,\"state\":\"%s\","
+	                 "\"written_bytes\":%lu,\"total_bytes\":%lu,"
+	                 "\"running_label\":",
+	                 ota_enabled() ? "true" : "false",
+	                 status.state == NODE0_OTA_UPDATING ? "true" : "false",
+	                 ota_state_name(status.state),
+	                 (unsigned long)status.written_bytes,
+	                 (unsigned long)status.total_bytes);
+	pos = append_json_string(out, cap, pos, running ? running->label : "");
+	pos = append_fmt(out, cap, pos,
+	                 ",\"running_address\":%lu,\"running_size\":%lu,"
+	                 "\"update_label\":",
+	                 (unsigned long)(running ? running->address : 0),
+	                 (unsigned long)(running ? running->size : 0));
+	pos = append_json_string(out, cap, pos, update ? update->label : "");
+	pos = append_fmt(out, cap, pos,
+	                 ",\"update_size\":%lu,\"rollback_state\":",
+	                 (unsigned long)(update ? update->size : 0));
+	pos = append_json_string(out, cap, pos,
+	                         img_state_valid ? ota_img_state_name(img_state) : "unknown");
+	pos = append_fmt(out, cap, pos, ",\"project_name\":");
+	pos = append_json_string(out, cap, pos, app ? app->project_name : "");
+	pos = append_fmt(out, cap, pos, ",\"version\":");
+	pos = append_json_string(out, cap, pos, app ? app->version : "");
+	pos = append_fmt(out, cap, pos, ",\"last_result\":");
+	pos = append_json_string(out, cap, pos, status.last_result);
+	pos = append_fmt(out, cap, pos, ",\"last_error\":");
+	pos = append_json_string(out, cap, pos, status.last_error);
+	return append_fmt(out, cap, pos, "}");
+}
+
+static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
+                                             const uint8_t mac[6])
+{
+	uint8_t target_mac[6] = {0};
+	char tag[16] = "node";
+	char target_err[96] = "target node is unknown";
+
+	if (mac) {
+		mac_copy(target_mac, mac);
+	}
+
+	bool target_ok = !mac_eq(target_mac, s_local_mac) &&
+	                 lookup_node_tag(target_mac, tag, sizeof(tag));
+	if (!target_ok && mac_eq(target_mac, s_local_mac)) {
+		strncpy(target_err, "target is local node0", sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
+	}
+	bool supported = target_ok && remote_ota_supported_tag(tag);
+
+	char mac_hex[13] = {0};
+	mac_to_hex(target_mac, mac_hex);
+
+	remote_ota_status_t status;
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	status = s_remote_ota_status;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	bool target_match = target_ok &&
+	                    status.target_valid &&
+	                    mac_eq(target_mac, status.target_mac);
+	node0_ota_state_t state = target_match ? status.state : NODE0_OTA_IDLE;
+	uint32_t total = target_match ? status.total_bytes : 0;
+	uint32_t written = target_match ? status.written_bytes : 0;
+	const char *last_result = target_match ? status.last_result : "";
+	const char *last_error = target_match ? status.last_error : "";
+	const char *remote_message = target_match ? status.remote_message : "";
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
+	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
+	                 "\"target_mac\":\"%s\",\"target_tag\":",
+	                 ota_enabled() ? "true" : "false",
+	                 supported ? "true" : "false",
+	                 state == NODE0_OTA_UPDATING ? "true" : "false",
+	                 ota_state_name(state),
+	                 (unsigned long)written,
+	                 (unsigned long)total,
+	                 mac_hex);
+	pos = append_json_string(out, cap, pos, target_ok ? tag : "");
+	pos = append_fmt(out, cap, pos, ",\"running_label\":\"remote\","
+	                 "\"update_label\":\"remote\",\"last_result\":");
+	pos = append_json_string(out, cap, pos, last_result);
+	pos = append_fmt(out, cap, pos, ",\"last_error\":");
+	pos = append_json_string(out, cap, pos, target_ok ? last_error : target_err);
+	pos = append_fmt(out, cap, pos, ",\"remote_message\":");
+	pos = append_json_string(out, cap, pos, remote_message);
+	return append_fmt(out, cap, pos, "}");
+}
+
+static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
+                                        const uint8_t mac[6])
+{
+	uint8_t target_mac[6];
+	if (mac) {
+		mac_copy(target_mac, mac);
+	} else {
+		selection_snapshot(target_mac, NULL, 0);
+	}
+
+	stack_monitor_snapshot_t snap;
+	char tag[16] = {0};
+	bool valid = taskmon_get_snapshot(target_mac, &snap, tag, sizeof(tag));
+	if (tag[0] == '\0' && !lookup_node_tag(target_mac, tag, sizeof(tag))) {
+		copy_tag(tag, sizeof(tag), "node");
+	}
+
+	char mac_hex[13];
+	mac_to_hex(target_mac, mac_hex);
+	int slot_count = mac_eq(target_mac, s_local_mac)
+		? STACK_MONITOR_MAX_TASKS
+		: taskmon_slot_count_for_mac(target_mac);
+	uint32_t uptime_s = 0;
+	bool uptime_valid = node_uptime_for_mac(target_mac, &uptime_s);
+	ram_status_t ram = ram_status_for_mac(target_mac);
+	persistent_status_t persistent = persistent_status_for_mac(target_mac);
+
+	if (!valid) {
+		pos = append_fmt(out, cap, pos,
+		                 "{\"valid\":false,\"mac\":\"%s\",\"tag\":",
+		                 mac_hex);
+		pos = append_json_string(out, cap, pos, tag);
+		return append_fmt(out, cap, pos,
+		                  ",\"updated_ms\":0,\"age_ms\":0,"
+		                  "\"cpu_valid\":false,\"cpu_load_x10\":0,"
+		                  "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                  "\"uptime_s\":%lu,\"ram_valid\":%s,"
+		                  "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
+		                  "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+		                  "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+		                  "\"app_partition_bytes\":%lu,"
+		                  "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+		                  "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+		                  "\"nvs_total_entries\":%lu,\"tasks\":[]}",
+		                  slot_count,
+		                  uptime_valid ? "true" : "false",
+		                  (unsigned long)uptime_s,
+		                  ram.valid ? "true" : "false",
+		                  (unsigned long)ram.free_bytes,
+		                  (unsigned long)ram.min_free_bytes,
+		                  (unsigned long)ram.total_bytes,
+		                  persistent.flash_valid ? "true" : "false",
+		                  (unsigned long)persistent.flash_chip_bytes,
+		                  (unsigned long)persistent.app_used_bytes,
+		                  (unsigned long)persistent.app_partition_bytes,
+		                  persistent.nvs_valid ? "true" : "false",
+		                  (unsigned long)persistent.nvs_used_entries,
+		                  (unsigned long)persistent.nvs_free_entries,
+		                  (unsigned long)persistent.nvs_available_entries,
+		                  (unsigned long)persistent.nvs_total_entries);
+	}
+
+	uint32_t now = ms_now();
+	uint32_t age_ms = (now >= snap.updated_ms) ? (now - snap.updated_ms) : 0;
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"valid\":true,\"mac\":\"%s\",\"tag\":",
+	                 mac_hex);
+	pos = append_json_string(out, cap, pos, tag);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
+	                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
+	                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+	                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
+	                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
+	                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+	                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+	                 "\"app_partition_bytes\":%lu,"
+	                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+	                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+	                 "\"nvs_total_entries\":%lu,\"tasks\":[",
+	                 (unsigned long)snap.updated_ms,
+	                 (unsigned long)age_ms,
+	                 snap.cpu_valid ? "true" : "false",
+	                 (unsigned long)snap.cpu_load_x10,
+	                 slot_count,
+	                 uptime_valid ? "true" : "false",
+	                 (unsigned long)uptime_s,
+	                 ram.valid ? "true" : "false",
+	                 (unsigned long)ram.free_bytes,
+	                 (unsigned long)ram.min_free_bytes,
+	                 (unsigned long)ram.total_bytes,
+	                 persistent.flash_valid ? "true" : "false",
+	                 (unsigned long)persistent.flash_chip_bytes,
+	                 (unsigned long)persistent.app_used_bytes,
+	                 (unsigned long)persistent.app_partition_bytes,
+	                 persistent.nvs_valid ? "true" : "false",
+	                 (unsigned long)persistent.nvs_used_entries,
+	                 (unsigned long)persistent.nvs_free_entries,
+	                 (unsigned long)persistent.nvs_available_entries,
+	                 (unsigned long)persistent.nvs_total_entries);
+
+	for (uint32_t i = 0; i < snap.count && i < STACK_MONITOR_MAX_TASKS; i++) {
+		const stack_monitor_task_info_t *t = &snap.tasks[i];
+		if (i > 0) pos = append_fmt(out, cap, pos, ",");
+		pos = append_fmt(out, cap, pos, "{\"name\":");
+		pos = append_json_string(out, cap, pos, t->name);
+		pos = append_fmt(out, cap, pos,
+		                 ",\"prio\":%lu,\"free_words\":%lu,\"cpu_x10\":%ld}",
+		                 (unsigned long)t->priority,
+		                 (unsigned long)t->free_words,
+		                 (long)t->cpu_x10);
+	}
+
+	return append_fmt(out, cap, pos, "]}");
+}
+
 static bool remote_ota_target_from_req(httpd_req_t *req, uint8_t mac[6],
                                        char *tag, size_t tag_sz,
                                        char *err, size_t err_sz)
@@ -2027,29 +2381,45 @@ static esp_err_t remote_ota_send_wait(const uint8_t mac[6], const void *pkt,
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	while (xSemaphoreTake(s_remote_ota_ack_sem, 0) == pdTRUE) {
+	esp_err_t last_err = ESP_ERR_TIMEOUT;
+
+	for (uint32_t attempt = 1; attempt <= REMOTE_OTA_SEND_RETRIES; attempt++) {
+		while (xSemaphoreTake(s_remote_ota_ack_sem, 0) == pdTRUE) {
+		}
+
+		portENTER_CRITICAL(&s_remote_ota_lock);
+		memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
+		s_remote_ota_wait.waiting = true;
+		mac_copy(s_remote_ota_wait.mac, mac);
+		s_remote_ota_wait.op = op;
+		s_remote_ota_wait.seq = seq;
+		portEXIT_CRITICAL(&s_remote_ota_lock);
+
+		esp_err_t send_err = mesh_ota_send_to(mac, pkt, pkt_len);
+		if (send_err != ESP_OK) {
+			remote_ota_clear_wait();
+			last_err = send_err;
+			snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
+			vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
+			continue;
+		}
+
+		if (xSemaphoreTake(s_remote_ota_ack_sem,
+		                   pdMS_TO_TICKS(REMOTE_OTA_ACK_TIMEOUT_MS)) == pdTRUE) {
+			last_err = ESP_OK;
+			break;
+		}
+
+		remote_ota_clear_wait();
+		last_err = ESP_ERR_TIMEOUT;
+		snprintf(err, err_sz, "remote OTA ACK timeout op=%u seq=%u try=%lu/%u",
+		         (unsigned)op, (unsigned)seq, (unsigned long)attempt,
+		         (unsigned)REMOTE_OTA_SEND_RETRIES);
+		vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
 	}
 
-	portENTER_CRITICAL(&s_remote_ota_lock);
-	memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
-	s_remote_ota_wait.waiting = true;
-	mac_copy(s_remote_ota_wait.mac, mac);
-	s_remote_ota_wait.op = op;
-	s_remote_ota_wait.seq = seq;
-	portEXIT_CRITICAL(&s_remote_ota_lock);
-
-	esp_err_t send_err = mesh_ota_send_to(mac, pkt, pkt_len);
-	if (send_err != ESP_OK) {
-		remote_ota_clear_wait();
-		snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
-		return send_err;
-	}
-
-	if (xSemaphoreTake(s_remote_ota_ack_sem,
-	                   pdMS_TO_TICKS(REMOTE_OTA_ACK_TIMEOUT_MS)) != pdTRUE) {
-		remote_ota_clear_wait();
-		snprintf(err, err_sz, "remote OTA ACK timeout");
-		return ESP_ERR_TIMEOUT;
+	if (last_err != ESP_OK) {
+		return last_err;
 	}
 
 	mesh_ota_status_packet_t got;
@@ -2622,13 +2992,13 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		                 new_desc.version, sizeof(new_desc.version));
 
 		mesh_ota_status_packet_t ack;
+		remote_started = true;
 		result = remote_ota_send_wait(target_mac, &begin, sizeof(begin),
 		                              MESH_OTA_OP_BEGIN, begin.seq,
 		                              &ack, err_msg, sizeof(err_msg));
 		if (result != ESP_OK) {
 			break;
 		}
-		remote_started = true;
 
 		uint32_t written = 0;
 		result = remote_ota_send_chunks_from_buffer(target_mac, buf, first_have,
@@ -2846,6 +3216,81 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
+static bool query_bool_value(const char *q, const char *key)
+{
+	char v[12] = {0};
+	if (!q || !key) return false;
+	if (httpd_query_key_value(q, key, v, sizeof(v)) != ESP_OK) return false;
+	return strcmp(v, "1") == 0 ||
+	       strcmp(v, "true") == 0 ||
+	       strcmp(v, "yes") == 0 ||
+	       strcmp(v, "on") == 0;
+}
+
+static esp_err_t http_ui_status_get(httpd_req_t *req)
+{
+	uint8_t mac[6];
+	selection_snapshot(mac, NULL, 0);
+
+	char q[96] = {0};
+	bool include_tasks = false;
+	bool include_ota = false;
+
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[32] = {0};
+		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
+			uint8_t parsed[6];
+			if (parse_mac_hex(v, parsed)) {
+				mac_copy(mac, parsed);
+			}
+		}
+		include_tasks = query_bool_value(q, "tasks");
+		include_ota = query_bool_value(q, "ota") || include_tasks;
+	}
+
+	char *out = (char *)malloc(UI_STATUS_JSON_MAX);
+	if (!out) {
+		return http_json_error(req, "500 Internal Server Error",
+		                       "no memory for UI status");
+	}
+
+	size_t pos = 0;
+	out[0] = '\0';
+
+	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "{\"nodes\":");
+	pos = append_nodes_json(out, UI_STATUS_JSON_MAX, pos);
+	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, ",\"tasks\":");
+	if (include_tasks) {
+		pos = append_tasks_json_for_mac(out, UI_STATUS_JSON_MAX, pos, mac);
+	} else {
+		pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "null");
+	}
+
+	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, ",\"ota\":");
+	if (include_ota) {
+		if (mac_eq(mac, s_local_mac)) {
+			pos = append_local_ota_json(out, UI_STATUS_JSON_MAX, pos);
+		} else {
+			pos = append_remote_ota_json_for_mac(out, UI_STATUS_JSON_MAX, pos, mac);
+		}
+	} else {
+		pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "null");
+	}
+	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "}");
+
+	if (pos >= UI_STATUS_JSON_MAX - 2) {
+		free(out);
+		return http_json_error(req, "500 Internal Server Error",
+		                       "UI status JSON truncated");
+	}
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	free(out);
+	return err;
+}
+
 static esp_err_t http_root_get(httpd_req_t *req)
 {
 	static const char html[] =
@@ -2944,7 +3389,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let logStreamErrors=0;\n"
 		"let pollFallbackUntil=0;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){loadTasks();loadOtaStatus()}}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadUiStatus()}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
@@ -2967,6 +3412,32 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function otaSlotClassFor(label){if(label==='ota_0')return 'otaSlotA';if(label==='ota_1')return 'otaSlotB';return 'otaSlotUnknown'}\n"
 		"function setOtaSlot(text,cls){otaSlotText=text||'A/B ?';otaSlotClass=cls||'otaSlotUnknown';const el=document.getElementById('otaSlot');if(el){el.textContent=otaSlotText;el.className='otaSlot '+otaSlotClass}}\n"
 		"function updateOtaSlotFromStatus(j){const a=otaSlotName(j.running_label);const n=otaSlotName(j.update_label);if(a==='?'&&n==='?')setOtaSlot('A/B ?','otaSlotUnknown');else setOtaSlot(a+' active / '+n+' next',otaSlotClassFor(j.running_label))}\n"
+		"function applyNodes(j,raw){\n"
+		"  if(!j)return;\n"
+		"  const s=document.getElementById('nodeSel');\n"
+		"  const txt=raw||JSON.stringify(j);if(txt===lastNodes)return;lastNodes=txt;\n"
+		"  const cur=j.selected_mac;localMac=j.local_mac||localMac;const prev=s.value;selectedMac=cur||prev||selectedMac;s.innerHTML='';\n"
+		"  for(const n of j.nodes||[]){const o=document.createElement('option');o.value=n.mac;o.textContent=n.tag||'node';s.appendChild(o)}\n"
+		"  s.value=cur||prev;selectedMac=s.value||selectedMac;updateOtaUi();\n"
+		"}\n"
+		"function applyOta(j){\n"
+		"  if(!j)return;\n"
+		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
+		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}\n"
+		"  else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText='';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
+		"  updateOtaUi();\n"
+		"}\n"
+		"function applyTasks(j,mac,raw){\n"
+		"  if(!j)return;\n"
+		"  const txt=raw||JSON.stringify(j);if(txt===lastTasks)return;lastTasks=txt;\n"
+		"  const box=document.getElementById('taskTable');const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
+		"  setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);document.getElementById('taskRam').textContent=fmtRam(j);document.getElementById('taskFlash').textContent=fmtFlash(j);\n"
+		"  if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';return;}\n"
+		"  const tasks=j.tasks||[];const slots=typeof j.slot_count==='number'?j.slot_count:-1;tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
+		"  let rows='';for(const t of tasks){const cls=stackCls(t.free_words);rows+='<tr'+(cls?' class='+cls:'')+'><td>'+esc(t.name)+'</td><td>'+t.prio+'</td><td>'+pct(t.cpu_x10)+'</td><td>'+t.free_words+'</td></tr>';}\n"
+		"  document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
+		"  box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
+		"}\n"
 		"function startLogStream(){\n"
 		"  if(otaBusy||logStream)return;\n"
 		"  if(!window.EventSource){setLogMode('streamPoll','poll');return;}\n"
@@ -3014,7 +3485,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(otaBusy||!tasksVisible||otaStatusBusy)return;\n"
 		"  const local=isLocalSelected();\n"
 		"  otaStatusBusy=true;\n"
-		"  try{const url=local?'/ota/status':'/ota/remote/status?mac='+encodeURIComponent(selectedMac||'');const r=await fetchTimeout(url,6000);const j=await r.json();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');otaStatusText=otaSupported?(j.busy?'remote updating':'ready'):'';}updateOtaUi();}catch(e){otaEnabled=false;otaSupported=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
+		"  try{const url=local?'/ota/status':'/ota/remote/status?mac='+encodeURIComponent(selectedMac||'');const r=await fetchTimeout(url,6000);applyOta(await r.json());}catch(e){otaEnabled=false;otaSupported=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
 		"}\n"
 		"async function startOta(){\n"
 		"  if(otaBusy)return;\n"
@@ -3038,7 +3509,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  xhr.setRequestHeader('Content-Type','application/octet-stream');\n"
 		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
 		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
-		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus('OTA uploading '+pct+'%',true,pct)}};\n"
+		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus((!local&&pct>=100)?'OTA relaying to mesh...':'OTA uploading '+pct+'%',true,pct)}};\n"
 		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
 		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startLogStream()};\n"
 		"  xhr.send(file);\n"
@@ -3103,23 +3574,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  try{\n"
 		"    const r=await fetchTimeout('/nodes',6000);\n"
 		"    const txt=await r.text();\n"
-		"    if(txt===lastNodes) return;\n"
-		"    const j=JSON.parse(txt);\n"
-		"    lastNodes=txt;\n"
-		"    const cur=j.selected_mac;\n"
-		"    localMac=j.local_mac||localMac;\n"
-		"    const prev=s.value;\n"
-		"    selectedMac=cur||prev||selectedMac;\n"
-		"    s.innerHTML='';\n"
-		"    for(const n of j.nodes){\n"
-		"      const o=document.createElement('option');\n"
-		"      o.value=n.mac;\n"
-		"      o.textContent=n.tag||'node';\n"
-		"      s.appendChild(o);\n"
-		"    }\n"
-		"    s.value = cur || prev;\n"
-		"    selectedMac=s.value||selectedMac;\n"
-		"    updateOtaUi();\n"
+		"    applyNodes(JSON.parse(txt),txt);\n"
 		"  }catch(e){}finally{nodesBusy=false;}\n"
 		"}\n"
 		"async function onNodeSel(){\n"
@@ -3134,7 +3589,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
 		"  logStreamErrors=0;pollFallbackUntil=0;startLogStream();\n"
-		"  if(tasksVisible){loadTasks();loadOtaStatus();}\n"
+		"  if(tasksVisible)loadUiStatus();\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
@@ -3149,40 +3604,30 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
 		"    const r=await fetchTimeout('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''),6000);\n"
 		"    const txt=await r.text();\n"
-		"    if(txt===lastTasks) return;\n"
-		"    const j=JSON.parse(txt);\n"
-		"    lastTasks=txt;\n"
-		"    const box=document.getElementById('taskTable');\n"
-		"    const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
-		"    setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);\n"
-		"    document.getElementById('taskRam').textContent=fmtRam(j);\n"
-		"    document.getElementById('taskFlash').textContent=fmtFlash(j);\n"
-		"    if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';return;}\n"
-		"    const tasks=j.tasks||[];\n"
-		"    const slots=typeof j.slot_count==='number'?j.slot_count:-1;\n"
-		"    tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
-		"    let rows='';\n"
-		"    for(const t of tasks){\n"
-		"      const cls=stackCls(t.free_words);\n"
-		"      rows+='<tr'+(cls?' class='+cls:'')+'><td>'+esc(t.name)+'</td><td>'+t.prio+'</td><td>'+pct(t.cpu_x10)+'</td><td>'+t.free_words+'</td></tr>';\n"
-		"    }\n"
-		"    document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);\n"
-		"    setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
-		"    box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
+		"    applyTasks(JSON.parse(txt),mac,txt);\n"
 		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
-		"async function controlPoll(){\n"
+		"async function loadUiStatus(){\n"
 		"  if(controlPollBusy||otaBusy)return;\n"
+		"  const s=document.getElementById('nodeSel');\n"
+		"  if(document.activeElement===s)return;\n"
 		"  controlPollBusy=true;\n"
-		"  try{await loadNodes();await loadTasks();await loadOtaStatus();}finally{controlPollBusy=false;}\n"
+		"  try{\n"
+		"    const mac=selectedMac||s.value||'';const detail=tasksVisible?'1':'0';\n"
+		"    const url='/ui/status?tasks='+detail+'&ota='+detail+(mac?'&mac='+encodeURIComponent(mac):'');\n"
+		"    const r=await fetchTimeout(url,7000);const txt=await r.text();const j=JSON.parse(txt);\n"
+		"    applyNodes(j.nodes,JSON.stringify(j.nodes));\n"
+		"    if(tasksVisible){applyTasks(j.tasks,mac,JSON.stringify(j.tasks));applyOta(j.ota);}\n"
+		"  }catch(e){}finally{controlPollBusy=false;}\n"
 		"}\n"
+		"async function controlPoll(){await loadUiStatus()}\n"
 		"document.getElementById('nodeSel').addEventListener('change',(e)=>{\n"
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
-		"setInterval(controlPoll,5000);\n"
-		"loadNodes();\n"
+		"setInterval(controlPoll," STR(UI_CONTROL_POLL_MS) ");\n"
+		"loadUiStatus();\n"
 		"tick();\n"
 		"</script>\n"
 		"</body></html>\n";
@@ -3219,6 +3664,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/tasks",
 		.method		= HTTP_GET,
 		.handler	= http_tasks_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ui_status = {
+		.uri		= "/ui/status",
+		.method		= HTTP_GET,
+		.handler	= http_ui_status_get,
 		.user_ctx	= NULL
 	};
 
@@ -3278,6 +3730,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	err = httpd_register_uri_handler(server, &uri_log_stream);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_tasks);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ui_status);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
 	if (err != ESP_OK) return err;
@@ -3342,21 +3796,20 @@ esp_err_t log_http_server_start(void)
 	httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
-	config.httpd.max_open_sockets = 2;
+	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
 	config.httpd.max_uri_handlers = 12;
-	config.httpd.backlog_conn = 2;
+	config.httpd.backlog_conn = 1;
 	config.httpd.recv_wait_timeout = 5;
 	config.httpd.send_wait_timeout = 5;
-	config.httpd.keep_alive_enable = true;
-	config.httpd.keep_alive_idle = 5;
-	config.httpd.keep_alive_interval = 3;
-	config.httpd.keep_alive_count = 2;
+	config.httpd.keep_alive_enable = false;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;
 	config.servercert_len = node0_https_servercert_pem_end - node0_https_servercert_pem_start;
 	config.prvtkey_pem = node0_https_prvtkey_pem_start;
 	config.prvtkey_len = node0_https_prvtkey_pem_end - node0_https_prvtkey_pem_start;
+
+	esp_log_level_set("esp_https_server", ESP_LOG_WARN);
 
 	esp_err_t err = httpd_ssl_start(&s_http_server, &config);
 	if (err != ESP_OK) {
