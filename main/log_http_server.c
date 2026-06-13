@@ -101,6 +101,7 @@ typedef struct {
 	httpd_req_t *req;
 	uint32_t cursor;
 	bool headers_sent;
+	bool client_close;
 } log_stream_state_t;
 
 static SemaphoreHandle_t s_log_stream_mutex = NULL;
@@ -111,6 +112,7 @@ typedef struct {
 	httpd_req_t *req;
 	uint32_t seq;
 	bool headers_sent;
+	bool client_close;
 } mesh_stream_state_t;
 
 static SemaphoreHandle_t s_mesh_stream_mutex = NULL;
@@ -1914,6 +1916,26 @@ static void log_stream_complete(httpd_req_t *req)
 	}
 }
 
+static void log_stream_request_close(void)
+{
+	if (!s_log_stream_mutex || !s_log_stream_task) {
+		return;
+	}
+
+	bool notify = false;
+	if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+		if (s_log_stream.req) {
+			s_log_stream.client_close = true;
+			notify = true;
+		}
+		xSemaphoreGive(s_log_stream_mutex);
+	}
+
+	if (notify) {
+		xTaskNotifyGive(s_log_stream_task);
+	}
+}
+
 static void log_stream_task(void *arg)
 {
 	(void)arg;
@@ -1925,6 +1947,7 @@ static void log_stream_task(void *arg)
 		httpd_req_t *req = NULL;
 		uint32_t cursor = 0;
 		bool headers_sent = false;
+		bool client_close = false;
 
 		if (!s_log_stream_mutex ||
 		    xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -1934,9 +1957,21 @@ static void log_stream_task(void *arg)
 		req = s_log_stream.req;
 		cursor = s_log_stream.cursor;
 		headers_sent = s_log_stream.headers_sent;
+		client_close = s_log_stream.client_close;
 		xSemaphoreGive(s_log_stream_mutex);
 
 		if (!req) {
+			continue;
+		}
+
+		if (client_close) {
+			if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_log_stream.req == req) {
+					memset(&s_log_stream, 0, sizeof(s_log_stream));
+				}
+				xSemaphoreGive(s_log_stream_mutex);
+			}
+			log_stream_complete(req);
 			continue;
 		}
 
@@ -3803,6 +3838,26 @@ static void mesh_stream_complete(httpd_req_t *req)
 	}
 }
 
+static void mesh_stream_request_close(void)
+{
+	if (!s_mesh_stream_mutex || !s_mesh_stream_task) {
+		return;
+	}
+
+	bool notify = false;
+	if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+		if (s_mesh_stream.req) {
+			s_mesh_stream.client_close = true;
+			notify = true;
+		}
+		xSemaphoreGive(s_mesh_stream_mutex);
+	}
+
+	if (notify) {
+		xTaskNotifyGive(s_mesh_stream_task);
+	}
+}
+
 static void mesh_stream_task(void *arg)
 {
 	(void)arg;
@@ -3810,6 +3865,7 @@ static void mesh_stream_task(void *arg)
 	for (;;) {
 		httpd_req_t *req = NULL;
 		bool headers_sent = false;
+		bool client_close = false;
 		uint32_t seq = 0;
 
 		if (!s_mesh_stream_mutex ||
@@ -3819,11 +3875,23 @@ static void mesh_stream_task(void *arg)
 		}
 		req = s_mesh_stream.req;
 		headers_sent = s_mesh_stream.headers_sent;
+		client_close = s_mesh_stream.client_close;
 		seq = s_mesh_stream.seq;
 		xSemaphoreGive(s_mesh_stream_mutex);
 
 		if (!req) {
 			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+			continue;
+		}
+
+		if (client_close) {
+			if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_mesh_stream.req == req) {
+					memset(&s_mesh_stream, 0, sizeof(s_mesh_stream));
+				}
+				xSemaphoreGive(s_mesh_stream_mutex);
+			}
+			mesh_stream_complete(req);
 			continue;
 		}
 
@@ -3912,6 +3980,27 @@ static esp_err_t http_mesh_stream_get(httpd_req_t *req)
 
 	mesh_stream_notify();
 	return ESP_OK;
+}
+
+static esp_err_t http_stream_close_post(httpd_req_t *req)
+{
+	char q[32] = {0};
+	char which[8] = "all";
+
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		(void)httpd_query_key_value(q, "which", which, sizeof(which));
+	}
+
+	if (strcmp(which, "mesh") != 0) {
+		log_stream_request_close();
+	}
+	if (strcmp(which, "log") != 0) {
+		mesh_stream_request_close();
+	}
+
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, "OK\n", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t http_root_get(httpd_req_t *req)
@@ -4025,7 +4114,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let reselectBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadUiStatus()}\n"
-		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible)startMeshStream();else stopMeshStream()}\n"
+		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible)startMeshStream();else stopMeshStream(true)}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
@@ -4039,14 +4128,16 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function fmtRam(j){if(!j.ram_valid)return 'RAM int ? / PSRAM ?';const iv=!!j.ram_internal_valid;const pv=!!j.ram_psram_valid;let s=iv?fmtRamPool('RAM int',true,j.ram_internal_free_bytes,j.ram_internal_total_bytes):fmtRamPool('RAM',true,j.ram_free_bytes,j.ram_total_bytes);return s+' / '+(pv?fmtRamPool('PSRAM',true,j.ram_psram_free_bytes,j.ram_psram_total_bytes):(iv?'PSRAM off':'PSRAM ?'))}\n"
 		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"async function fetchTimeout(url,ms){\n"
+		"  ms=Math.max(ms||0,12000);\n"
 		"  const opt={cache:'no-store'};let timer=null;\n"
 		"  if(window.AbortController){const c=new AbortController();opt.signal=c.signal;timer=setTimeout(()=>c.abort(),ms);}\n"
 		"  try{return await fetch(url,opt);}finally{if(timer)clearTimeout(timer);}\n"
 		"}\n"
 		"function setLogMode(cls,text){const el=document.getElementById('logMode');if(el){el.className='logMode '+cls;el.title='log transport: '+(text||'off')}}\n"
 		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(follow)el.scrollTop=el.scrollHeight}\n"
-		"function stopLogStream(){if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
-		"function stopMeshStream(){if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
+		"function notifyStreamClose(which){try{const url='/stream/close?which='+(which||'all');if(navigator.sendBeacon){navigator.sendBeacon(url,'');return;}fetch(url,{method:'POST',cache:'no-store',keepalive:true}).catch(()=>{})}catch(e){}}\n"
+		"function stopLogStream(notify){if(notify)notifyStreamClose('log');if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
+		"function stopMeshStream(notify){if(notify)notifyStreamClose('mesh');if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
 		"function otaSlotName(label){if(label==='ota_0')return 'A';if(label==='ota_1')return 'B';return '?'}\n"
 		"function otaSlotClassFor(label){if(label==='ota_0')return 'otaSlotA';if(label==='ota_1')return 'otaSlotB';return 'otaSlotUnknown'}\n"
 		"function setOtaSlot(text,cls){otaSlotText=text||'A/B ?';otaSlotClass=cls||'otaSlotUnknown';const el=document.getElementById('otaSlot');if(el){el.textContent=otaSlotText;el.className='otaSlot '+otaSlotClass}}\n"
@@ -4156,7 +4247,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const phrase=prompt('Type '+confirmPhrase+' to update '+target+' and reboot.');\n"
 		"  if(phrase!==confirmPhrase){alert('OTA cancelled.');return;}\n"
 		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to '+target+' and reboot?'))return;\n"
-		"  stopLogStream();stopMeshStream();\n"
+		"  notifyStreamClose('all');stopLogStream();stopMeshStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
 		"  xhr.open('POST',local?'/ota':'/ota/remote?mac='+encodeURIComponent(selectedMac||''));\n"
@@ -4239,7 +4330,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  otaEnabled=false;otaSupported=false;otaStatusText='';setOtaSlot('A/B ?','otaSlotUnknown');\n"
 		"  clearTasksPanel();\n"
 		"  updateOtaUi();\n"
-		"  stopLogStream();\n"
+		"  stopLogStream(true);\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
@@ -4280,7 +4371,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
-		"window.addEventListener('pagehide',()=>{stopLogStream();stopMeshStream()});\n"
+		"window.addEventListener('pagehide',()=>{notifyStreamClose('all');stopLogStream();stopMeshStream()});\n"
 		"selectedMac=rememberedNode()||selectedMac;\n"
 		"pollFallbackUntil=Date.now()+16000;\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
@@ -4342,6 +4433,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/mesh/stream",
 		.method		= HTTP_GET,
 		.handler	= http_mesh_stream_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_stream_close = {
+		.uri		= "/stream/close",
+		.method		= HTTP_POST,
+		.handler	= http_stream_close_post,
 		.user_ctx	= NULL
 	};
 
@@ -4407,6 +4505,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	err = httpd_register_uri_handler(server, &uri_mesh_status);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_mesh_stream);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_stream_close);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
 	if (err != ESP_OK) return err;
@@ -4483,7 +4583,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
-	config.httpd.max_uri_handlers = 14;
+	config.httpd.max_uri_handlers = 15;
 	config.httpd.backlog_conn = 1;
 	config.httpd.recv_wait_timeout = 5;
 	config.httpd.send_wait_timeout = 5;
