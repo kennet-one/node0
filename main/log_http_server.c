@@ -159,6 +159,14 @@ typedef struct {
 	uint32_t free_bytes;
 	uint32_t min_free_bytes;
 	uint32_t total_bytes;
+	bool internal_valid;
+	uint32_t internal_free_bytes;
+	uint32_t internal_min_free_bytes;
+	uint32_t internal_total_bytes;
+	bool psram_valid;
+	uint32_t psram_free_bytes;
+	uint32_t psram_min_free_bytes;
+	uint32_t psram_total_bytes;
 } ram_status_t;
 
 typedef struct {
@@ -541,6 +549,14 @@ static ram_status_t ram_status_for_mac(const uint8_t mac[6])
 		ram.free_bytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
 		ram.min_free_bytes = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
 		ram.total_bytes = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_8BIT);
+		ram.internal_total_bytes = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		ram.internal_free_bytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		ram.internal_min_free_bytes = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		ram.internal_valid = ram.internal_total_bytes > 0;
+		ram.psram_total_bytes = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		ram.psram_free_bytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		ram.psram_min_free_bytes = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		ram.psram_valid = ram.psram_total_bytes > 0;
 	}
 	else if (mac) {
 		portENTER_CRITICAL(&s_taskmon_lock);
@@ -2556,6 +2572,38 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	return append_fmt(out, cap, pos, "}");
 }
 
+static size_t append_ram_json_fields(char *out, size_t cap, size_t pos,
+                                     const ram_status_t *ram)
+{
+	ram_status_t empty = {0};
+	if (!ram) ram = &empty;
+
+	return append_fmt(out, cap, pos,
+	                  "\"ram_valid\":%s,"
+	                  "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
+	                  "\"ram_total_bytes\":%lu,"
+	                  "\"ram_internal_valid\":%s,"
+	                  "\"ram_internal_free_bytes\":%lu,"
+	                  "\"ram_internal_min_free_bytes\":%lu,"
+	                  "\"ram_internal_total_bytes\":%lu,"
+	                  "\"ram_psram_valid\":%s,"
+	                  "\"ram_psram_free_bytes\":%lu,"
+	                  "\"ram_psram_min_free_bytes\":%lu,"
+	                  "\"ram_psram_total_bytes\":%lu",
+	                  ram->valid ? "true" : "false",
+	                  (unsigned long)ram->free_bytes,
+	                  (unsigned long)ram->min_free_bytes,
+	                  (unsigned long)ram->total_bytes,
+	                  ram->internal_valid ? "true" : "false",
+	                  (unsigned long)ram->internal_free_bytes,
+	                  (unsigned long)ram->internal_min_free_bytes,
+	                  (unsigned long)ram->internal_total_bytes,
+	                  ram->psram_valid ? "true" : "false",
+	                  (unsigned long)ram->psram_free_bytes,
+	                  (unsigned long)ram->psram_min_free_bytes,
+	                  (unsigned long)ram->psram_total_bytes);
+}
+
 static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
                                         const uint8_t mac[6])
 {
@@ -2592,21 +2640,18 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 		                  ",\"updated_ms\":0,\"age_ms\":0,"
 		                  "\"cpu_valid\":false,\"cpu_load_x10\":0,"
 		                  "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                  "\"uptime_s\":%lu,\"ram_valid\":%s,"
-		                  "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
-		                  "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+		                  "\"uptime_s\":%lu,",
+		                  slot_count,
+		                  uptime_valid ? "true" : "false",
+		                  (unsigned long)uptime_s);
+		pos = append_ram_json_fields(out, cap, pos, &ram);
+		return append_fmt(out, cap, pos,
+		                  ",\"flash_valid\":%s,"
 		                  "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
 		                  "\"app_partition_bytes\":%lu,"
 		                  "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
 		                  "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
 		                  "\"nvs_total_entries\":%lu,\"tasks\":[]}",
-		                  slot_count,
-		                  uptime_valid ? "true" : "false",
-		                  (unsigned long)uptime_s,
-		                  ram.valid ? "true" : "false",
-		                  (unsigned long)ram.free_bytes,
-		                  (unsigned long)ram.min_free_bytes,
-		                  (unsigned long)ram.total_bytes,
 		                  persistent.flash_valid ? "true" : "false",
 		                  (unsigned long)persistent.flash_chip_bytes,
 		                  (unsigned long)persistent.app_used_bytes,
@@ -2629,25 +2674,22 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 	                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
 	                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
 	                 "\"slot_count\":%d,\"uptime_valid\":%s,"
-	                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
-	                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
-	                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
-	                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
-	                 "\"app_partition_bytes\":%lu,"
-	                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
-	                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
-	                 "\"nvs_total_entries\":%lu,\"tasks\":[",
+	                 "\"uptime_s\":%lu,",
 	                 (unsigned long)snap.updated_ms,
 	                 (unsigned long)age_ms,
 	                 snap.cpu_valid ? "true" : "false",
 	                 (unsigned long)snap.cpu_load_x10,
 	                 slot_count,
 	                 uptime_valid ? "true" : "false",
-	                 (unsigned long)uptime_s,
-	                 ram.valid ? "true" : "false",
-	                 (unsigned long)ram.free_bytes,
-	                 (unsigned long)ram.min_free_bytes,
-	                 (unsigned long)ram.total_bytes,
+	                 (unsigned long)uptime_s);
+	pos = append_ram_json_fields(out, cap, pos, &ram);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"flash_valid\":%s,"
+	                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+	                 "\"app_partition_bytes\":%lu,"
+	                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+	                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+	                 "\"nvs_total_entries\":%lu,\"tasks\":[",
 	                 persistent.flash_valid ? "true" : "false",
 	                 (unsigned long)persistent.flash_chip_bytes,
 	                 (unsigned long)persistent.app_used_bytes,
@@ -3523,21 +3565,18 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		                 ",\"updated_ms\":0,\"age_ms\":0,"
 		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
 		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
-		                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
-		                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
+		                 "\"uptime_s\":%lu,",
+		                 slot_count,
+		                 uptime_valid ? "true" : "false",
+		                 (unsigned long)uptime_s);
+		pos = append_ram_json_fields(out, TASKS_JSON_MAX, pos, &ram);
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 ",\"flash_valid\":%s,"
 		                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
 		                 "\"app_partition_bytes\":%lu,"
 		                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
 		                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
 		                 "\"nvs_total_entries\":%lu,\"tasks\":[]}",
-		                 slot_count,
-		                 uptime_valid ? "true" : "false",
-		                 (unsigned long)uptime_s,
-		                 ram.valid ? "true" : "false",
-		                 (unsigned long)ram.free_bytes,
-		                 (unsigned long)ram.min_free_bytes,
-		                 (unsigned long)ram.total_bytes,
 		                 persistent.flash_valid ? "true" : "false",
 		                 (unsigned long)persistent.flash_chip_bytes,
 		                 (unsigned long)persistent.app_used_bytes,
@@ -3559,25 +3598,22 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
 		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
 		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                 "\"uptime_s\":%lu,\"ram_valid\":%s,"
-		                 "\"ram_free_bytes\":%lu,\"ram_min_free_bytes\":%lu,"
-		                 "\"ram_total_bytes\":%lu,\"flash_valid\":%s,"
-		                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
-		                 "\"app_partition_bytes\":%lu,"
-		                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
-		                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
-		                 "\"nvs_total_entries\":%lu,\"tasks\":[",
+		                 "\"uptime_s\":%lu,",
 		                 (unsigned long)snap.updated_ms,
 		                 (unsigned long)age_ms,
 		                 snap.cpu_valid ? "true" : "false",
 		                 (unsigned long)snap.cpu_load_x10,
 		                 slot_count,
 		                 uptime_valid ? "true" : "false",
-		                 (unsigned long)uptime_s,
-		                 ram.valid ? "true" : "false",
-		                 (unsigned long)ram.free_bytes,
-		                 (unsigned long)ram.min_free_bytes,
-		                 (unsigned long)ram.total_bytes,
+		                 (unsigned long)uptime_s);
+		pos = append_ram_json_fields(out, TASKS_JSON_MAX, pos, &ram);
+		pos = append_fmt(out, TASKS_JSON_MAX, pos,
+		                 ",\"flash_valid\":%s,"
+		                 "\"flash_chip_bytes\":%lu,\"app_used_bytes\":%lu,"
+		                 "\"app_partition_bytes\":%lu,"
+		                 "\"nvs_valid\":%s,\"nvs_used_entries\":%lu,"
+		                 "\"nvs_free_entries\":%lu,\"nvs_available_entries\":%lu,"
+		                 "\"nvs_total_entries\":%lu,\"tasks\":[",
 		                 persistent.flash_valid ? "true" : "false",
 		                 (unsigned long)persistent.flash_chip_bytes,
 		                 (unsigned long)persistent.app_used_bytes,
@@ -3959,7 +3995,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
 		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM free ? / min ? / total ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
@@ -3998,7 +4034,9 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function fmtUptime(valid,sec){if(!valid)return 'up ?';sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;return 'up '+(d>0?d+'d ':'')+pad2(h)+':'+pad2(m)+':'+pad2(s)}\n"
 		"function fmtKb(bytes){return Math.round((Number(bytes)||0)/1024)+' KB'}\n"
 		"function fmtMb(bytes){return Math.round((Number(bytes)||0)/1048576)+' MB'}\n"
-		"function fmtRam(j){return j.ram_valid?'RAM free '+fmtKb(j.ram_free_bytes)+' / min '+fmtKb(j.ram_min_free_bytes)+' / total '+fmtKb(j.ram_total_bytes):'RAM free ? / min ? / total ?'}\n"
+		"function fmtUsedKb(free,total){free=Number(free)||0;total=Number(total)||0;if(total<=0)return '?';return fmtKb(Math.max(0,total-free))+'/'+fmtKb(total)+' used'}\n"
+		"function fmtRamPool(label,valid,free,total){return valid&&Number(total)>0?label+' '+fmtUsedKb(free,total):label+' ?'}\n"
+		"function fmtRam(j){if(!j.ram_valid)return 'RAM int ? / PSRAM ?';const iv=!!j.ram_internal_valid;const pv=!!j.ram_psram_valid;let s=iv?fmtRamPool('RAM int',true,j.ram_internal_free_bytes,j.ram_internal_total_bytes):fmtRamPool('RAM',true,j.ram_free_bytes,j.ram_total_bytes);return s+' / '+(pv?fmtRamPool('PSRAM',true,j.ram_psram_free_bytes,j.ram_psram_total_bytes):(iv?'PSRAM off':'PSRAM ?'))}\n"
 		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"async function fetchTimeout(url,ms){\n"
 		"  const opt={cache:'no-store'};let timer=null;\n"
@@ -4065,7 +4103,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  logStream.onerror=()=>{logStreamReady=false;logStreamErrors++;setLogMode(logStreamErrors>=3?'streamPoll':'streamRetry',logStreamErrors>=3?'poll':'retry');document.getElementById('st').textContent='RETRY';if(logStreamErrors>=3){stopLogStream();pollFallbackUntil=Date.now()+15000;tick();}};\n"
 		"}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
-		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
 		"function selectedNodeTag(){const s=document.getElementById('nodeSel');const o=s&&s.selectedOptions&&s.selectedOptions[0];return o?(o.dataset.tag||o.textContent||'node'):'node'}\n"
 		"function selectedOtaTarget(){return isLocalSelected()?'node0':(selectedNodeTag()||'node')}\n"
@@ -4222,7 +4260,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const r=await fetchTimeout('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''),6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyTasks(JSON.parse(txt),mac,txt);\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM free ? / min ? / total ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
 		"async function loadUiStatus(){\n"
 		"  if(controlPollBusy||otaBusy)return;\n"
