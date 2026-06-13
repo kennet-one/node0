@@ -28,6 +28,7 @@ void log_http_server_remote_ota_status(const uint8_t mac[6],
 
 // Called by mesh events when the routing table changes.
 void log_http_server_refresh_routes(void);
+void log_http_server_mesh_state_changed(void);
 
 #ifdef __cplusplus
 }

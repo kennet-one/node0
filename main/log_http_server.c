@@ -76,7 +76,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
 #define MESH_STREAM_HEARTBEAT_MS	15000U
-#define HTTPS_MAX_OPEN_SOCKETS		3
+#define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
 #define UI_CONTROL_POLL_MS		15000
@@ -310,6 +310,12 @@ static void mesh_stream_notify(void)
 	}
 }
 
+static void mesh_stream_mark_changed(void)
+{
+	s_mesh_stream_seq++;
+	mesh_stream_notify();
+}
+
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
 {
 	return memcmp(a, b, 6) == 0;
@@ -348,6 +354,7 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 {
 	if (!routes || route_count <= 0) return;
 
+	bool changed = false;
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
 		for (int i = 0; i < route_count; i++) {
@@ -360,6 +367,10 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 
 			for (uint32_t n = 0; n < s_nodes_count; n++) {
 				if (mac_eq(s_nodes[n].mac, mac)) {
+					if (s_nodes[n].last_route_ms == 0 ||
+					    (uint32_t)(now - s_nodes[n].last_route_ms) > NODEINFO_STALE_MS) {
+						changed = true;
+					}
 					s_nodes[n].last_route_ms = now;
 					found = true;
 					break;
@@ -372,11 +383,14 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 				mac_copy(ent->mac, mac);
 				copy_tag(ent->tag, sizeof(ent->tag), "mesh");
 				ent->last_route_ms = now;
+				changed = true;
 			}
 		}
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
-	mesh_stream_notify();
+	if (changed) {
+		mesh_stream_mark_changed();
+	}
 
 	for (int i = 0; i < route_count; i++) {
 		const uint8_t *mac = routes[i].addr;
@@ -399,6 +413,11 @@ void log_http_server_refresh_routes(void)
 	if (route_count > LOG_HTTP_MAX_NODES) route_count = LOG_HTTP_MAX_NODES;
 
 	note_route_table_nodes(routes, route_count, ms_now());
+}
+
+void log_http_server_mesh_state_changed(void)
+{
+	mesh_stream_mark_changed();
 }
 
 static bool node_route_current(const uint8_t mac[6])
@@ -1544,7 +1563,7 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	}
 
 	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
-	mesh_stream_notify();
+	mesh_stream_mark_changed();
 }
 
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
@@ -1607,7 +1626,7 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
 
-	mesh_stream_notify();
+	mesh_stream_mark_changed();
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -2283,7 +2302,7 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  ",\"v2_session\":0,\"expected_seq\":0,"
 		                  "\"gap_count\":0,\"replay_count\":0,"
 		                  "\"lost_count\":0,\"last_v2_ms\":0,"
-		                  "\"last_tunnel_ms\":0,\"v2_age_ms\":-1,"
+		                  "\"last_tunnel_ms\":0,\"v2_age_ms\":-1,\"v2_ack_age_ms\":-1,"
 		                  "\"tunnel_age_ms\":-1,\"has_gap\":false");
 	}
 
@@ -2298,7 +2317,7 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  ",\"v2_session\":%lu,\"expected_seq\":%lu,"
 	                  "\"gap_count\":%lu,\"replay_count\":%lu,"
 	                  "\"lost_count\":%lu,\"last_v2_ms\":%lu,"
-	                  "\"last_tunnel_ms\":%lu,\"v2_age_ms\":%ld,"
+	                  "\"last_tunnel_ms\":%lu,\"v2_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
 	                  "\"tunnel_age_ms\":%ld,\"has_gap\":%s",
 	                  (unsigned long)st.session_id,
 	                  (unsigned long)st.expected_seq,
@@ -2307,6 +2326,7 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  (unsigned long)st.lost_count,
 	                  (unsigned long)st.last_v2_ms,
 	                  (unsigned long)st.last_tunnel_ms,
+	                  v2_age_ms,
 	                  v2_age_ms,
 	                  tunnel_age_ms,
 	                  st.has_gap ? "true" : "false");
@@ -2343,13 +2363,33 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	bool offline = remote && !link_seen && stale &&
 		(!has_route_history || (uint32_t)route_age_ms > NODE_OFFLINE_MS);
 
-	return append_fmt(out, cap, pos,
+	const char *node_source = "selected";
+	if (!remote) {
+		node_source = "local";
+	} else if (route_seen && has_v2) {
+		node_source = "route+v2";
+	} else if (route_seen && has_nodeinfo) {
+		node_source = "route+nodeinfo";
+	} else if (route_seen) {
+		node_source = "route";
+	} else if (has_v2) {
+		node_source = "v2";
+	} else if (has_nodeinfo) {
+		node_source = "nodeinfo";
+	}
+
+	pos = append_fmt(out, cap, pos,
 	                  ",\"route_seen\":%s,\"route_table_seen\":%s,\"route_age_ms\":%ld,"
-	                  "\"nodeinfo_age_ms\":%ld,\"stale\":%s,\"offline\":%s",
+	                  "\"nodeinfo_age_ms\":%ld,\"node_source\":",
 	                  link_seen ? "true" : "false",
 	                  route_seen ? "true" : "false",
 	                  route_age_ms,
-	                  nodeinfo_age_ms,
+	                  nodeinfo_age_ms);
+	pos = append_json_string(out, cap, pos, node_source);
+	return append_fmt(out, cap, pos,
+	                  ",\"last_send_err\":0,\"recovery_phase\":%s,"
+	                  "\"stale\":%s,\"offline\":%s",
+	                  remote ? "\"unknown\"" : "\"ok\"",
 	                  stale ? "true" : "false",
 	                  offline ? "true" : "false");
 }
@@ -2412,9 +2452,11 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	                 selected_mac[3], selected_mac[4], selected_mac[5]);
 	pos = append_json_string(out, cap, pos, selected_tag);
 	pos = append_fmt(out, cap, pos,
-	                 ",\"local_mac\":\"%02x%02x%02x%02x%02x%02x\",\"nodes\":[",
+	                 ",\"local_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"route_table_count\":%d,\"nodes\":[",
 	                 s_local_mac[0], s_local_mac[1], s_local_mac[2],
-	                 s_local_mac[3], s_local_mac[4], s_local_mac[5]);
+	                 s_local_mac[3], s_local_mac[4], s_local_mac[5],
+	                 route_count);
 
 	pos = append_fmt(out, cap, pos,
 	                 "{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"tag\":",
@@ -3827,6 +3869,12 @@ static esp_err_t mesh_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
 	return err;
 }
 
+static esp_err_t mesh_stream_send_heartbeat(httpd_req_t *req)
+{
+	static const char heartbeat[] = ": ping\n\n";
+	return httpd_resp_send_chunk(req, heartbeat, sizeof(heartbeat) - 1);
+}
+
 static void mesh_stream_complete(httpd_req_t *req)
 {
 	if (!req) {
@@ -3866,7 +3914,8 @@ static void mesh_stream_task(void *arg)
 		httpd_req_t *req = NULL;
 		bool headers_sent = false;
 		bool client_close = false;
-		uint32_t seq = 0;
+		uint32_t last_sent_seq = 0;
+		uint32_t current_seq = s_mesh_stream_seq;
 
 		if (!s_mesh_stream_mutex ||
 		    xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -3876,7 +3925,8 @@ static void mesh_stream_task(void *arg)
 		req = s_mesh_stream.req;
 		headers_sent = s_mesh_stream.headers_sent;
 		client_close = s_mesh_stream.client_close;
-		seq = s_mesh_stream.seq;
+		last_sent_seq = s_mesh_stream.seq;
+		current_seq = s_mesh_stream_seq;
 		xSemaphoreGive(s_mesh_stream_mutex);
 
 		if (!req) {
@@ -3907,14 +3957,18 @@ static void mesh_stream_task(void *arg)
 			}
 		}
 
-		if (err == ESP_OK) {
-			err = mesh_stream_send_snapshot(req, seq);
+		bool sent_snapshot = false;
+		if (err == ESP_OK && (!headers_sent || last_sent_seq != current_seq)) {
+			err = mesh_stream_send_snapshot(req, current_seq);
+			sent_snapshot = (err == ESP_OK);
+		} else if (err == ESP_OK) {
+			err = mesh_stream_send_heartbeat(req);
 		}
 
 		if (err == ESP_OK) {
 			if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-				if (s_mesh_stream.req == req) {
-					s_mesh_stream.seq = ++s_mesh_stream_seq;
+				if (s_mesh_stream.req == req && sent_snapshot) {
+					s_mesh_stream.seq = current_seq;
 				}
 				xSemaphoreGive(s_mesh_stream_mutex);
 			}
@@ -3974,7 +4028,7 @@ static esp_err_t http_mesh_stream_get(httpd_req_t *req)
 		return ESP_OK;
 	}
 	s_mesh_stream.req = async_req;
-	s_mesh_stream.seq = s_mesh_stream_seq++;
+	s_mesh_stream.seq = 0;
 	s_mesh_stream.headers_sent = false;
 	xSemaphoreGive(s_mesh_stream_mutex);
 
@@ -4110,6 +4164,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let meshStream=null;\n"
 		"let logStreamReady=false;\n"
 		"let logStreamErrors=0;\n"
+		"let meshStreamErrors=0;\n"
 		"let pollFallbackUntil=0;\n"
 		"let reselectBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
@@ -4162,9 +4217,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':n.stale?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
-		"function applyMeshStatus(j){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for mesh';st.textContent='live '+(j.seq||'')}\n"
-		"async function loadMeshStatus(){try{const r=await fetchTimeout('/mesh/status',6000);applyMeshStatus(await r.json())}catch(e){document.getElementById('meshState').textContent='err'}}\n"
-		"function startMeshStream(){if(!meshVisible||meshStream)return;if(!window.EventSource){loadMeshStatus();return;}document.getElementById('meshState').textContent='connect';try{meshStream=new EventSource('/mesh/stream')}catch(e){meshStream=null;loadMeshStatus();return;}meshStream.addEventListener('mesh',e=>{try{applyMeshStatus(JSON.parse(e.data||'{}'))}catch(x){}});meshStream.onopen=()=>{document.getElementById('meshState').textContent='live'};meshStream.onerror=()=>{document.getElementById('meshState').textContent='retry';stopMeshStream();if(meshVisible)setTimeout(()=>{loadMeshStatus();startMeshStream()},3000)}}\n"
+		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
+		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
+		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await fetchTimeout('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
+		"function startMeshStream(){if(!meshVisible||meshStream)return;if(!window.EventSource){loadMeshStatus('poll');return;}document.getElementById('meshState').textContent='connect';try{meshStream=new EventSource('/mesh/stream')}catch(e){meshStream=null;loadMeshStatus('poll');return;}meshStream.addEventListener('mesh',e=>{try{meshStreamErrors=0;applyMeshStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});meshStream.onopen=()=>{meshStreamErrors=0;document.getElementById('meshState').textContent='live'};meshStream.onerror=()=>{meshStreamErrors++;document.getElementById('meshState').textContent='retry';stopMeshStream();const d=Math.min(30000,3000*meshStreamErrors);if(meshVisible)setTimeout(()=>{loadMeshStatus('poll');startMeshStream()},d)}}\n"
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
@@ -4584,9 +4640,9 @@ esp_err_t log_http_server_start(void)
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
 	config.httpd.max_uri_handlers = 15;
-	config.httpd.backlog_conn = 1;
-	config.httpd.recv_wait_timeout = 5;
-	config.httpd.send_wait_timeout = 5;
+	config.httpd.backlog_conn = 2;
+	config.httpd.recv_wait_timeout = 3;
+	config.httpd.send_wait_timeout = 3;
 	config.httpd.keep_alive_enable = false;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;

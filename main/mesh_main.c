@@ -617,6 +617,8 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGW(MESH_TAG,
 		         "<MESH_EVENT_ROUTING_TABLE_REMOVE> remove %d, new:%d, layer:%d",
 		         rt->rt_size_change, rt->rt_size_new, mesh_layer);
+		log_http_server_refresh_routes();
+		log_http_server_mesh_state_changed();
 	}
 	break;
 
