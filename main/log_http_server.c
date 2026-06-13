@@ -56,7 +56,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #endif
 
 #ifndef WEB_POLL_MS
-	#define WEB_POLL_MS			1000
+	#define WEB_POLL_MS			2000
 #endif
 
 #ifndef LOG_HTTP_MAX_NODES
@@ -75,11 +75,11 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define LOG_STREAM_TASK_STACK		6144U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
-#define MESH_STREAM_HEARTBEAT_MS	10000U
-#define HTTPS_MAX_OPEN_SOCKETS		4
+#define MESH_STREAM_HEARTBEAT_MS	15000U
+#define HTTPS_MAX_OPEN_SOCKETS		3
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
-#define UI_CONTROL_POLL_MS		10000
+#define UI_CONTROL_POLL_MS		15000
 #define REMOTE_LOG_REARM_MIN_MS		15000U
 #define NODEINFO_STALE_MS		75000U
 #define NODE_OFFLINE_MS		180000U
@@ -3736,24 +3736,23 @@ static esp_err_t mesh_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
 		return ESP_ERR_NO_MEM;
 	}
 
-	size_t frame_cap = pos + 80;
-	char *frame = (char *)malloc(frame_cap);
-	if (!frame) {
+	char header[48];
+	int n = snprintf(header, sizeof(header),
+	                 "event: mesh\nid: %lu\ndata: ",
+	                 (unsigned long)seq);
+	if (n < 0 || (size_t)n >= sizeof(header)) {
 		free(json);
-		return ESP_ERR_NO_MEM;
-	}
-
-	int n = snprintf(frame, frame_cap,
-	                 "event: mesh\nid: %lu\ndata: %s\n\n",
-	                 (unsigned long)seq, json);
-	free(json);
-	if (n < 0 || (size_t)n >= frame_cap) {
-		free(frame);
 		return ESP_FAIL;
 	}
 
-	esp_err_t err = httpd_resp_send_chunk(req, frame, (size_t)n);
-	free(frame);
+	esp_err_t err = httpd_resp_send_chunk(req, header, (size_t)n);
+	if (err == ESP_OK) {
+		err = httpd_resp_send_chunk(req, json, pos);
+	}
+	if (err == ESP_OK) {
+		err = httpd_resp_send_chunk(req, "\n\n", 2);
+	}
+	free(json);
 	return err;
 }
 
@@ -4248,8 +4247,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"pollFallbackUntil=Date.now()+16000;\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
 		"setInterval(controlPoll," STR(UI_CONTROL_POLL_MS) ");\n"
-		"loadUiStatus();\n"
-		"tick();\n"
+		"loadUiStatus().finally(()=>setTimeout(tick,350));\n"
 		"</script>\n"
 		"</body></html>\n";
 
