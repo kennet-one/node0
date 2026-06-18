@@ -21,7 +21,7 @@ menu "Example Configuration"
 
     config MESH_ENABLE_PS
         bool "Enable mesh PS (power save) function"
-        default y
+        default n
         help
             Enable/Disable Power Save function.
 

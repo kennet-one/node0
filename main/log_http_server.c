@@ -819,14 +819,6 @@ static bool lookup_node_tag(const uint8_t mac[6], char *tag, size_t tag_sz)
 		return true;
 	}
 
-	uint8_t selected_mac[6];
-	char selected_tag[16];
-	selection_snapshot(selected_mac, selected_tag, sizeof(selected_tag));
-	if (mac_eq(mac, selected_mac)) {
-		copy_tag(tag, tag_sz, selected_tag);
-		return true;
-	}
-
 	bool found = false;
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
@@ -840,7 +832,19 @@ static bool lookup_node_tag(const uint8_t mac[6], char *tag, size_t tag_sz)
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
 
-	return found;
+	if (found) {
+		return true;
+	}
+
+	uint8_t selected_mac[6];
+	char selected_tag[16];
+	selection_snapshot(selected_mac, selected_tag, sizeof(selected_tag));
+	if (mac_eq(mac, selected_mac)) {
+		copy_tag(tag, tag_sz, selected_tag);
+		return true;
+	}
+
+	return false;
 }
 
 static const char *body_after_marker(const char *line, const char *marker)
@@ -3077,6 +3081,34 @@ static void ota_restart_task(void *arg)
 	esp_restart();
 }
 
+static esp_err_t http_reboot_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		return http_json_error(req, "403 Forbidden",
+		                       "reboot disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+
+	if (!ota_check_pin(req)) {
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	if (s_ota_mutex && xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	}
+	if (s_ota_mutex) {
+		xSemaphoreGive(s_ota_mutex);
+	}
+
+	ESP_LOGW(TAG, "manual reboot requested from web UI");
+	BaseType_t task_ok = xTaskCreate(ota_restart_task, "web_reboot", 2048, NULL, 5, NULL);
+	if (task_ok != pdPASS) {
+		return http_json_error(req, "500 Internal Server Error",
+		                       "failed to create reboot task");
+	}
+
+	return http_json_ok(req, "rebooting node0");
+}
+
 static esp_err_t http_ota_status_get(httpd_req_t *req)
 {
 	enum { OTA_STATUS_JSON_MAX = 1024 };
@@ -4099,6 +4131,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".otaAction{display:flex;justify-content:flex-end;align-items:center;gap:6px}\n"
 		".otaBtn{font-size:12px;min-height:25px;padding:3px 9px;text-transform:uppercase;color:#caffdf;background:#103724;border-color:#1d6e44}\n"
 		".otaBtn:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
+		".rebootBtn{font-size:12px;min-height:25px;padding:3px 9px;text-transform:uppercase;color:#ffd8c7;background:#3a1d14;border-color:#7b3a25}\n"
+		".rebootBtn:hover:not(:disabled){background:#5a2618;border-color:#d4663c;color:#fff}\n"
 		".otaSlot{display:inline-flex;align-items:center;min-height:23px;padding:2px 7px;border:1px solid #3d4750;border-radius:999px;background:#191d21;color:#b9c4ce;font-size:11px}\n"
 		".otaSlotA{border-color:#18784d;color:#88ffb6;background:#10271d}\n"
 		".otaSlotB{border-color:#2b6594;color:#8bd0ff;background:#101f2b}\n"
@@ -4138,7 +4172,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
 		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"let follow=true;\n"
@@ -4152,6 +4186,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let otaEnabled=false;\n"
 		"let otaSupported=false;\n"
 		"let otaBusy=false;\n"
+		"let rebootBusy=false;\n"
 		"let otaStatusText='OTA ...';\n"
 		"let otaSlotText='A/B ?';\n"
 		"let otaSlotClass='otaSlotUnknown';\n"
@@ -4256,11 +4291,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function selectedOtaTarget(){return isLocalSelected()?'node0':(selectedNodeTag()||'node')}\n"
 		"function otaFileKey(){return 'ota-bin-'+(isLocalSelected()?'node0':(selectedMac||selectedNodeTag()||'remote'))}\n"
 		"function updateOtaUi(){\n"
-		"  const b=document.getElementById('otaBtn');const s=document.getElementById('otaStatus');const local=isLocalSelected();\n"
-		"  if(!b||!s)return;\n"
-		"  if(!local&&!otaSupported){b.disabled=true;s.textContent='';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
-		"  if(!otaEnabled){b.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
-		"  b.disabled=otaBusy||!otaSupported;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  const b=document.getElementById('otaBtn');const rb=document.getElementById('rebootBtn');const s=document.getElementById('otaStatus');const local=isLocalSelected();\n"
+		"  if(!b||!rb||!s)return;\n"
+		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent='';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
+		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
+		"  b.disabled=otaBusy||rebootBusy||!otaSupported;rb.disabled=otaBusy||rebootBusy||!local;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
 		"  otaStatusText=text||'OTA ready';\n"
@@ -4314,6 +4349,20 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
 		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startLogStream()};\n"
 		"  xhr.send(file);\n"
+		"}\n"
+		"async function startReboot(){\n"
+		"  if(otaBusy||rebootBusy)return;\n"
+		"  if(!isLocalSelected())return;\n"
+		"  await loadOtaStatus();\n"
+		"  if(!otaEnabled){alert('Reboot is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
+		"  const pin=prompt('OTA PIN');\n"
+		"  if(!pin)return;\n"
+		"  const phrase=prompt('Type REBOOT NODE0 to reboot node0.');\n"
+		"  if(phrase!=='REBOOT NODE0'){alert('Reboot cancelled.');return;}\n"
+		"  if(!confirm('Reboot node0 now?'))return;\n"
+		"  notifyStreamClose('all');stopLogStream();stopMeshStream();\n"
+		"  rebootBusy=true;otaBusy=true;otaSetStatus('rebooting node0...',false,0);\n"
+		"  try{const r=await fetch('/reboot',{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||'rebooting node0',false,100);setTimeout(()=>location.reload(),9000)}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startLogStream()}\n"
 		"}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
@@ -4499,6 +4548,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_reboot = {
+		.uri		= "/reboot",
+		.method		= HTTP_POST,
+		.handler	= http_reboot_post,
+		.user_ctx	= NULL
+	};
+
 	httpd_uri_t uri_nodes = {
 		.uri		= "/nodes",
 		.method		= HTTP_GET,
@@ -4563,6 +4619,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	err = httpd_register_uri_handler(server, &uri_mesh_stream);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_stream_close);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_reboot);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
 	if (err != ESP_OK) return err;
@@ -4639,7 +4697,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
-	config.httpd.max_uri_handlers = 15;
+	config.httpd.max_uri_handlers = 16;
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;
