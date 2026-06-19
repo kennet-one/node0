@@ -28,6 +28,7 @@ esp_err_t mesh_v2_root_handle_rx(const mesh_addr_t *from, const void *pkt_buf, s
 bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out);
 bool mesh_v2_root_tunnel_ready_for_mac(const uint8_t mac[6]);
 esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable);
+esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_id);
 
 #ifdef __cplusplus
 }

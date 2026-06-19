@@ -99,12 +99,15 @@ extern "C" {
 #define MESH_V2_TUNNEL_REPLAY_RING_SIZE	8
 #define MESH_V2_TUNNEL_INNER_MAX	156
 #define MESH_V2_TUNNEL_LOG_LINE_MAX	128
+#define MESH_V2_TASK_NAME_MAX		16
+#define MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES	4
 
 #define MESH_V2_TUNNEL_FLAG_REPLAY	0x01
 #define MESH_V2_TUNNEL_FLAG_E2E_ACK	0x02
 #define MESH_V2_TUNNEL_FLAG_HOP_ACK	0x04
 #define MESH_V2_TUNNEL_FLAG_FRAGMENT	0x08
 #define MESH_V2_TUNNEL_TTL_DEFAULT	8
+#define MESH_V2_TASK_SNAPSHOT_FLAG_LAST	0x01
 
 typedef struct __attribute__((packed)) {
 	uint8_t		magic;
@@ -286,6 +289,36 @@ typedef struct __attribute__((packed)) {
 	uint8_t		enable;
 	uint8_t		rsv[3];
 } mesh_v2_tunnel_log_ctrl_payload_t;
+
+typedef struct __attribute__((packed)) {
+	uint32_t	request_id;
+	uint8_t		detail;
+	uint8_t		rsv[3];
+} mesh_v2_task_request_payload_t;
+
+typedef struct __attribute__((packed)) {
+	char		name[MESH_V2_TASK_NAME_MAX];
+	uint32_t	priority;
+	uint32_t	free_words;
+	int16_t		cpu_x10;
+	uint16_t	rsv;
+} mesh_v2_task_entry_t;
+
+typedef struct __attribute__((packed)) {
+	char		tag[MESH_V2_TAG_MAX];
+	uint32_t	request_id;
+	uint32_t	updated_ms;
+	uint32_t	uptime_s;
+	uint32_t	cpu_load_x10;
+	uint16_t	slot_count;
+	uint16_t	task_total;
+	uint16_t	task_index;
+	uint8_t		task_count;
+	uint8_t		flags;
+	uint8_t		cpu_valid;
+	uint8_t		rsv[3];
+	mesh_v2_task_entry_t tasks[MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES];
+} mesh_v2_task_snapshot_payload_t;
 
 typedef struct __attribute__((packed)) {
 	char		tag[MESH_V2_TAG_MAX];

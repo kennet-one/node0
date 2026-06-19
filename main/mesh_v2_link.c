@@ -406,6 +406,16 @@ static void deliver_tunnel_payload(const mesh_v2_tunnel_hdr_t *t, const uint8_t 
 		return;
 	}
 
+	if (t->channel_id == MESH_V2_TUNNEL_CHANNEL_TASK) {
+		if (t->payload_len < sizeof(mesh_v2_task_snapshot_payload_t)) {
+			return;
+		}
+		const mesh_v2_task_snapshot_payload_t *p =
+			(const mesh_v2_task_snapshot_payload_t *)payload;
+		log_http_server_task_snapshot_v2(t->origin_mac, p);
+		return;
+	}
+
 	if (t->channel_id == MESH_V2_TUNNEL_CHANNEL_TOPOLOGY) {
 		if (t->payload_len < sizeof(mesh_v2_topology_payload_t)) {
 			return;
@@ -805,4 +815,55 @@ esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable)
 
 	return send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA, session_id, 0, 0,
 	                          payload, sizeof(*t) + sizeof(ctrl));
+}
+
+esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_id)
+{
+	if (!mac) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	uint32_t session_id = 0;
+	uint32_t seq = 0;
+	uint8_t root_mac[6];
+	local_mac(root_mac);
+
+	portENTER_CRITICAL(&s_lock);
+	root_node_state_t *st = find_node_locked(mac, false);
+	if (st && st->tunnel_seen && st->session_id != 0) {
+		tunnel_tx_channel_t *tx = &st->tx[MESH_V2_TUNNEL_CHANNEL_TASK];
+		session_id = st->session_id;
+		seq = tx->next_seq++;
+	}
+	portEXIT_CRITICAL(&s_lock);
+
+	if (session_id == 0 || seq == 0) {
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	uint8_t payload[MESH_V2_PAYLOAD_MAX];
+	memset(payload, 0, sizeof(payload));
+
+	mesh_v2_tunnel_hdr_t *t = (mesh_v2_tunnel_hdr_t *)payload;
+	mesh_v2_task_request_payload_t req = {
+		.request_id = request_id,
+		.detail = 1,
+	};
+
+	t->channel_id = MESH_V2_TUNNEL_CHANNEL_TASK;
+	t->flags = MESH_V2_TUNNEL_FLAG_E2E_ACK | MESH_V2_TUNNEL_FLAG_HOP_ACK;
+	t->ttl = MESH_V2_TUNNEL_TTL_DEFAULT;
+	t->fragment_count = 1;
+	t->payload_len = sizeof(req);
+	t->fragment_index = 0;
+	t->stream_id = MESH_V2_TUNNEL_CHANNEL_TASK;
+	t->seq = seq;
+	t->ack_seq = 0;
+	t->sack_bitmap = 0;
+	mac_copy(t->origin_mac, root_mac);
+	mac_copy(t->target_mac, mac);
+	memcpy(payload + sizeof(*t), &req, sizeof(req));
+
+	return send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA, session_id, 0, 0,
+	                          payload, sizeof(*t) + sizeof(req));
 }

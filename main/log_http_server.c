@@ -84,6 +84,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
 #define UI_CONTROL_POLL_MS		15000
+#define TASKS_FAST_POLL_MS		2000
 #define REMOTE_LOG_REARM_MIN_MS		15000U
 #define NODEINFO_STALE_MS		75000U
 #define NODE_OFFLINE_MS		180000U
@@ -140,6 +141,7 @@ static uint8_t s_stream_mac[6] = {0};
 static bool s_stream_active = false;
 static uint8_t s_last_rearm_mac[6] = {0};
 static uint32_t s_last_rearm_ms = 0;
+static uint32_t s_task_request_id = 1;
 
 // Known node list.
 typedef struct {
@@ -199,6 +201,7 @@ typedef struct {
 	bool valid;
 	bool staging_active;
 	int slot_count;
+	uint32_t last_request_id;
 	ram_status_t ram;
 	persistent_status_t persistent;
 	stack_monitor_snapshot_t current;
@@ -227,6 +230,7 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 static size_t append_local_ota_json(char *out, size_t cap, size_t pos);
 static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
                                              const uint8_t mac[6]);
+static bool query_bool_value(const char *q, const char *key);
 static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s);
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
@@ -675,6 +679,73 @@ static int taskmon_slot_count_for_mac(const uint8_t mac[6])
 	return slot_count;
 }
 
+static uint32_t next_task_request_id(void)
+{
+	uint32_t id = 0;
+
+	portENTER_CRITICAL(&s_selection_lock);
+	id = s_task_request_id++;
+	if (s_task_request_id == 0) {
+		s_task_request_id = 1;
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
+	return id;
+}
+
+static uint32_t request_fresh_tasks_for_mac(const uint8_t mac[6])
+{
+	if (!mac) {
+		return 0;
+	}
+
+	if (mac_eq(mac, s_local_mac)) {
+		stack_monitor_snapshot_t snapshot;
+		(void)stack_monitor_sample_now(&snapshot);
+		return 0;
+	}
+
+	uint32_t request_id = next_task_request_id();
+	if (mesh_v2_root_send_task_request(mac, request_id) != ESP_OK) {
+		return 0;
+	}
+	return request_id;
+}
+
+static bool taskmon_request_ready(const uint8_t mac[6], uint32_t request_id)
+{
+	bool ready = false;
+
+	if (!mac || request_id == 0) {
+		return false;
+	}
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, false);
+		ready = ent && ent->valid && ent->last_request_id == request_id;
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+
+	return ready;
+}
+
+static void wait_for_task_request(const uint8_t mac[6], uint32_t request_id,
+                                  uint32_t timeout_ms)
+{
+	if (!mac || request_id == 0 || timeout_ms == 0) {
+		return;
+	}
+
+	uint32_t start = ms_now();
+	while ((uint32_t)(ms_now() - start) < timeout_ms) {
+		if (taskmon_request_ready(mac, request_id)) {
+			return;
+		}
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+}
+
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
 {
 	taskmon_ent_t *empty = NULL;
@@ -805,6 +876,13 @@ static bool taskmon_get_snapshot(const uint8_t mac[6], stack_monitor_snapshot_t 
 
 	if (tag && tag_sz > 0) {
 		tag[0] = '\0';
+	}
+
+	if (mac && mac_eq(mac, s_local_mac)) {
+		if (tag && tag_sz > 0) {
+			copy_tag(tag, tag_sz, s_local_tag);
+		}
+		return out ? stack_monitor_get_snapshot(out) : false;
 	}
 
 	portENTER_CRITICAL(&s_taskmon_lock);
@@ -1646,6 +1724,63 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	portEXIT_CRITICAL(&s_nodes_lock);
 
 	mesh_stream_mark_changed();
+}
+
+void log_http_server_task_snapshot_v2(const uint8_t mac[6],
+                                      const mesh_v2_task_snapshot_payload_t *snapshot)
+{
+	if (!mac || !snapshot) return;
+
+	uint32_t now = ms_now();
+	char tag[MESH_V2_TAG_MAX + 1];
+	copy_packet_text(tag, sizeof(tag), snapshot->tag, sizeof(snapshot->tag));
+	log_http_server_node_seen_uptime(mac, tag, true, snapshot->uptime_s);
+
+	uint16_t total = snapshot->task_total;
+	if (total > STACK_MONITOR_MAX_TASKS) {
+		total = STACK_MONITOR_MAX_TASKS;
+	}
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, true);
+		if (ent) {
+			taskmon_update_tag_locked(ent, tag);
+			ent->slot_count = snapshot->slot_count;
+
+			if (snapshot->task_index == 0 || !ent->staging_active) {
+				memset(&ent->staging, 0, sizeof(ent->staging));
+				ent->staging.updated_ms = now;
+				ent->staging.cpu_valid = snapshot->cpu_valid != 0;
+				ent->staging.cpu_load_x10 = snapshot->cpu_load_x10;
+				ent->staging.count = total;
+				ent->staging_active = true;
+			}
+
+			for (uint8_t i = 0; i < snapshot->task_count; i++) {
+				uint16_t idx = (uint16_t)(snapshot->task_index + i);
+				if (idx >= STACK_MONITOR_MAX_TASKS || idx >= total) {
+					continue;
+				}
+				const mesh_v2_task_entry_t *src = &snapshot->tasks[i];
+				stack_monitor_task_info_t *dst = &ent->staging.tasks[idx];
+				copy_packet_text(dst->name, sizeof(dst->name), src->name, sizeof(src->name));
+				dst->priority = src->priority;
+				dst->free_words = src->free_words;
+				dst->free_bytes = src->free_words * sizeof(StackType_t);
+				dst->cpu_x10 = src->cpu_x10;
+			}
+
+			if ((snapshot->flags & MESH_V2_TASK_SNAPSHOT_FLAG_LAST) ||
+			    snapshot->task_index + snapshot->task_count >= total) {
+				ent->current = ent->staging;
+				ent->valid = true;
+				ent->staging_active = false;
+				ent->last_request_id = snapshot->request_id;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -3862,6 +3997,7 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 	selection_snapshot(mac, NULL, 0);
 
 	char q[64] = {0};
+	bool fresh = false;
 	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
 		char v[32] = {0};
 		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
@@ -3870,6 +4006,12 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 				mac_copy(mac, parsed);
 			}
 		}
+		fresh = query_bool_value(q, "fresh");
+	}
+
+	if (fresh) {
+		uint32_t request_id = request_fresh_tasks_for_mac(mac);
+		wait_for_task_request(mac, request_id, 2000);
 	}
 
 	stack_monitor_snapshot_t snap;
@@ -3997,6 +4139,7 @@ static esp_err_t http_ui_status_get(httpd_req_t *req)
 	char q[96] = {0};
 	bool include_tasks = false;
 	bool include_ota = false;
+	bool fresh_tasks = false;
 
 	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
 		char v[32] = {0};
@@ -4008,6 +4151,12 @@ static esp_err_t http_ui_status_get(httpd_req_t *req)
 		}
 		include_tasks = query_bool_value(q, "tasks");
 		include_ota = query_bool_value(q, "ota") || include_tasks;
+		fresh_tasks = query_bool_value(q, "fresh");
+	}
+
+	if (include_tasks && fresh_tasks) {
+		uint32_t request_id = request_fresh_tasks_for_mac(mac);
+		wait_for_task_request(mac, request_id, 2000);
 	}
 
 	char *out = (char *)malloc(UI_STATUS_JSON_MAX);
@@ -4430,7 +4579,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let reselectBusy=false;\n"
 		"let selectionBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible)loadUiStatus()}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true)}}\n"
 		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible)startMeshStream();else stopMeshStream(true)}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
@@ -4673,7 +4822,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
 		"  logStreamErrors=0;pollFallbackUntil=Date.now()+2500;await tick();setTimeout(()=>{pollFallbackUntil=0;startLogStream()},900);\n"
 		"  selectionBusy=false;lastNodes='';\n"
-		"  if(tasksVisible)loadUiStatus();\n"
+		"  if(tasksVisible){loadTasks(true);loadOtaStatus();loadUiStatus(true)}\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
@@ -4681,24 +4830,25 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  document.getElementById('log').innerHTML='';\n"
 		"  logStreamErrors=0;\n"
 		"}\n"
-		"async function loadTasks(){\n"
+		"async function loadTasks(fresh){\n"
 		"  if(!tasksVisible||otaBusy||tasksBusyReq) return;\n"
 		"  tasksBusyReq=true;\n"
 		"  try{\n"
 		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
-		"    const r=await fetchTimeout('/tasks'+(mac?'?mac='+encodeURIComponent(mac):''),6000);\n"
+		"    let url='/tasks'+(mac?'?mac='+encodeURIComponent(mac):'');if(fresh)url+=(url.indexOf('?')>=0?'&':'?')+'fresh=1';\n"
+		"    const r=await fetchTimeout(url,6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyTasks(JSON.parse(txt),mac,txt);\n"
 		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
-		"async function loadUiStatus(){\n"
+		"async function loadUiStatus(fresh){\n"
 		"  if(controlPollBusy||otaBusy||selectionBusy)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  if(document.activeElement===s)return;\n"
 		"  controlPollBusy=true;\n"
 		"  try{\n"
 		"    const mac=selectedMac||s.value||'';const detail=tasksVisible?'1':'0';\n"
-		"    const url='/ui/status?tasks='+detail+'&ota='+detail+(mac?'&mac='+encodeURIComponent(mac):'');\n"
+		"    const url='/ui/status?tasks='+detail+'&ota='+detail+(fresh?'&fresh=1':'')+(mac?'&mac='+encodeURIComponent(mac):'');\n"
 		"    const r=await fetchTimeout(url,7000);const txt=await r.text();const j=JSON.parse(txt);\n"
 		"    applyNodes(j.nodes,JSON.stringify(j.nodes));\n"
 		"    if(tasksVisible){applyTasks(j.tasks,mac,JSON.stringify(j.tasks));applyOta(j.ota);}\n"
@@ -4713,6 +4863,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"selectedMac=rememberedNode()||selectedMac;\n"
 		"pollFallbackUntil=Date.now()+16000;\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
+		"setInterval(()=>loadTasks(false)," STR(TASKS_FAST_POLL_MS) ");\n"
 		"setInterval(controlPoll," STR(UI_CONTROL_POLL_MS) ");\n"
 		"loadUiStatus().finally(()=>setTimeout(tick,350));\n"
 		"</script>\n"

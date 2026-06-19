@@ -34,6 +34,9 @@ void stack_monitor_start(UBaseType_t priority);
 // Copies the latest task snapshot. Returns false before the first sample exists.
 bool stack_monitor_get_snapshot(stack_monitor_snapshot_t *out);
 
+// Takes a fresh sample immediately and returns it.
+bool stack_monitor_sample_now(stack_monitor_snapshot_t *out);
+
 #ifdef __cplusplus
 }
 #endif

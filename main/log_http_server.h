@@ -19,6 +19,8 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
                                       bool uptime_valid, uint32_t uptime_s);
 void log_http_server_node_topology(const uint8_t mac[6],
                                    const mesh_v2_topology_payload_t *topology);
+void log_http_server_task_snapshot_v2(const uint8_t mac[6],
+                                      const mesh_v2_task_snapshot_payload_t *snapshot);
 
 // Called by root RX path for LOG_LINE.
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line);
