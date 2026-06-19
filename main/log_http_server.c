@@ -72,6 +72,10 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_OTA_ACK_TIMEOUT_MS	8000U
 #define REMOTE_OTA_SEND_RETRIES		3
 #define REMOTE_OTA_RETRY_DELAY_MS	120U
+#define REMOTE_REBOOT_ACK_TIMEOUT_MS	7000U
+#define REMOTE_REBOOT_SEND_RETRIES	3
+#define REMOTE_REBOOT_RETRY_DELAY_MS	150U
+#define REMOTE_REBOOT_DELAY_MS		1200U
 #define LOG_STREAM_TASK_STACK		6144U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
@@ -281,6 +285,17 @@ static remote_ota_wait_t s_remote_ota_wait = {0};
 static remote_ota_status_t s_remote_ota_status = {
 	.state = NODE0_OTA_IDLE,
 };
+
+typedef struct {
+	bool waiting;
+	uint8_t mac[6];
+	uint16_t seq;
+	mesh_reboot_status_packet_t ack;
+} remote_reboot_wait_t;
+
+static SemaphoreHandle_t s_remote_reboot_ack_sem = NULL;
+static portMUX_TYPE s_remote_reboot_lock = portMUX_INITIALIZER_UNLOCKED;
+static remote_reboot_wait_t s_remote_reboot_wait = {0};
 
 /* ----------------- Helpers ----------------- */
 
@@ -1700,6 +1715,35 @@ void log_http_server_remote_ota_status(const uint8_t mac[6],
 	}
 }
 
+void log_http_server_remote_reboot_status(const uint8_t mac[6],
+                                          const mesh_reboot_status_packet_t *status)
+{
+	if (!mac || !status) return;
+
+	bool give_ack = false;
+
+	portENTER_CRITICAL(&s_remote_reboot_lock);
+	{
+		if (s_remote_reboot_wait.waiting &&
+		    mac_eq(mac, s_remote_reboot_wait.mac) &&
+		    status->seq == s_remote_reboot_wait.seq) {
+			s_remote_reboot_wait.ack = *status;
+			s_remote_reboot_wait.waiting = false;
+			give_ack = true;
+		}
+	}
+	portEXIT_CRITICAL(&s_remote_reboot_lock);
+
+	if (give_ack && s_remote_reboot_ack_sem) {
+		xSemaphoreGive(s_remote_reboot_ack_sem);
+	}
+
+	char msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
+	copy_packet_text(msg, sizeof(msg), status->message, sizeof(status->message));
+	ESP_LOGI(TAG, "remote reboot status from " MACSTR ": code=%u seq=%u %s",
+	         MAC2STR(mac), (unsigned)status->code, (unsigned)status->seq, msg);
+}
+
 /* ----------------- HTTP handlers ----------------- */
 
 static esp_err_t http_nodes_get(httpd_req_t *req)
@@ -2611,7 +2655,13 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 		strncpy(target_err, "target is local node0", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
-	bool supported = target_ok && remote_ota_supported_tag(tag);
+	bool target_supported = target_ok && remote_ota_supported_tag(tag);
+	bool route_ready = target_supported && node_route_current(target_mac);
+	bool supported = target_supported && route_ready;
+	if (target_ok && target_supported && !route_ready) {
+		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
+	}
 
 	char mac_hex[13] = {0};
 	mac_to_hex(target_mac, mac_hex);
@@ -2634,14 +2684,15 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	pos = append_fmt(out, cap, pos,
 	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
 	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
-	                 "\"target_mac\":\"%s\",\"target_tag\":",
+	                 "\"target_mac\":\"%s\",\"route_ready\":%s,\"target_tag\":",
 	                 ota_enabled() ? "true" : "false",
 	                 supported ? "true" : "false",
 	                 state == NODE0_OTA_UPDATING ? "true" : "false",
 	                 ota_state_name(state),
 	                 (unsigned long)written,
 	                 (unsigned long)total,
-	                 mac_hex);
+	                 mac_hex,
+	                 route_ready ? "true" : "false");
 	pos = append_json_string(out, cap, pos, target_ok ? tag : "");
 	pos = append_fmt(out, cap, pos, ",\"running_label\":\"remote\","
 	                 "\"update_label\":\"remote\",\"last_result\":");
@@ -2717,14 +2768,14 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 		                 "{\"valid\":false,\"mac\":\"%s\",\"tag\":",
 		                 mac_hex);
 		pos = append_json_string(out, cap, pos, tag);
-		return append_fmt(out, cap, pos,
-		                  ",\"updated_ms\":0,\"age_ms\":0,"
-		                  "\"cpu_valid\":false,\"cpu_load_x10\":0,"
-		                  "\"slot_count\":%d,\"uptime_valid\":%s,"
-		                  "\"uptime_s\":%lu,",
-		                  slot_count,
-		                  uptime_valid ? "true" : "false",
-		                  (unsigned long)uptime_s);
+		pos = append_fmt(out, cap, pos,
+		                 ",\"updated_ms\":0,\"age_ms\":0,"
+		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
+		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"uptime_s\":%lu,",
+		                 slot_count,
+		                 uptime_valid ? "true" : "false",
+		                 (unsigned long)uptime_s);
 		pos = append_ram_json_fields(out, cap, pos, &ram);
 		return append_fmt(out, cap, pos,
 		                  ",\"flash_valid\":%s,"
@@ -2955,6 +3006,96 @@ static esp_err_t remote_ota_send_wait(const uint8_t mac[6], const void *pkt,
 	return ESP_OK;
 }
 
+static uint16_t remote_reboot_next_seq(void)
+{
+	static uint16_t seq = 0;
+	seq++;
+	if (seq == 0) {
+		seq = 1;
+	}
+	return seq;
+}
+
+static void remote_reboot_clear_wait(void)
+{
+	portENTER_CRITICAL(&s_remote_reboot_lock);
+	s_remote_reboot_wait.waiting = false;
+	portEXIT_CRITICAL(&s_remote_reboot_lock);
+}
+
+static esp_err_t remote_reboot_send_wait(const uint8_t mac[6],
+                                         const mesh_reboot_request_packet_t *pkt,
+                                         mesh_reboot_status_packet_t *ack,
+                                         char *err, size_t err_sz)
+{
+	if (!s_remote_reboot_ack_sem) {
+		snprintf(err, err_sz, "remote reboot ACK semaphore unavailable");
+		return ESP_ERR_INVALID_STATE;
+	}
+	if (!mac || !pkt) {
+		snprintf(err, err_sz, "bad remote reboot request");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	esp_err_t last_err = ESP_ERR_TIMEOUT;
+
+	for (uint32_t attempt = 1; attempt <= REMOTE_REBOOT_SEND_RETRIES; attempt++) {
+		while (xSemaphoreTake(s_remote_reboot_ack_sem, 0) == pdTRUE) {
+		}
+
+		portENTER_CRITICAL(&s_remote_reboot_lock);
+		memset(&s_remote_reboot_wait, 0, sizeof(s_remote_reboot_wait));
+		s_remote_reboot_wait.waiting = true;
+		mac_copy(s_remote_reboot_wait.mac, mac);
+		s_remote_reboot_wait.seq = pkt->seq;
+		portEXIT_CRITICAL(&s_remote_reboot_lock);
+
+		esp_err_t send_err = mesh_ota_send_to(mac, pkt, sizeof(*pkt));
+		if (send_err != ESP_OK) {
+			remote_reboot_clear_wait();
+			last_err = send_err;
+			snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
+			vTaskDelay(pdMS_TO_TICKS(REMOTE_REBOOT_RETRY_DELAY_MS));
+			continue;
+		}
+
+		if (xSemaphoreTake(s_remote_reboot_ack_sem,
+		                   pdMS_TO_TICKS(REMOTE_REBOOT_ACK_TIMEOUT_MS)) == pdTRUE) {
+			last_err = ESP_OK;
+			break;
+		}
+
+		remote_reboot_clear_wait();
+		last_err = ESP_ERR_TIMEOUT;
+		snprintf(err, err_sz, "remote reboot ACK timeout seq=%u try=%lu/%u",
+		         (unsigned)pkt->seq, (unsigned long)attempt,
+		         (unsigned)REMOTE_REBOOT_SEND_RETRIES);
+		vTaskDelay(pdMS_TO_TICKS(REMOTE_REBOOT_RETRY_DELAY_MS));
+	}
+
+	if (last_err != ESP_OK) {
+		return last_err;
+	}
+
+	mesh_reboot_status_packet_t got;
+	portENTER_CRITICAL(&s_remote_reboot_lock);
+	got = s_remote_reboot_wait.ack;
+	portEXIT_CRITICAL(&s_remote_reboot_lock);
+
+	if (ack) {
+		*ack = got;
+	}
+
+	if (got.code != MESH_REBOOT_STATUS_OK) {
+		char msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
+		copy_packet_text(msg, sizeof(msg), got.message, sizeof(got.message));
+		snprintf(err, err_sz, "remote reboot error: %s", msg[0] ? msg : "unknown");
+		return ESP_FAIL;
+	}
+
+	return ESP_OK;
+}
+
 static void remote_ota_send_abort(const uint8_t mac[6], const char *reason)
 {
 	mesh_ota_abort_packet_t p;
@@ -3107,6 +3248,80 @@ static esp_err_t http_reboot_post(httpd_req_t *req)
 	}
 
 	return http_json_ok(req, "rebooting node0");
+}
+
+static esp_err_t http_reboot_remote_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		return http_json_error(req, "403 Forbidden",
+		                       "reboot disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+
+	if (!ota_check_pin(req)) {
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	if (!s_ota_mutex) {
+		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
+	}
+	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+		return http_json_error(req, "409 Conflict", "OTA/reboot already running");
+	}
+
+	uint8_t target_mac[6] = {0};
+	char target_tag[16] = "node";
+	char err_msg[96] = "remote reboot failed";
+	esp_err_t result = ESP_FAIL;
+
+	do {
+		if (!remote_ota_target_from_req(req, target_mac, target_tag,
+		                                sizeof(target_tag), err_msg,
+		                                sizeof(err_msg))) {
+			break;
+		}
+		if (!remote_ota_supported_tag(target_tag)) {
+			snprintf(err_msg, sizeof(err_msg), "remote reboot unsupported for %s",
+			         target_tag);
+			break;
+		}
+		if (!node_route_current(target_mac)) {
+			snprintf(err_msg, sizeof(err_msg), "target route not ready");
+			break;
+		}
+
+		mesh_reboot_request_packet_t p;
+		memset(&p, 0, sizeof(p));
+		mesh_ota_fill_header(&p.h, MESH_REBOOT_TYPE_REQUEST);
+		p.seq = remote_reboot_next_seq();
+		p.delay_ms = REMOTE_REBOOT_DELAY_MS;
+		strncpy(p.reason, "manual web reboot", sizeof(p.reason) - 1);
+		p.reason[sizeof(p.reason) - 1] = '\0';
+
+		ESP_LOGW(TAG, "manual remote reboot requested -> " MACSTR " tag=%s seq=%u",
+		         MAC2STR(target_mac), target_tag, (unsigned)p.seq);
+
+		mesh_reboot_status_packet_t ack;
+		result = remote_reboot_send_wait(target_mac, &p, &ack,
+		                                 err_msg, sizeof(err_msg));
+		if (result != ESP_OK) {
+			break;
+		}
+
+		char remote_msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
+		copy_packet_text(remote_msg, sizeof(remote_msg),
+		                 ack.message, sizeof(ack.message));
+		snprintf(err_msg, sizeof(err_msg), "remote reboot accepted, %s rebooting",
+		         target_tag);
+		ESP_LOGI(TAG, "%s: %s", err_msg,
+		         remote_msg[0] ? remote_msg : "OK");
+
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_ok(req, err_msg);
+	} while (0);
+
+	ESP_LOGW(TAG, "remote reboot failed: %s", err_msg);
+	xSemaphoreGive(s_ota_mutex);
+	return http_json_error(req, "400 Bad Request", err_msg);
 }
 
 static esp_err_t http_ota_status_get(httpd_req_t *req)
@@ -3394,7 +3609,13 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	char tag[16] = "node";
 	bool target_ok = remote_ota_target_from_req(req, mac, tag, sizeof(tag),
 	                                            target_err, sizeof(target_err));
-	bool supported = target_ok && remote_ota_supported_tag(tag);
+	bool target_supported = target_ok && remote_ota_supported_tag(tag);
+	bool route_ready = target_supported && node_route_current(mac);
+	bool supported = target_supported && route_ready;
+	if (target_ok && target_supported && !route_ready) {
+		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
+	}
 
 	char mac_hex[13] = {0};
 	mac_to_hex(mac, mac_hex);
@@ -3418,14 +3639,15 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	pos = append_fmt(out, sizeof(out), pos,
 	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
 	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
-	                 "\"target_mac\":\"%s\",\"target_tag\":",
+	                 "\"target_mac\":\"%s\",\"route_ready\":%s,\"target_tag\":",
 	                 ota_enabled() ? "true" : "false",
 	                 supported ? "true" : "false",
 	                 state == NODE0_OTA_UPDATING ? "true" : "false",
 	                 ota_state_name(state),
 	                 (unsigned long)written,
 	                 (unsigned long)total,
-	                 mac_hex);
+	                 mac_hex,
+	                 route_ready ? "true" : "false");
 	pos = append_json_string(out, sizeof(out), pos, target_ok ? tag : "");
 	pos = append_fmt(out, sizeof(out), pos, ",\"running_label\":\"remote\","
 	                 "\"update_label\":\"remote\",\"last_result\":");
@@ -3477,6 +3699,10 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		}
 		if (!remote_ota_supported_tag(target_tag)) {
 			snprintf(err_msg, sizeof(err_msg), "remote OTA unsupported for %s", target_tag);
+			break;
+		}
+		if (!node_route_current(target_mac)) {
+			snprintf(err_msg, sizeof(err_msg), "target route not ready");
 			break;
 		}
 
@@ -4260,7 +4486,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
 		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}\n"
-		"  else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText='';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
+		"  else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
 		"  updateOtaUi();\n"
 		"}\n"
 		"function applyTasks(j,mac,raw){\n"
@@ -4293,9 +4519,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function updateOtaUi(){\n"
 		"  const b=document.getElementById('otaBtn');const rb=document.getElementById('rebootBtn');const s=document.getElementById('otaStatus');const local=isLocalSelected();\n"
 		"  if(!b||!rb||!s)return;\n"
-		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent='';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
+		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
 		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
-		"  b.disabled=otaBusy||rebootBusy||!otaSupported;rb.disabled=otaBusy||rebootBusy||!local;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  const rebootSupported=local||otaSupported;\n"
+		"  b.disabled=otaBusy||rebootBusy||!otaSupported;rb.disabled=otaBusy||rebootBusy||!rebootSupported;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
 		"  otaStatusText=text||'OTA ready';\n"
@@ -4352,17 +4579,20 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"async function startReboot(){\n"
 		"  if(otaBusy||rebootBusy)return;\n"
-		"  if(!isLocalSelected())return;\n"
+		"  const local=isLocalSelected();const target=selectedOtaTarget();\n"
 		"  await loadOtaStatus();\n"
+		"  if(!local&&!otaSupported){return;}\n"
 		"  if(!otaEnabled){alert('Reboot is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
 		"  const pin=prompt('OTA PIN');\n"
 		"  if(!pin)return;\n"
-		"  const phrase=prompt('Type REBOOT NODE0 to reboot node0.');\n"
-		"  if(phrase!=='REBOOT NODE0'){alert('Reboot cancelled.');return;}\n"
-		"  if(!confirm('Reboot node0 now?'))return;\n"
+		"  const confirmPhrase='REBOOT '+String(target||'node').toUpperCase();\n"
+		"  const phrase=prompt('Type '+confirmPhrase+' to reboot '+target+'.');\n"
+		"  if(phrase!==confirmPhrase){alert('Reboot cancelled.');return;}\n"
+		"  if(!confirm('Reboot '+target+' now?'))return;\n"
 		"  notifyStreamClose('all');stopLogStream();stopMeshStream();\n"
-		"  rebootBusy=true;otaBusy=true;otaSetStatus('rebooting node0...',false,0);\n"
-		"  try{const r=await fetch('/reboot',{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||'rebooting node0',false,100);setTimeout(()=>location.reload(),9000)}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startLogStream()}\n"
+		"  rebootBusy=true;otaBusy=true;otaSetStatus('rebooting '+target+'...',false,0);\n"
+		"  const url=local?'/reboot':'/reboot/remote?mac='+encodeURIComponent(selectedMac||'');\n"
+		"  try{const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||('rebooting '+target),false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;rebootBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startLogStream()}\n"
 		"}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
@@ -4555,6 +4785,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_reboot_remote = {
+		.uri		= "/reboot/remote",
+		.method		= HTTP_POST,
+		.handler	= http_reboot_remote_post,
+		.user_ctx	= NULL
+	};
+
 	httpd_uri_t uri_nodes = {
 		.uri		= "/nodes",
 		.method		= HTTP_GET,
@@ -4622,6 +4859,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_reboot);
 	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_reboot_remote);
+	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_nodes);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_select);
@@ -4662,6 +4901,10 @@ esp_err_t log_http_server_init(void)
 	if (!s_remote_ota_ack_sem) {
 		ESP_LOGW(TAG, "remote OTA ACK semaphore allocation failed; remote OTA disabled");
 	}
+	s_remote_reboot_ack_sem = xSemaphoreCreateBinary();
+	if (!s_remote_reboot_ack_sem) {
+		ESP_LOGW(TAG, "remote reboot ACK semaphore allocation failed; remote reboot disabled");
+	}
 
 	s_log_stream_mutex = xSemaphoreCreateMutex();
 	if (!s_log_stream_mutex) {
@@ -4697,7 +4940,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
-	config.httpd.max_uri_handlers = 16;
+	config.httpd.max_uri_handlers = 17;
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;

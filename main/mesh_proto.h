@@ -28,11 +28,17 @@ extern "C" {
 #define MESH_OTA_TYPE_ABORT		9
 #define MESH_OTA_TYPE_STATUS		10
 
+// Manual remote reboot v1 (root -> node, node -> root status).
+#define MESH_REBOOT_TYPE_REQUEST	11
+#define MESH_REBOOT_TYPE_STATUS	12
+
 #define MESH_OTA_CHUNK_MAX		192
 #define MESH_OTA_PROJECT_MAX		32
 #define MESH_OTA_VERSION_MAX		32
 #define MESH_OTA_STATUS_MSG_MAX		64
 #define MESH_OTA_ABORT_MSG_MAX		48
+#define MESH_REBOOT_REASON_MAX		48
+#define MESH_REBOOT_STATUS_MSG_MAX	64
 
 #define MESH_OTA_OP_BEGIN		1
 #define MESH_OTA_OP_DATA		2
@@ -42,6 +48,10 @@ extern "C" {
 #define MESH_OTA_STATUS_OK		0
 #define MESH_OTA_STATUS_ERROR		1
 #define MESH_OTA_STATUS_BUSY		2
+
+#define MESH_REBOOT_STATUS_OK		0
+#define MESH_REBOOT_STATUS_ERROR	1
+#define MESH_REBOOT_STATUS_BUSY		2
 
 // Reliable mesh v2 (kept next to v1; packet types 1..10 stay intact).
 #define MESH_V2_TYPE_HELLO		32
@@ -182,6 +192,21 @@ typedef struct __attribute__((packed)) {
 	uint32_t	total;
 	char		message[MESH_OTA_STATUS_MSG_MAX];
 } mesh_ota_status_packet_t;
+
+typedef struct __attribute__((packed)) {
+	mesh_pkt_hdr_t	h;
+	uint16_t	seq;
+	uint16_t	delay_ms;
+	char		reason[MESH_REBOOT_REASON_MAX];
+} mesh_reboot_request_packet_t;
+
+typedef struct __attribute__((packed)) {
+	mesh_pkt_hdr_t	h;
+	uint8_t		code;
+	uint8_t		rsv;
+	uint16_t	seq;
+	char		message[MESH_REBOOT_STATUS_MSG_MAX];
+} mesh_reboot_status_packet_t;
 
 typedef struct __attribute__((packed)) {
 	uint8_t		magic;
