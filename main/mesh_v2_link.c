@@ -551,6 +551,14 @@ static void handle_tunnel_data(const mesh_v2_hdr_t *h, const uint8_t *payload)
 	if (st) {
 		if (st->session_id != h->session_id) {
 			reset_session_locked(st, h);
+			if (t->seq > st->rx[t->channel_id].expected_seq) {
+				tunnel_rx_channel_t *new_rx = &st->rx[t->channel_id];
+				new_rx->gap_count++;
+				new_rx->lost_count++;
+				new_rx->has_gap = true;
+				new_rx->expected_seq = t->seq;
+				new_rx->highest_seen_seq = t->seq;
+			}
 		}
 		st->tunnel_seen = true;
 		st->last_tunnel_ms = ms_now();
