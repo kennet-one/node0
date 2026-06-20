@@ -170,6 +170,8 @@ static uint32_t s_stream_selected_ms = 0;
 static uint32_t s_stream_last_line_ms = 0;
 static uint8_t s_last_rearm_mac[6] = {0};
 static uint32_t s_last_rearm_ms = 0;
+static uint32_t s_last_log_ctrl_ms = 0;
+static esp_err_t s_last_log_ctrl_err = ESP_OK;
 static uint32_t s_task_request_id = 1;
 
 // Known node list.
@@ -275,7 +277,7 @@ static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s);
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
 static bool selected_remote_stream_needs_rearm(const uint8_t mac[6]);
-static void selected_remote_stream_mark_rearm(const uint8_t mac[6]);
+static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t err);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -464,8 +466,11 @@ static void note_route_table_nodes(const mesh_addr_t routes[], int route_count,
 	for (int i = 0; i < route_count; i++) {
 		const uint8_t *mac = routes[i].addr;
 		if (!mac_eq(mac, s_local_mac) && selected_remote_stream_needs_rearm(mac)) {
-			if (mesh_send_log_ctrl(mac, true) == ESP_OK) {
-				selected_remote_stream_mark_rearm(mac);
+			esp_err_t err = mesh_send_log_ctrl(mac, true);
+			selected_remote_stream_note_rearm(mac, err);
+			if (err != ESP_OK) {
+				ESP_LOGD(TAG, "LOG_CTRL route retry failed: %s",
+				         esp_err_to_name(err));
 			}
 		}
 	}
@@ -503,36 +508,70 @@ static bool node_route_current(const uint8_t mac[6])
 	return route_table_contains(routes, route_count, mac);
 }
 
+static uint32_t max_ms_value(uint32_t a, uint32_t b)
+{
+	return (a > b) ? a : b;
+}
+
+static uint32_t node_last_app_ms(const uint8_t mac[6])
+{
+	uint32_t last_ms = 0;
+
+	if (!mac) return 0;
+	if (mac_eq(mac, s_local_mac)) return ms_now();
+
+	mesh_v2_root_stats_t v2;
+	if (mesh_v2_root_stats_for_mac(mac, &v2)) {
+		last_ms = max_ms_value(last_ms, v2.last_v2_ms);
+		last_ms = max_ms_value(last_ms, v2.last_tunnel_ms);
+	}
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac)) {
+				last_ms = max_ms_value(last_ms, s_nodes[i].last_seen_ms);
+				last_ms = max_ms_value(last_ms, s_nodes[i].topology_seen_ms);
+				break;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, false);
+		if (ent && ent->valid) {
+			last_ms = max_ms_value(last_ms, ent->current.updated_ms);
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		if (s_stream_active && mac_eq(mac, s_stream_mac)) {
+			last_ms = max_ms_value(last_ms, s_stream_last_line_ms);
+		}
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
+	return last_ms;
+}
+
+static long node_app_age_ms_at(const uint8_t mac[6], uint32_t now)
+{
+	uint32_t last_ms = node_last_app_ms(mac);
+	if (last_ms == 0) return -1;
+	return (long)(uint32_t)(now - last_ms);
+}
+
 static bool node_has_fresh_telemetry(const uint8_t mac[6], uint32_t max_age_ms)
 {
 	if (!mac || mac_eq(mac, s_local_mac)) return true;
 
 	uint32_t now = ms_now();
-	bool fresh = false;
-
-	mesh_v2_root_stats_t v2;
-	if (mesh_v2_root_stats_for_mac(mac, &v2) &&
-	    v2.last_v2_ms != 0 &&
-	    (uint32_t)(now - v2.last_v2_ms) <= max_age_ms) {
-		fresh = true;
-	}
-
-	if (!fresh) {
-		portENTER_CRITICAL(&s_nodes_lock);
-		{
-			for (uint32_t i = 0; i < s_nodes_count; i++) {
-				if (mac_eq(s_nodes[i].mac, mac) &&
-				    s_nodes[i].last_seen_ms != 0 &&
-				    (uint32_t)(now - s_nodes[i].last_seen_ms) <= max_age_ms) {
-					fresh = true;
-					break;
-				}
-			}
-		}
-		portEXIT_CRITICAL(&s_nodes_lock);
-	}
-
-	return fresh;
+	long age_ms = node_app_age_ms_at(mac, now);
+	return age_ms >= 0 && (uint32_t)age_ms <= max_age_ms;
 }
 
 static void mac_to_hex(const uint8_t mac[6], char out[13])
@@ -753,6 +792,12 @@ static uint32_t request_fresh_tasks_for_mac(const uint8_t mac[6])
 		stack_monitor_snapshot_t snapshot;
 		(void)stack_monitor_sample_now(&snapshot);
 		return 0;
+	}
+
+	if (!node_has_fresh_telemetry(mac, NODEINFO_STALE_MS) &&
+	    selected_remote_stream_needs_rearm(mac)) {
+		esp_err_t ctrl_err = mesh_send_log_ctrl(mac, true);
+		selected_remote_stream_note_rearm(mac, ctrl_err);
 	}
 
 	uint32_t request_id = next_task_request_id();
@@ -1559,10 +1604,11 @@ selected:
 	if (enable_new_stream) {
 		char tprefix[40];
 		char line[LOG_HTTP_LINE_MAX];
-		const char *reason = (node_route_current(new_stream_mac) ||
-		                      node_has_fresh_telemetry(new_stream_mac, NODEINFO_STALE_MS))
-			? "waiting for log stream"
-			: "waiting for node route";
+		bool route_current = node_route_current(new_stream_mac);
+		bool app_fresh = node_has_fresh_telemetry(new_stream_mac, NODEINFO_STALE_MS);
+		const char *reason = route_current
+			? (app_fresh ? "waiting for log stream" : "route alive, telemetry stale")
+			: (app_fresh ? "waiting for log stream" : "waiting for node route");
 		build_time_prefix(tprefix, sizeof(tprefix));
 		snprintf(line, sizeof(line),
 		         "%sI (0) log_http: selected %s [%02x%02x%02x%02x%02x%02x], %s",
@@ -1572,9 +1618,8 @@ selected:
 		         new_stream_mac[3], new_stream_mac[4], new_stream_mac[5],
 		         reason);
 		log_buffer_append_line(line, strnlen(line, sizeof(line)));
-		if (mesh_send_log_ctrl(new_stream_mac, true) == ESP_OK) {
-			selected_remote_stream_mark_rearm(new_stream_mac);
-		}
+		esp_err_t err = mesh_send_log_ctrl(new_stream_mac, true);
+		selected_remote_stream_note_rearm(new_stream_mac, err);
 	}
 
 	mesh_stream_mark_changed();
@@ -1584,6 +1629,7 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 {
 	bool rearm = false;
 	uint32_t now = ms_now();
+	bool app_fresh = node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
 
 	if (!mac) return false;
 
@@ -1593,6 +1639,9 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 		    mac_eq(mac, s_sel_mac) &&
 		    mac_eq(mac, s_stream_mac) &&
 		    !mac_eq(mac, s_local_mac)) {
+			if (s_stream_ready && !app_fresh) {
+				s_stream_ready = false;
+			}
 			uint32_t min_ms = s_stream_ready ? REMOTE_LOG_READY_REARM_MS :
 			                  REMOTE_LOG_RETRY_MS;
 			bool same_mac = mac_eq(mac, s_last_rearm_mac);
@@ -1608,14 +1657,21 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 	return rearm;
 }
 
-static void selected_remote_stream_mark_rearm(const uint8_t mac[6])
+static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t err)
 {
 	if (!mac) return;
 
 	portENTER_CRITICAL(&s_selection_lock);
 	{
-		mac_copy(s_last_rearm_mac, mac);
-		s_last_rearm_ms = ms_now();
+		uint32_t now = ms_now();
+		s_last_log_ctrl_ms = now;
+		s_last_log_ctrl_err = err;
+		if (err == ESP_OK) {
+			mac_copy(s_last_rearm_mac, mac);
+			s_last_rearm_ms = now;
+		} else if (s_stream_active && mac_eq(mac, s_stream_mac)) {
+			s_stream_ready = false;
+		}
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
 }
@@ -1644,9 +1700,8 @@ static void stream_lease_task(void *arg)
 
 		if (selected_remote_stream_needs_rearm(mac)) {
 			esp_err_t err = mesh_send_log_ctrl(mac, true);
-			if (err == ESP_OK) {
-				selected_remote_stream_mark_rearm(mac);
-			} else {
+			selected_remote_stream_note_rearm(mac, err);
+			if (err != ESP_OK) {
 				ESP_LOGD(TAG, "LOG_CTRL retry failed: %s", esp_err_to_name(err));
 			}
 		}
@@ -1750,9 +1805,8 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 	portEXIT_CRITICAL(&s_nodes_lock);
 
 	if (uptime_valid && selected_remote_stream_needs_rearm(mac)) {
-		if (mesh_send_log_ctrl(mac, true) == ESP_OK) {
-			selected_remote_stream_mark_rearm(mac);
-		}
+		esp_err_t err = mesh_send_log_ctrl(mac, true);
+		selected_remote_stream_note_rearm(mac, err);
 	}
 
 	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
@@ -2530,6 +2584,25 @@ static bool remote_ota_supported_tag(const char *tag)
 	return tag && strcmp(tag, "choinka") == 0;
 }
 
+static bool remote_ota_is_choinka_mac(const uint8_t mac[6])
+{
+	static const uint8_t choinka_mac[6] = {
+		0x08, 0xa6, 0xf7, 0x65, 0xce, 0xa0
+	};
+
+	return mac && mac_eq(mac, choinka_mac);
+}
+
+static void remote_ota_normalize_tag_for_mac(const uint8_t mac[6],
+                                             char *tag,
+                                             size_t tag_sz)
+{
+	if (!tag || tag_sz == 0) return;
+	if (!remote_ota_supported_tag(tag) && remote_ota_is_choinka_mac(mac)) {
+		copy_tag(tag, tag_sz, "choinka");
+	}
+}
+
 static void remote_ota_status_begin(const uint8_t mac[6], const char *tag,
                                     uint32_t total_bytes)
 {
@@ -2662,39 +2735,38 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	bool remote = mac && !mac_eq(mac, s_local_mac);
 	bool has_nodeinfo = last_nodeinfo_ms != 0;
 	bool has_route_history = last_route_ms != 0;
-	bool has_telemetry = has_nodeinfo || has_v2;
-	uint32_t best_age = UINT32_MAX;
+	uint32_t app_last_ms = node_last_app_ms(mac);
 	long route_age_ms = has_route_history ? (long)(uint32_t)(now - last_route_ms) : -1;
 	long nodeinfo_age_ms = has_nodeinfo ? (long)(uint32_t)(now - last_nodeinfo_ms) : -1;
+	long telemetry_age_ms = app_last_ms ? (long)(uint32_t)(now - app_last_ms) : -1;
 
-	if (has_nodeinfo) {
-		best_age = (uint32_t)nodeinfo_age_ms;
-	}
-	if (has_v2 && v2.last_v2_ms != 0) {
-		uint32_t v2_age = (uint32_t)(now - v2.last_v2_ms);
-		if (v2_age < best_age) best_age = v2_age;
-	}
-
-	bool stale = remote && (!has_telemetry || best_age > NODEINFO_STALE_MS);
-	bool fresh_telemetry = remote && has_telemetry && best_age <= NODEINFO_STALE_MS;
+	bool fresh_telemetry = remote
+		? (telemetry_age_ms >= 0 && (uint32_t)telemetry_age_ms <= NODEINFO_STALE_MS)
+		: true;
+	bool app_stale = remote && !fresh_telemetry;
+	bool stale = app_stale;
 	bool link_seen = route_seen || fresh_telemetry;
 	bool offline = remote && !link_seen && stale &&
 		(!has_route_history || (uint32_t)route_age_ms > NODE_OFFLINE_MS);
 	const char *stream_state = remote ? "idle" : "local";
 	long log_ctrl_age_ms = -1;
 	long remote_line_age_ms = -1;
+	long last_remote_app_ms = app_last_ms ? (long)app_last_ms : -1;
+	int last_log_ctrl_err = 0;
 
 	if (remote) {
 		portENTER_CRITICAL(&s_selection_lock);
 		{
 			if (s_stream_active && mac_eq(mac, s_stream_mac)) {
-				stream_state = s_stream_ready ? "ready" :
-				               (route_seen || fresh_telemetry) ? "waiting_log" :
+				stream_state = (s_stream_ready && !app_stale) ? "ready" :
+				               route_seen ? "telemetry_stale" :
+				               fresh_telemetry ? "waiting_log" :
 				               "waiting_route";
-				log_ctrl_age_ms = s_last_rearm_ms ?
-					(long)(uint32_t)(now - s_last_rearm_ms) : -1;
+				log_ctrl_age_ms = s_last_log_ctrl_ms ?
+					(long)(uint32_t)(now - s_last_log_ctrl_ms) : -1;
 				remote_line_age_ms = s_stream_last_line_ms ?
 					(long)(uint32_t)(now - s_stream_last_line_ms) : -1;
+				last_log_ctrl_err = (int)s_last_log_ctrl_err;
 			}
 		}
 		portEXIT_CRITICAL(&s_selection_lock);
@@ -2716,22 +2788,30 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	}
 
 	pos = append_fmt(out, cap, pos,
-	                  ",\"route_seen\":%s,\"route_table_seen\":%s,\"route_age_ms\":%ld,"
-	                  "\"nodeinfo_age_ms\":%ld,\"node_source\":",
-	                  link_seen ? "true" : "false",
+	                  ",\"route_seen\":%s,\"route_table_seen\":%s,\"link_seen\":%s,"
+	                  "\"route_age_ms\":%ld,\"nodeinfo_age_ms\":%ld,"
+	                  "\"telemetry_fresh\":%s,\"telemetry_age_ms\":%ld,"
+	                  "\"app_stale\":%s,\"last_remote_app_ms\":%ld,\"node_source\":",
 	                  route_seen ? "true" : "false",
+	                  route_seen ? "true" : "false",
+	                  link_seen ? "true" : "false",
 	                  route_age_ms,
-	                  nodeinfo_age_ms);
+	                  nodeinfo_age_ms,
+	                  fresh_telemetry ? "true" : "false",
+	                  telemetry_age_ms,
+	                  app_stale ? "true" : "false",
+	                  last_remote_app_ms);
 	pos = append_json_string(out, cap, pos, node_source);
 	pos = append_fmt(out, cap, pos,
 	                  ",\"stream_state\":");
 	pos = append_json_string(out, cap, pos, stream_state);
 	return append_fmt(out, cap, pos,
 	                  ",\"log_ctrl_age_ms\":%ld,\"remote_line_age_ms\":%ld,"
-	                  "\"last_send_err\":0,\"recovery_phase\":%s,"
+	                  "\"last_log_ctrl_err\":%d,\"last_send_err\":0,\"recovery_phase\":%s,"
 	                  "\"stale\":%s,\"offline\":%s",
 	                  log_ctrl_age_ms,
 	                  remote_line_age_ms,
+	                  last_log_ctrl_err,
 	                  remote ? "\"unknown\"" : "\"ok\"",
 	                  stale ? "true" : "false",
 	                  offline ? "true" : "false");
@@ -2961,11 +3041,19 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 		strncpy(target_err, "target is local node0", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
+	if (target_ok) {
+		remote_ota_normalize_tag_for_mac(target_mac, tag, sizeof(tag));
+	}
 	bool target_supported = target_ok && remote_ota_supported_tag(tag);
 	bool route_ready = target_supported && node_route_current(target_mac);
-	bool supported = target_supported && route_ready;
+	bool telemetry_ready = target_supported &&
+	                       node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS);
+	bool supported = target_supported && route_ready && telemetry_ready;
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
+	} else if (target_ok && target_supported && !telemetry_ready) {
+		strncpy(target_err, "target telemetry stale", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
 
@@ -2990,7 +3078,8 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	pos = append_fmt(out, cap, pos,
 	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
 	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
-	                 "\"target_mac\":\"%s\",\"route_ready\":%s,\"target_tag\":",
+	                 "\"target_mac\":\"%s\",\"route_ready\":%s,"
+	                 "\"telemetry_ready\":%s,\"target_tag\":",
 	                 ota_enabled() ? "true" : "false",
 	                 supported ? "true" : "false",
 	                 state == NODE0_OTA_UPDATING ? "true" : "false",
@@ -2998,7 +3087,8 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	                 (unsigned long)written,
 	                 (unsigned long)total,
 	                 mac_hex,
-	                 route_ready ? "true" : "false");
+	                 route_ready ? "true" : "false",
+	                 telemetry_ready ? "true" : "false");
 	pos = append_json_string(out, cap, pos, target_ok ? tag : "");
 	pos = append_fmt(out, cap, pos, ",\"running_label\":\"remote\","
 	                 "\"update_label\":\"remote\",\"last_result\":");
@@ -3585,6 +3675,8 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		                                sizeof(err_msg))) {
 			break;
 		}
+		remote_ota_normalize_tag_for_mac(target_mac, target_tag,
+		                                 sizeof(target_tag));
 		if (!remote_ota_supported_tag(target_tag)) {
 			snprintf(err_msg, sizeof(err_msg), "remote reboot unsupported for %s",
 			         target_tag);
@@ -3915,11 +4007,19 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	char tag[16] = "node";
 	bool target_ok = remote_ota_target_from_req(req, mac, tag, sizeof(tag),
 	                                            target_err, sizeof(target_err));
+	if (target_ok) {
+		remote_ota_normalize_tag_for_mac(mac, tag, sizeof(tag));
+	}
 	bool target_supported = target_ok && remote_ota_supported_tag(tag);
 	bool route_ready = target_supported && node_route_current(mac);
-	bool supported = target_supported && route_ready;
+	bool telemetry_ready = target_supported &&
+	                       node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
+	bool supported = target_supported && route_ready && telemetry_ready;
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
+	} else if (target_ok && target_supported && !telemetry_ready) {
+		strncpy(target_err, "target telemetry stale", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
 
@@ -3945,7 +4045,8 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	pos = append_fmt(out, sizeof(out), pos,
 	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
 	                 "\"state\":\"%s\",\"written_bytes\":%lu,\"total_bytes\":%lu,"
-	                 "\"target_mac\":\"%s\",\"route_ready\":%s,\"target_tag\":",
+	                 "\"target_mac\":\"%s\",\"route_ready\":%s,"
+	                 "\"telemetry_ready\":%s,\"target_tag\":",
 	                 ota_enabled() ? "true" : "false",
 	                 supported ? "true" : "false",
 	                 state == NODE0_OTA_UPDATING ? "true" : "false",
@@ -3953,7 +4054,8 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	                 (unsigned long)written,
 	                 (unsigned long)total,
 	                 mac_hex,
-	                 route_ready ? "true" : "false");
+	                 route_ready ? "true" : "false",
+	                 telemetry_ready ? "true" : "false");
 	pos = append_json_string(out, sizeof(out), pos, target_ok ? tag : "");
 	pos = append_fmt(out, sizeof(out), pos, ",\"running_label\":\"remote\","
 	                 "\"update_label\":\"remote\",\"last_result\":");
@@ -4003,12 +4105,18 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		                                err_msg, sizeof(err_msg))) {
 			break;
 		}
+		remote_ota_normalize_tag_for_mac(target_mac, target_tag,
+		                                 sizeof(target_tag));
 		if (!remote_ota_supported_tag(target_tag)) {
 			snprintf(err_msg, sizeof(err_msg), "remote OTA unsupported for %s", target_tag);
 			break;
 		}
 		if (!node_route_current(target_mac)) {
 			snprintf(err_msg, sizeof(err_msg), "target route not ready");
+			break;
+		}
+		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
+			snprintf(err_msg, sizeof(err_msg), "target telemetry stale");
 			break;
 		}
 
@@ -4338,9 +4446,12 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	bool remote_stream = false;
 	bool remote_ready = false;
 	uint32_t now = ms_now();
+	uint8_t selected_mac[6] = {0};
 	uint32_t selected_ms = 0;
 	uint32_t last_line_ms = 0;
 	uint32_t last_rearm_ms = 0;
+	uint32_t last_log_ctrl_ms = 0;
+	esp_err_t last_log_ctrl_err = ESP_OK;
 
 	if (s_log_stream_mutex &&
 	    xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -4360,17 +4471,22 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 
 	portENTER_CRITICAL(&s_selection_lock);
 	{
+		mac_copy(selected_mac, s_sel_mac);
 		remote_stream = s_stream_active && !mac_eq(s_stream_mac, s_local_mac);
 		remote_ready = s_stream_ready;
 		selected_ms = s_stream_selected_ms;
 		last_line_ms = s_stream_last_line_ms;
 		last_rearm_ms = s_last_rearm_ms;
+		last_log_ctrl_ms = s_last_log_ctrl_ms;
+		last_log_ctrl_err = s_last_log_ctrl_err;
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
 
 	long selected_age = selected_ms ? (long)(uint32_t)(now - selected_ms) : -1;
 	long line_age = last_line_ms ? (long)(uint32_t)(now - last_line_ms) : -1;
 	long rearm_age = last_rearm_ms ? (long)(uint32_t)(now - last_rearm_ms) : -1;
+	long ctrl_age = last_log_ctrl_ms ? (long)(uint32_t)(now - last_log_ctrl_ms) : -1;
+	long app_age = remote_stream ? node_app_age_ms_at(selected_mac, now) : -1;
 	size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	size_t internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -4380,7 +4496,8 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	                 "{\"log_sse\":%s,\"ui_sse\":%s,\"mesh_sse\":%s,"
 	                 "\"remote_stream\":%s,\"remote_stream_ready\":%s,"
 	                 "\"remote_selected_age_ms\":%ld,\"remote_line_age_ms\":%ld,"
-	                 "\"log_ctrl_age_ms\":%ld,"
+	                 "\"log_ctrl_age_ms\":%ld,\"last_log_ctrl_age_ms\":%ld,"
+	                 "\"last_log_ctrl_err\":%d,\"remote_app_age_ms\":%ld,"
 	                 "\"heap_internal_free\":%lu,\"heap_internal_min\":%lu,"
 	                 "\"heap_psram_free\":%lu,\"heap_psram_min\":%lu}",
 	                 log_active ? "true" : "false",
@@ -4391,6 +4508,9 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	                 selected_age,
 	                 line_age,
 	                 rearm_age,
+	                 ctrl_age,
+	                 (int)last_log_ctrl_err,
+	                 app_age,
 	                 (unsigned long)internal_free,
 	                 (unsigned long)internal_min,
 	                 (unsigned long)psram_free,
@@ -5149,13 +5269,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!selectionBusy&&remembered&&remembered!==serverCur&&nodeInList(nodes,remembered)&&!reselectBusy){cur=remembered;setTimeout(()=>reselectNode(remembered),0)}\n"
 		"  else if(!selectionBusy&&rememberedMissing){cur=remembered}\n"
 		"  selectedMac=cur||selectedMac;s.innerHTML='';\n"
-		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=n.has_gap?'gap':(n.offline?'offline':(n.stale?'stale':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))));o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
+		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=n.has_gap?'gap':(n.offline?'offline':(n.app_stale?'app stale':(n.stale?'stale':(n.route_table_seen&&!n.telemetry_fresh?'route':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))))));o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
 		"  if(rememberedMissing){const o=document.createElement('option');o.value=remembered;o.dataset.tag=rememberedTag;o.textContent=rememberedTag+' · waiting';s.appendChild(o)}\n"
 		"  s.value=cur||prev;selectedMac=s.value||selectedMac;updateOtaUi();\n"
 		"}\n"
-		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
-		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':n.stale?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
-		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':(n.app_stale||n.stale)?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
+		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
 		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
 		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
 		"function applyUiStatus(j,mode){if(!j)return;applyNodes(j.nodes,JSON.stringify(j.nodes));if(tasksVisible&&j.tasks)applyTasks(j.tasks,selectedMac||'',JSON.stringify(j.tasks));if(tasksVisible&&j.ota)applyOta(j.ota);if(meshVisible&&j.nodes)applyMeshStatus(j.nodes,mode||'live')}\n"
