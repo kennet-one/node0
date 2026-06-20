@@ -3125,7 +3125,38 @@ static void remote_ota_slot_snapshot(const uint8_t mac[6],
 	if (update_size) *update_size = 0;
 	if (!mac) return;
 
+	bool found_node_slots = false;
 	remote_ota_status_t status;
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (!mac_eq(mac, s_nodes[i].mac)) continue;
+			found_node_slots = s_nodes[i].ota_running_label[0] ||
+			                   s_nodes[i].ota_update_label[0] ||
+			                   s_nodes[i].ota_running_size != 0 ||
+			                   s_nodes[i].ota_update_size != 0;
+			if (running_label) {
+				copy_packet_text(running_label, MESH_OTA_SLOT_LABEL_MAX,
+				                 s_nodes[i].ota_running_label,
+				                 sizeof(s_nodes[i].ota_running_label));
+			}
+			if (update_label) {
+				copy_packet_text(update_label, MESH_OTA_SLOT_LABEL_MAX,
+				                 s_nodes[i].ota_update_label,
+				                 sizeof(s_nodes[i].ota_update_label));
+			}
+			if (running_size) *running_size = s_nodes[i].ota_running_size;
+			if (update_size) *update_size = s_nodes[i].ota_update_size;
+			break;
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	if (found_node_slots) {
+		return;
+	}
+
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	status = s_remote_ota_status;
 	portEXIT_CRITICAL(&s_remote_ota_lock);
@@ -3143,29 +3174,7 @@ static void remote_ota_slot_snapshot(const uint8_t mac[6],
 		}
 		if (running_size) *running_size = status.running_size;
 		if (update_size) *update_size = status.update_size;
-		return;
 	}
-
-	portENTER_CRITICAL(&s_nodes_lock);
-	{
-		for (uint32_t i = 0; i < s_nodes_count; i++) {
-			if (!mac_eq(mac, s_nodes[i].mac)) continue;
-			if (running_label) {
-				copy_packet_text(running_label, MESH_OTA_SLOT_LABEL_MAX,
-				                 s_nodes[i].ota_running_label,
-				                 sizeof(s_nodes[i].ota_running_label));
-			}
-			if (update_label) {
-				copy_packet_text(update_label, MESH_OTA_SLOT_LABEL_MAX,
-				                 s_nodes[i].ota_update_label,
-				                 sizeof(s_nodes[i].ota_update_label));
-			}
-			if (running_size) *running_size = s_nodes[i].ota_running_size;
-			if (update_size) *update_size = s_nodes[i].ota_update_size;
-			break;
-		}
-	}
-	portEXIT_CRITICAL(&s_nodes_lock);
 }
 
 static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
