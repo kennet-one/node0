@@ -83,6 +83,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define MESH_STREAM_HEARTBEAT_MS	15000U
 #define UI_STREAM_TASK_STACK		4096U
 #define UI_STREAM_HEARTBEAT_MS		5000U
+#define LOG_LEASE_TASK_STACK		3572U
 #define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
@@ -5636,7 +5637,7 @@ esp_err_t log_http_server_init(void)
 	}
 
 	if (!s_stream_lease_task &&
-	    xTaskCreate(stream_lease_task, "log_lease", 3072, NULL, 4,
+	    xTaskCreate(stream_lease_task, "log_lease", LOG_LEASE_TASK_STACK, NULL, 4,
 	                &s_stream_lease_task) != pdPASS) {
 		ESP_LOGW(TAG, "log lease task allocation failed; remote log retry disabled");
 		s_stream_lease_task = NULL;
