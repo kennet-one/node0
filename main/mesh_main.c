@@ -32,7 +32,10 @@
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
-#define NODE0_WIFI_STACK_EXTRA_WORDS (500U)
+#define MESH_TX_TASK_STACK (4096U)
+#define MESH_RX_TASK_STACK (5120U)
+#define NODE0_WIFI_MTXON_STACK_EXTRA_WORDS (1000U)
+#define NODE0_WIFI_MRX_STACK_EXTRA_WORDS   (500U)
 //#define FIXED_ROOT  1   // node0 only
 
 static const char *MESH_TAG = "node0";
@@ -68,8 +71,11 @@ static bool s_wifi_task_stack_patch_installed = false;
 static uint32_t node0_wifi_stack_depth_for_task(const char *name,
                                                 uint32_t stack_depth)
 {
-	if (name && (strcmp(name, "MTXON") == 0 || strcmp(name, "MRX") == 0)) {
-		return stack_depth + NODE0_WIFI_STACK_EXTRA_WORDS;
+	if (name && strcmp(name, "MTXON") == 0) {
+		return stack_depth + NODE0_WIFI_MTXON_STACK_EXTRA_WORDS;
+	}
+	if (name && strcmp(name, "MRX") == 0) {
+		return stack_depth + NODE0_WIFI_MRX_STACK_EXTRA_WORDS;
 	}
 
 	return stack_depth;
@@ -128,8 +134,9 @@ static void node0_install_wifi_task_stack_patch(void)
 	s_wifi_task_stack_patch_installed = true;
 
 	ESP_LOGI(MESH_TAG,
-	         "Wi-Fi stack patch installed: MTXON/MRX +%u words",
-	         (unsigned)NODE0_WIFI_STACK_EXTRA_WORDS);
+	         "Wi-Fi stack patch installed: MTXON +%u words, MRX +%u words",
+	         (unsigned)NODE0_WIFI_MTXON_STACK_EXTRA_WORDS,
+	         (unsigned)NODE0_WIFI_MRX_STACK_EXTRA_WORDS);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -551,8 +558,8 @@ static esp_err_t mesh_comm_start(void)
 
 	if (!started) {
 		started = true;
-		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
-		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
+		xTaskCreate(mesh_tx_task, "mesh_tx", MESH_TX_TASK_STACK, NULL, 5, NULL);
+		xTaskCreate(mesh_rx_task, "mesh_rx", MESH_RX_TASK_STACK, NULL, 5, NULL);
 #if I_AM_SINGLE_SENDER
         xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
 #endif

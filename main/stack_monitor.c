@@ -10,6 +10,7 @@
 #include "esp_log.h"
 
 #define STACK_MONITOR_PERIOD_MS		60000
+#define STACK_MONITOR_TASK_STACK	6400U
 
 static const char *TAG = "[STACKMON]";
 
@@ -253,7 +254,7 @@ void stack_monitor_start(UBaseType_t priority)
 	BaseType_t ok = xTaskCreate(
 			stack_monitor_task,
 			"stack_mon",
-			6000,
+			STACK_MONITOR_TASK_STACK,
 			NULL,
 			priority,
 			NULL);

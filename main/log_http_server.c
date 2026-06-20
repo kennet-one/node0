@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -76,18 +77,26 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_REBOOT_SEND_RETRIES	3
 #define REMOTE_REBOOT_RETRY_DELAY_MS	150U
 #define REMOTE_REBOOT_DELAY_MS		1200U
-#define LOG_STREAM_TASK_STACK		6144U
+#define LOG_STREAM_TASK_STACK		4096U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
 #define MESH_STREAM_HEARTBEAT_MS	15000U
+#define UI_STREAM_TASK_STACK		4096U
+#define UI_STREAM_HEARTBEAT_MS		5000U
 #define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
 #define UI_CONTROL_POLL_MS		15000
 #define TASKS_FAST_POLL_MS		2000
-#define REMOTE_LOG_REARM_MIN_MS		15000U
+#define REMOTE_LOG_RETRY_MS		5000U
+#define REMOTE_LOG_READY_REARM_MS	30000U
 #define NODEINFO_STALE_MS		75000U
+#define STREAM_SID_MAX			32
 #define NODE_OFFLINE_MS		180000U
+
+#ifndef LOG_HTTP_ENABLE_MESH_STREAM
+#define LOG_HTTP_ENABLE_MESH_STREAM	0
+#endif
 
 #define STR_HELPER(x)	#x
 #define STR(x)		STR_HELPER(x)
@@ -107,6 +116,7 @@ typedef struct {
 	uint32_t cursor;
 	bool headers_sent;
 	bool client_close;
+	char sid[STREAM_SID_MAX];
 } log_stream_state_t;
 
 static SemaphoreHandle_t s_log_stream_mutex = NULL;
@@ -118,12 +128,27 @@ typedef struct {
 	uint32_t seq;
 	bool headers_sent;
 	bool client_close;
+	char sid[STREAM_SID_MAX];
 } mesh_stream_state_t;
 
 static SemaphoreHandle_t s_mesh_stream_mutex = NULL;
 static TaskHandle_t s_mesh_stream_task = NULL;
 static mesh_stream_state_t s_mesh_stream = {0};
 static uint32_t s_mesh_stream_seq = 1;
+
+typedef struct {
+	httpd_req_t *req;
+	uint32_t seq;
+	bool headers_sent;
+	bool client_close;
+	char sid[STREAM_SID_MAX];
+} ui_stream_state_t;
+
+static SemaphoreHandle_t s_ui_stream_mutex = NULL;
+static TaskHandle_t s_ui_stream_task = NULL;
+static ui_stream_state_t s_ui_stream = {0};
+static uint32_t s_ui_stream_seq = 1;
+static TaskHandle_t s_stream_lease_task = NULL;
 
 typedef int (*vprintf_like_t)(const char *fmt, va_list ap);
 static vprintf_like_t s_orig_vprintf = NULL;
@@ -139,6 +164,9 @@ static char s_sel_tag[16] = "node0";
 // Currently active remote stream; used to disable the previous one.
 static uint8_t s_stream_mac[6] = {0};
 static bool s_stream_active = false;
+static bool s_stream_ready = false;
+static uint32_t s_stream_selected_ms = 0;
+static uint32_t s_stream_last_line_ms = 0;
 static uint8_t s_last_rearm_mac[6] = {0};
 static uint32_t s_last_rearm_ms = 0;
 static uint32_t s_task_request_id = 1;
@@ -157,6 +185,11 @@ typedef struct {
 	int8_t parent_rssi;
 	uint8_t child_count;
 	uint32_t capabilities;
+	uint32_t v1_ok_age_ms;
+	uint32_t v2_ack_age_ms;
+	int32_t last_send_err;
+	uint8_t recovery_phase;
+	bool log_stream_enabled;
 	bool uptime_valid;
 	uint32_t uptime_s;
 	uint32_t uptime_seen_ms;
@@ -216,6 +249,7 @@ static size_t append_fmt(char *out, size_t cap, size_t pos, const char *fmt, ...
 static size_t append_json_string(char *out, size_t cap, size_t pos, const char *s);
 static void log_stream_notify(void);
 static void mesh_stream_notify(void);
+static void ui_stream_notify(void);
 static bool parse_mac_hex(const char *s, uint8_t mac[6]);
 static void copy_tag(char *dst, size_t dst_sz, const char *tag);
 static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz);
@@ -231,6 +265,11 @@ static size_t append_local_ota_json(char *out, size_t cap, size_t pos);
 static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
                                              const uint8_t mac[6]);
 static bool query_bool_value(const char *q, const char *key);
+static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz);
+static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
+                                            const uint8_t mac[6],
+                                            bool include_tasks,
+                                            bool include_ota);
 static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s);
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
@@ -329,10 +368,20 @@ static void mesh_stream_notify(void)
 	}
 }
 
+static void ui_stream_notify(void)
+{
+	TaskHandle_t task = s_ui_stream_task;
+	if (task) {
+		xTaskNotifyGive(task);
+	}
+}
+
 static void mesh_stream_mark_changed(void)
 {
 	s_mesh_stream_seq++;
+	s_ui_stream_seq++;
 	mesh_stream_notify();
+	ui_stream_notify();
 }
 
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
@@ -1451,6 +1500,9 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 			s_stream_active = true;
 			mac_copy(s_stream_mac, mac);
 			mac_copy(new_stream_mac, mac);
+			s_stream_ready = false;
+			s_stream_selected_ms = ms_now();
+			s_stream_last_line_ms = 0;
 			enable_new_stream = true;
 			portEXIT_CRITICAL(&s_selection_lock);
 			goto selected;
@@ -1466,12 +1518,18 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 
 		if (mac_eq(mac, s_local_mac)) {
 			s_stream_active = false;
+			s_stream_ready = false;
+			s_stream_selected_ms = 0;
+			s_stream_last_line_ms = 0;
 			memset(s_stream_mac, 0, sizeof(s_stream_mac));
 			enable_local_stream = true;
 		} else {
 			s_stream_active = true;
 			mac_copy(s_stream_mac, mac);
 			mac_copy(new_stream_mac, mac);
+			s_stream_ready = false;
+			s_stream_selected_ms = ms_now();
+			s_stream_last_line_ms = 0;
 			enable_new_stream = true;
 		}
 	}
@@ -1517,6 +1575,8 @@ selected:
 			selected_remote_stream_mark_rearm(new_stream_mac);
 		}
 	}
+
+	mesh_stream_mark_changed();
 }
 
 static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
@@ -1532,9 +1592,11 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 		    mac_eq(mac, s_sel_mac) &&
 		    mac_eq(mac, s_stream_mac) &&
 		    !mac_eq(mac, s_local_mac)) {
+			uint32_t min_ms = s_stream_ready ? REMOTE_LOG_READY_REARM_MS :
+			                  REMOTE_LOG_RETRY_MS;
 			bool same_mac = mac_eq(mac, s_last_rearm_mac);
 			bool throttled = same_mac &&
-			                 (uint32_t)(now - s_last_rearm_ms) < REMOTE_LOG_REARM_MIN_MS;
+			                 (uint32_t)(now - s_last_rearm_ms) < min_ms;
 			if (!throttled) {
 				rearm = true;
 			}
@@ -1555,6 +1617,39 @@ static void selected_remote_stream_mark_rearm(const uint8_t mac[6])
 		s_last_rearm_ms = ms_now();
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
+}
+
+static void stream_lease_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(1000));
+
+		uint8_t mac[6] = {0};
+		bool active = false;
+		portENTER_CRITICAL(&s_selection_lock);
+		{
+			active = s_stream_active && !mac_eq(s_stream_mac, s_local_mac);
+			if (active) {
+				mac_copy(mac, s_stream_mac);
+			}
+		}
+		portEXIT_CRITICAL(&s_selection_lock);
+
+		if (!active) {
+			continue;
+		}
+
+		if (selected_remote_stream_needs_rearm(mac)) {
+			esp_err_t err = mesh_send_log_ctrl(mac, true);
+			if (err == ESP_OK) {
+				selected_remote_stream_mark_rearm(mac);
+			} else {
+				ESP_LOGD(TAG, "LOG_CTRL retry failed: %s", esp_err_to_name(err));
+			}
+		}
+	}
 }
 
 /* ----------------- vprintf hook for the selected local node ----------------- */
@@ -1694,6 +1789,11 @@ void log_http_server_node_topology(const uint8_t mac[6],
 				s_nodes[i].parent_rssi = topology->parent_rssi;
 				s_nodes[i].child_count = topology->child_count;
 				s_nodes[i].capabilities = topology->capabilities;
+				s_nodes[i].v1_ok_age_ms = topology->v1_ok_age_ms;
+				s_nodes[i].v2_ack_age_ms = topology->v2_ack_age_ms;
+				s_nodes[i].last_send_err = topology->last_send_err;
+				s_nodes[i].recovery_phase = topology->recovery_phase;
+				s_nodes[i].log_stream_enabled = topology->log_stream_enabled != 0;
 				s_nodes[i].uptime_valid = true;
 				s_nodes[i].uptime_s = topology->uptime_s;
 				s_nodes[i].uptime_seen_ms = now;
@@ -1716,6 +1816,11 @@ void log_http_server_node_topology(const uint8_t mac[6],
 			ent->parent_rssi = topology->parent_rssi;
 			ent->child_count = topology->child_count;
 			ent->capabilities = topology->capabilities;
+			ent->v1_ok_age_ms = topology->v1_ok_age_ms;
+			ent->v2_ack_age_ms = topology->v2_ack_age_ms;
+			ent->last_send_err = topology->last_send_err;
+			ent->recovery_phase = topology->recovery_phase;
+			ent->log_stream_enabled = topology->log_stream_enabled != 0;
 			ent->uptime_valid = true;
 			ent->uptime_s = topology->uptime_s;
 			ent->uptime_seen_ms = now;
@@ -1781,6 +1886,7 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 		}
 	}
 	portEXIT_CRITICAL(&s_taskmon_lock);
+	ui_stream_notify();
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -1790,9 +1896,19 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 	selection_snapshot(selected_mac, NULL, 0);
 	if (!mac_eq(mac, selected_mac)) return;
 
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		if (s_stream_active && mac_eq(mac, s_stream_mac)) {
+			s_stream_ready = true;
+			s_stream_last_line_ms = ms_now();
+		}
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
 	if (!taskmon_ingest_line(mac, tag, line)) {
 		log_buffer_append_line(line, strnlen(line, 2048));
 	}
+	mesh_stream_mark_changed();
 }
 
 void log_http_server_remote_ota_status(const uint8_t mac[6],
@@ -2249,16 +2365,28 @@ static esp_err_t http_log_stream_get(httpd_req_t *req)
 	}
 
 	uint32_t from = http_log_stream_cursor(req);
+	char sid[STREAM_SID_MAX];
+	stream_sid_from_req(req, sid, sizeof(sid));
 
-	if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-		return http_log_stream_busy(req);
-	}
+	for (int attempt = 0; attempt < 6; attempt++) {
+		if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			return http_log_stream_busy(req);
+		}
 
-	bool busy = (s_log_stream.req != NULL);
-	xSemaphoreGive(s_log_stream_mutex);
+		bool busy = (s_log_stream.req != NULL);
+		if (!busy) {
+			xSemaphoreGive(s_log_stream_mutex);
+			break;
+		}
 
-	if (busy) {
-		return http_log_stream_busy(req);
+		s_log_stream.client_close = true;
+		xSemaphoreGive(s_log_stream_mutex);
+		log_stream_notify();
+		vTaskDelay(pdMS_TO_TICKS(40));
+
+		if (attempt == 5) {
+			return http_log_stream_busy(req);
+		}
 	}
 
 	httpd_req_t *async_req = NULL;
@@ -2274,6 +2402,10 @@ static esp_err_t http_log_stream_get(httpd_req_t *req)
 
 	if (s_log_stream.req != NULL) {
 		xSemaphoreGive(s_log_stream_mutex);
+		httpd_resp_set_status(async_req, "503 Stream Busy");
+		httpd_resp_set_type(async_req, "text/plain");
+		httpd_resp_set_hdr(async_req, "Cache-Control", "no-store");
+		(void)httpd_resp_send(async_req, "log stream busy\n", HTTPD_RESP_USE_STRLEN);
 		log_stream_complete(async_req);
 		return ESP_OK;
 	}
@@ -2281,6 +2413,8 @@ static esp_err_t http_log_stream_get(httpd_req_t *req)
 	s_log_stream.req = async_req;
 	s_log_stream.cursor = from;
 	s_log_stream.headers_sent = false;
+	s_log_stream.client_close = false;
+	copy_packet_text(s_log_stream.sid, sizeof(s_log_stream.sid), sid, sizeof(sid));
 	xSemaphoreGive(s_log_stream_mutex);
 
 	log_stream_notify();
@@ -2545,6 +2679,25 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	bool link_seen = route_seen || fresh_telemetry;
 	bool offline = remote && !link_seen && stale &&
 		(!has_route_history || (uint32_t)route_age_ms > NODE_OFFLINE_MS);
+	const char *stream_state = remote ? "idle" : "local";
+	long log_ctrl_age_ms = -1;
+	long remote_line_age_ms = -1;
+
+	if (remote) {
+		portENTER_CRITICAL(&s_selection_lock);
+		{
+			if (s_stream_active && mac_eq(mac, s_stream_mac)) {
+				stream_state = s_stream_ready ? "ready" :
+				               (route_seen || fresh_telemetry) ? "waiting_log" :
+				               "waiting_route";
+				log_ctrl_age_ms = s_last_rearm_ms ?
+					(long)(uint32_t)(now - s_last_rearm_ms) : -1;
+				remote_line_age_ms = s_stream_last_line_ms ?
+					(long)(uint32_t)(now - s_stream_last_line_ms) : -1;
+			}
+		}
+		portEXIT_CRITICAL(&s_selection_lock);
+	}
 
 	const char *node_source = "selected";
 	if (!remote) {
@@ -2569,9 +2722,15 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	                  route_age_ms,
 	                  nodeinfo_age_ms);
 	pos = append_json_string(out, cap, pos, node_source);
+	pos = append_fmt(out, cap, pos,
+	                  ",\"stream_state\":");
+	pos = append_json_string(out, cap, pos, stream_state);
 	return append_fmt(out, cap, pos,
-	                  ",\"last_send_err\":0,\"recovery_phase\":%s,"
+	                  ",\"log_ctrl_age_ms\":%ld,\"remote_line_age_ms\":%ld,"
+	                  "\"last_send_err\":0,\"recovery_phase\":%s,"
 	                  "\"stale\":%s,\"offline\":%s",
+	                  log_ctrl_age_ms,
+	                  remote_line_age_ms,
 	                  remote ? "\"unknown\"" : "\"ok\"",
 	                  stale ? "true" : "false",
 	                  offline ? "true" : "false");
@@ -2586,7 +2745,10 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 		                  ",\"topology_valid\":false,\"topology_age_ms\":-1,"
 		                  "\"parent_mac\":\"\",\"root_mac\":\"\","
 		                  "\"layer\":0,\"max_layer\":0,\"parent_rssi\":-127,"
-		                  "\"child_count\":0,\"capabilities\":0");
+		                  "\"child_count\":0,\"capabilities\":0,"
+		                  "\"v1_ok_age_ms\":-1,\"v2_ack_age_ms\":-1,"
+		                  "\"last_remote_send_err\":0,\"remote_recovery_phase\":0,"
+		                  "\"remote_log_stream_enabled\":false");
 	}
 
 	long age_ms = (long)(uint32_t)(now - node->topology_seen_ms);
@@ -2595,7 +2757,10 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	                  "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                  "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                  "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
-	                  "\"child_count\":%u,\"capabilities\":%lu",
+	                  "\"child_count\":%u,\"capabilities\":%lu,"
+	                  "\"v1_ok_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
+	                  "\"last_remote_send_err\":%ld,\"remote_recovery_phase\":%u,"
+	                  "\"remote_log_stream_enabled\":%s",
 	                  age_ms,
 	                  node->parent_mac[0], node->parent_mac[1], node->parent_mac[2],
 	                  node->parent_mac[3], node->parent_mac[4], node->parent_mac[5],
@@ -2605,7 +2770,12 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	                  (unsigned)node->max_layer,
 	                  (int)node->parent_rssi,
 	                  (unsigned)node->child_count,
-	                  (unsigned long)node->capabilities);
+	                  (unsigned long)node->capabilities,
+	                  node->v1_ok_age_ms == UINT32_MAX ? -1L : (long)node->v1_ok_age_ms,
+	                  node->v2_ack_age_ms == UINT32_MAX ? -1L : (long)node->v2_ack_age_ms,
+	                  (long)node->last_send_err,
+	                  (unsigned)node->recovery_phase,
+	                  node->log_stream_enabled ? "true" : "false");
 }
 
 static size_t append_nodes_json(char *out, size_t cap, size_t pos)
@@ -4131,6 +4301,132 @@ static bool query_bool_value(const char *q, const char *key)
 	       strcmp(v, "on") == 0;
 }
 
+static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz)
+{
+	char q[96] = {0};
+	char raw[64] = {0};
+
+	if (!sid || sid_sz == 0) {
+		return;
+	}
+
+	copy_packet_text(sid, sid_sz, "nosid", 5);
+	if (!req || httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+	    httpd_query_key_value(q, "sid", raw, sizeof(raw)) != ESP_OK) {
+		return;
+	}
+
+	size_t out = 0;
+	for (size_t i = 0; raw[i] != '\0' && out + 1 < sid_sz; i++) {
+		unsigned char c = (unsigned char)raw[i];
+		if (isalnum(c) || c == '_' || c == '-') {
+			sid[out++] = (char)c;
+		}
+	}
+	sid[out] = '\0';
+	if (out == 0) {
+		copy_packet_text(sid, sid_sz, "nosid", 5);
+	}
+}
+
+static size_t append_health_json(char *out, size_t cap, size_t pos)
+{
+	bool log_active = false;
+	bool ui_active = false;
+	bool mesh_active = false;
+	bool remote_stream = false;
+	bool remote_ready = false;
+	uint32_t now = ms_now();
+	uint32_t selected_ms = 0;
+	uint32_t last_line_ms = 0;
+	uint32_t last_rearm_ms = 0;
+
+	if (s_log_stream_mutex &&
+	    xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		log_active = s_log_stream.req != NULL;
+		xSemaphoreGive(s_log_stream_mutex);
+	}
+	if (s_ui_stream_mutex &&
+	    xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		ui_active = s_ui_stream.req != NULL;
+		xSemaphoreGive(s_ui_stream_mutex);
+	}
+	if (s_mesh_stream_mutex &&
+	    xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		mesh_active = s_mesh_stream.req != NULL;
+		xSemaphoreGive(s_mesh_stream_mutex);
+	}
+
+	portENTER_CRITICAL(&s_selection_lock);
+	{
+		remote_stream = s_stream_active && !mac_eq(s_stream_mac, s_local_mac);
+		remote_ready = s_stream_ready;
+		selected_ms = s_stream_selected_ms;
+		last_line_ms = s_stream_last_line_ms;
+		last_rearm_ms = s_last_rearm_ms;
+	}
+	portEXIT_CRITICAL(&s_selection_lock);
+
+	long selected_age = selected_ms ? (long)(uint32_t)(now - selected_ms) : -1;
+	long line_age = last_line_ms ? (long)(uint32_t)(now - last_line_ms) : -1;
+	long rearm_age = last_rearm_ms ? (long)(uint32_t)(now - last_rearm_ms) : -1;
+	size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+	pos = append_fmt(out, cap, pos,
+	                 "{\"log_sse\":%s,\"ui_sse\":%s,\"mesh_sse\":%s,"
+	                 "\"remote_stream\":%s,\"remote_stream_ready\":%s,"
+	                 "\"remote_selected_age_ms\":%ld,\"remote_line_age_ms\":%ld,"
+	                 "\"log_ctrl_age_ms\":%ld,"
+	                 "\"heap_internal_free\":%lu,\"heap_internal_min\":%lu,"
+	                 "\"heap_psram_free\":%lu,\"heap_psram_min\":%lu}",
+	                 log_active ? "true" : "false",
+	                 ui_active ? "true" : "false",
+	                 mesh_active ? "true" : "false",
+	                 remote_stream ? "true" : "false",
+	                 remote_ready ? "true" : "false",
+	                 selected_age,
+	                 line_age,
+	                 rearm_age,
+	                 (unsigned long)internal_free,
+	                 (unsigned long)internal_min,
+	                 (unsigned long)psram_free,
+	                 (unsigned long)psram_min);
+	return pos;
+}
+
+static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
+                                            const uint8_t mac[6],
+                                            bool include_tasks,
+                                            bool include_ota)
+{
+	pos = append_fmt(out, cap, pos, "{\"nodes\":");
+	pos = append_nodes_json(out, cap, pos);
+	pos = append_fmt(out, cap, pos, ",\"tasks\":");
+	if (include_tasks) {
+		pos = append_tasks_json_for_mac(out, cap, pos, mac);
+	} else {
+		pos = append_fmt(out, cap, pos, "null");
+	}
+
+	pos = append_fmt(out, cap, pos, ",\"ota\":");
+	if (include_ota) {
+		if (mac_eq(mac, s_local_mac)) {
+			pos = append_local_ota_json(out, cap, pos);
+		} else {
+			pos = append_remote_ota_json_for_mac(out, cap, pos, mac);
+		}
+	} else {
+		pos = append_fmt(out, cap, pos, "null");
+	}
+
+	pos = append_fmt(out, cap, pos, ",\"health\":");
+	pos = append_health_json(out, cap, pos);
+	return append_fmt(out, cap, pos, "}");
+}
+
 static esp_err_t http_ui_status_get(httpd_req_t *req)
 {
 	uint8_t mac[6];
@@ -4167,27 +4463,8 @@ static esp_err_t http_ui_status_get(httpd_req_t *req)
 
 	size_t pos = 0;
 	out[0] = '\0';
-
-	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "{\"nodes\":");
-	pos = append_nodes_json(out, UI_STATUS_JSON_MAX, pos);
-	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, ",\"tasks\":");
-	if (include_tasks) {
-		pos = append_tasks_json_for_mac(out, UI_STATUS_JSON_MAX, pos, mac);
-	} else {
-		pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "null");
-	}
-
-	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, ",\"ota\":");
-	if (include_ota) {
-		if (mac_eq(mac, s_local_mac)) {
-			pos = append_local_ota_json(out, UI_STATUS_JSON_MAX, pos);
-		} else {
-			pos = append_remote_ota_json_for_mac(out, UI_STATUS_JSON_MAX, pos, mac);
-		}
-	} else {
-		pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "null");
-	}
-	pos = append_fmt(out, UI_STATUS_JSON_MAX, pos, "}");
+	pos = append_ui_status_json_for_mac(out, UI_STATUS_JSON_MAX, pos, mac,
+	                                    include_tasks, include_ota);
 
 	if (pos >= UI_STATUS_JSON_MAX - 2) {
 		free(out);
@@ -4234,6 +4511,7 @@ static esp_err_t http_mesh_status_get(httpd_req_t *req)
 	return err;
 }
 
+#if LOG_HTTP_ENABLE_MESH_STREAM
 static esp_err_t mesh_stream_send_preamble(httpd_req_t *req)
 {
 	static const char preamble[] = ": node0 mesh stream\n\n";
@@ -4281,6 +4559,7 @@ static esp_err_t mesh_stream_send_heartbeat(httpd_req_t *req)
 	static const char heartbeat[] = ": ping\n\n";
 	return httpd_resp_send_chunk(req, heartbeat, sizeof(heartbeat) - 1);
 }
+#endif
 
 static void mesh_stream_complete(httpd_req_t *req)
 {
@@ -4313,6 +4592,7 @@ static void mesh_stream_request_close(void)
 	}
 }
 
+#if LOG_HTTP_ENABLE_MESH_STREAM
 static void mesh_stream_task(void *arg)
 {
 	(void)arg;
@@ -4392,6 +4672,7 @@ static void mesh_stream_task(void *arg)
 		mesh_stream_complete(req);
 	}
 }
+#endif
 
 static esp_err_t http_mesh_stream_busy(httpd_req_t *req)
 {
@@ -4443,6 +4724,241 @@ static esp_err_t http_mesh_stream_get(httpd_req_t *req)
 	return ESP_OK;
 }
 
+static esp_err_t ui_stream_send_preamble(httpd_req_t *req)
+{
+	static const char preamble[] = ": node0 ui stream\n\n";
+	httpd_resp_set_type(req, "text/event-stream");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_hdr(req, "Connection", "keep-alive");
+	return httpd_resp_send_chunk(req, preamble, sizeof(preamble) - 1);
+}
+
+static esp_err_t ui_stream_send_heartbeat(httpd_req_t *req)
+{
+	static const char heartbeat[] = ": ping\n\n";
+	return httpd_resp_send_chunk(req, heartbeat, sizeof(heartbeat) - 1);
+}
+
+static esp_err_t ui_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
+{
+	uint8_t mac[6];
+	selection_snapshot(mac, NULL, 0);
+
+	char *json = (char *)malloc(UI_STATUS_JSON_MAX);
+	if (!json) {
+		return ESP_ERR_NO_MEM;
+	}
+
+	size_t pos = append_ui_status_json_for_mac(json, UI_STATUS_JSON_MAX, 0, mac,
+	                                           true, true);
+	if (pos >= UI_STATUS_JSON_MAX - 2) {
+		free(json);
+		return ESP_ERR_NO_MEM;
+	}
+
+	char header[64];
+	int n = snprintf(header, sizeof(header), "event: ui\nid: %lu\ndata: ",
+	                 (unsigned long)seq);
+	if (n < 0) {
+		free(json);
+		return ESP_FAIL;
+	}
+
+	esp_err_t err = httpd_resp_send_chunk(req, header, (size_t)n);
+	if (err == ESP_OK) {
+		err = httpd_resp_send_chunk(req, json, pos);
+	}
+	if (err == ESP_OK) {
+		static const char tail[] = "\n\n";
+		err = httpd_resp_send_chunk(req, tail, sizeof(tail) - 1);
+	}
+
+	free(json);
+	return err;
+}
+
+static void ui_stream_complete(httpd_req_t *req)
+{
+	if (!req) {
+		return;
+	}
+	esp_err_t err = httpd_req_async_handler_complete(req);
+	if (err != ESP_OK) {
+		ESP_LOGD(TAG, "ui stream async complete failed: %s", esp_err_to_name(err));
+	}
+}
+
+static void ui_stream_request_close(void)
+{
+	if (!s_ui_stream_mutex || !s_ui_stream_task) {
+		return;
+	}
+
+	bool notify = false;
+	if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+		if (s_ui_stream.req) {
+			s_ui_stream.client_close = true;
+			notify = true;
+		}
+		xSemaphoreGive(s_ui_stream_mutex);
+	}
+
+	if (notify) {
+		xTaskNotifyGive(s_ui_stream_task);
+	}
+}
+
+static void ui_stream_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		httpd_req_t *req = NULL;
+		bool headers_sent = false;
+		bool client_close = false;
+		uint32_t last_sent_seq = 0;
+		uint32_t current_seq = s_ui_stream_seq;
+
+		if (!s_ui_stream_mutex ||
+		    xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_STREAM_HEARTBEAT_MS));
+			continue;
+		}
+		req = s_ui_stream.req;
+		headers_sent = s_ui_stream.headers_sent;
+		client_close = s_ui_stream.client_close;
+		last_sent_seq = s_ui_stream.seq;
+		current_seq = s_ui_stream_seq;
+		xSemaphoreGive(s_ui_stream_mutex);
+
+		if (!req) {
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+			continue;
+		}
+
+		if (client_close) {
+			if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_ui_stream.req == req) {
+					memset(&s_ui_stream, 0, sizeof(s_ui_stream));
+				}
+				xSemaphoreGive(s_ui_stream_mutex);
+			}
+			ui_stream_complete(req);
+			continue;
+		}
+
+		esp_err_t err = ESP_OK;
+		if (!headers_sent) {
+			err = ui_stream_send_preamble(req);
+			if (err == ESP_OK &&
+			    xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_ui_stream.req == req) {
+					s_ui_stream.headers_sent = true;
+				}
+				xSemaphoreGive(s_ui_stream_mutex);
+			}
+		}
+
+		bool sent_snapshot = false;
+		if (err == ESP_OK && (!headers_sent || last_sent_seq != current_seq)) {
+			err = ui_stream_send_snapshot(req, current_seq);
+			sent_snapshot = (err == ESP_OK);
+		} else if (err == ESP_OK) {
+			err = ui_stream_send_heartbeat(req);
+		}
+
+		if (err == ESP_OK) {
+			if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_ui_stream.req == req && sent_snapshot) {
+					s_ui_stream.seq = current_seq;
+				}
+				xSemaphoreGive(s_ui_stream_mutex);
+			}
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_STREAM_HEARTBEAT_MS));
+			continue;
+		}
+
+		if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+			if (s_ui_stream.req == req) {
+				memset(&s_ui_stream, 0, sizeof(s_ui_stream));
+			}
+			xSemaphoreGive(s_ui_stream_mutex);
+		}
+		ui_stream_complete(req);
+	}
+}
+
+static esp_err_t http_ui_stream_busy(httpd_req_t *req)
+{
+	httpd_resp_set_status(req, "503 Stream Busy");
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, "ui stream busy\n", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_ui_stream_get(httpd_req_t *req)
+{
+	if (!s_ui_stream_mutex || !s_ui_stream_task) {
+		httpd_resp_set_status(req, "503 Stream Unavailable");
+		httpd_resp_set_type(req, "text/plain");
+		httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+		return httpd_resp_send(req, "ui stream unavailable\n", HTTPD_RESP_USE_STRLEN);
+	}
+
+	char sid[STREAM_SID_MAX];
+	stream_sid_from_req(req, sid, sizeof(sid));
+
+	for (int attempt = 0; attempt < 6; attempt++) {
+		if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			return http_ui_stream_busy(req);
+		}
+
+		bool busy = (s_ui_stream.req != NULL);
+		if (!busy) {
+			xSemaphoreGive(s_ui_stream_mutex);
+			break;
+		}
+
+		s_ui_stream.client_close = true;
+		xSemaphoreGive(s_ui_stream_mutex);
+		ui_stream_notify();
+		vTaskDelay(pdMS_TO_TICKS(40));
+
+		if (attempt == 5) {
+			return http_ui_stream_busy(req);
+		}
+	}
+
+	httpd_req_t *async_req = NULL;
+	esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+		ui_stream_complete(async_req);
+		return ESP_FAIL;
+	}
+	if (s_ui_stream.req != NULL) {
+		xSemaphoreGive(s_ui_stream_mutex);
+		httpd_resp_set_status(async_req, "503 Stream Busy");
+		httpd_resp_set_type(async_req, "text/plain");
+		httpd_resp_set_hdr(async_req, "Cache-Control", "no-store");
+		(void)httpd_resp_send(async_req, "ui stream busy\n", HTTPD_RESP_USE_STRLEN);
+		ui_stream_complete(async_req);
+		return ESP_OK;
+	}
+	s_ui_stream.req = async_req;
+	s_ui_stream.seq = 0;
+	s_ui_stream.headers_sent = false;
+	s_ui_stream.client_close = false;
+	copy_packet_text(s_ui_stream.sid, sizeof(s_ui_stream.sid), sid, sizeof(sid));
+	xSemaphoreGive(s_ui_stream_mutex);
+
+	ui_stream_notify();
+	return ESP_OK;
+}
+
 static esp_err_t http_stream_close_post(httpd_req_t *req)
 {
 	char q[32] = {0};
@@ -4452,11 +4968,15 @@ static esp_err_t http_stream_close_post(httpd_req_t *req)
 		(void)httpd_query_key_value(q, "which", which, sizeof(which));
 	}
 
-	if (strcmp(which, "mesh") != 0) {
+	bool close_all = strcmp(which, "all") == 0;
+	if (close_all || strcmp(which, "log") == 0) {
 		log_stream_request_close();
 	}
-	if (strcmp(which, "log") != 0) {
+	if (close_all || strcmp(which, "mesh") == 0) {
 		mesh_stream_request_close();
+	}
+	if (close_all || strcmp(which, "ui") == 0) {
+		ui_stream_request_close();
 	}
 
 	httpd_resp_set_type(req, "text/plain");
@@ -4550,6 +5070,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
+		"const pageSid=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).replace(/[^a-zA-Z0-9_-]/g,'');\n"
 		"let follow=true;\n"
 		"let tasksVisible=false;\n"
 		"let meshVisible=false;\n"
@@ -4570,17 +5091,20 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let tasksBusyReq=false;\n"
 		"let otaStatusBusy=false;\n"
 		"let controlPollBusy=false;\n"
+		"let activeFetch=false;\n"
 		"let logStream=null;\n"
 		"let meshStream=null;\n"
+		"let uiStream=null;\n"
 		"let logStreamReady=false;\n"
 		"let logStreamErrors=0;\n"
 		"let meshStreamErrors=0;\n"
+		"let uiStreamErrors=0;\n"
 		"let pollFallbackUntil=0;\n"
 		"let reselectBusy=false;\n"
 		"let selectionBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true)}}\n"
-		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible)startMeshStream();else stopMeshStream(true)}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true);startUiStream()}}\n"
+		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible){loadMeshStatus('poll');startUiStream()}else document.getElementById('meshState').textContent='off'}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
@@ -4599,11 +5123,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(window.AbortController){const c=new AbortController();opt.signal=c.signal;timer=setTimeout(()=>c.abort(),ms);}\n"
 		"  try{return await fetch(url,opt);}finally{if(timer)clearTimeout(timer);}\n"
 		"}\n"
+		"async function controlFetch(url,ms){const start=Date.now();while(activeFetch){if(Date.now()-start>Math.max(ms||0,3000))throw new Error('fetch busy');await new Promise(r=>setTimeout(r,50));}activeFetch=true;try{return await fetchTimeout(url,ms)}finally{activeFetch=false}}\n"
 		"function setLogMode(cls,text){const el=document.getElementById('logMode');if(el){el.className='logMode '+cls;el.title='log transport: '+(text||'off')}}\n"
 		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(follow)el.scrollTop=el.scrollHeight}\n"
-		"function notifyStreamClose(which){try{const url='/stream/close?which='+(which||'all');if(navigator.sendBeacon){navigator.sendBeacon(url,'');return;}fetch(url,{method:'POST',cache:'no-store',keepalive:true}).catch(()=>{})}catch(e){}}\n"
+		"function notifyStreamClose(which){try{const url='/stream/close?which='+(which||'all')+'&sid='+encodeURIComponent(pageSid);if(navigator.sendBeacon){navigator.sendBeacon(url,'');return;}fetch(url,{method:'POST',cache:'no-store',keepalive:true}).catch(()=>{})}catch(e){}}\n"
 		"function stopLogStream(notify){if(notify)notifyStreamClose('log');if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
 		"function stopMeshStream(notify){if(notify)notifyStreamClose('mesh');if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
+		"function stopUiStream(notify){if(notify)notifyStreamClose('ui');if(uiStream){uiStream.close();uiStream=null;}}\n"
 		"function otaSlotName(label){if(label==='ota_0')return 'A';if(label==='ota_1')return 'B';return '?'}\n"
 		"function otaSlotClassFor(label){if(label==='ota_0')return 'otaSlotA';if(label==='ota_1')return 'otaSlotB';return 'otaSlotUnknown'}\n"
 		"function setOtaSlot(text,cls){otaSlotText=text||'A/B ?';otaSlotClass=cls||'otaSlotUnknown';const el=document.getElementById('otaSlot');if(el){el.textContent=otaSlotText;el.className='otaSlot '+otaSlotClass}}\n"
@@ -4612,7 +5138,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function rememberedNodeTag(){try{return localStorage.getItem('logSelectedTag')||'node'}catch(e){return 'node'}}\n"
 		"function rememberNode(mac,tag){try{if(mac)localStorage.setItem('logSelectedMac',mac);if(tag)localStorage.setItem('logSelectedTag',tag)}catch(e){}}\n"
 		"function nodeInList(nodes,mac){return !!(mac&&(nodes||[]).some(n=>n.mac===mac))}\n"
-		"async function reselectNode(mac){if(!mac||reselectBusy)return;reselectBusy=true;try{await fetchTimeout('/select?mac='+encodeURIComponent(mac),6000);lastNodes='';await loadUiStatus();}catch(e){}finally{reselectBusy=false}}\n"
+		"async function reselectNode(mac){if(!mac||reselectBusy)return;reselectBusy=true;try{await controlFetch('/select?mac='+encodeURIComponent(mac),6000);lastNodes='';await loadUiStatus();}catch(e){}finally{reselectBusy=false}}\n"
 		"function applyNodes(j,raw){\n"
 		"  if(!j)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
@@ -4630,8 +5156,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':n.stale?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
 		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
 		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
-		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await fetchTimeout('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
-		"function startMeshStream(){if(!meshVisible||meshStream)return;if(!window.EventSource){loadMeshStatus('poll');return;}document.getElementById('meshState').textContent='connect';try{meshStream=new EventSource('/mesh/stream')}catch(e){meshStream=null;loadMeshStatus('poll');return;}meshStream.addEventListener('mesh',e=>{try{meshStreamErrors=0;applyMeshStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});meshStream.onopen=()=>{meshStreamErrors=0;document.getElementById('meshState').textContent='live'};meshStream.onerror=()=>{meshStreamErrors++;document.getElementById('meshState').textContent='retry';stopMeshStream();const d=Math.min(30000,3000*meshStreamErrors);if(meshVisible)setTimeout(()=>{loadMeshStatus('poll');startMeshStream()},d)}}\n"
+		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
+		"function applyUiStatus(j,mode){if(!j)return;applyNodes(j.nodes,JSON.stringify(j.nodes));if(tasksVisible&&j.tasks)applyTasks(j.tasks,selectedMac||'',JSON.stringify(j.tasks));if(tasksVisible&&j.ota)applyOta(j.ota);if(meshVisible&&j.nodes)applyMeshStatus(j.nodes,mode||'live')}\n"
+		"function startUiStream(){if(uiStream||otaBusy)return;if(!window.EventSource){loadUiStatus();return;}try{uiStream=new EventSource('/ui/stream?sid='+encodeURIComponent(pageSid))}catch(e){uiStream=null;loadUiStatus();return;}uiStream.addEventListener('ui',e=>{try{uiStreamErrors=0;applyUiStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});uiStream.onopen=()=>{uiStreamErrors=0;if(meshVisible)document.getElementById('meshState').textContent='live'};uiStream.onerror=()=>{uiStreamErrors++;stopUiStream(false);if(meshVisible)document.getElementById('meshState').textContent='retry';const d=Math.min(30000,2000*uiStreamErrors);setTimeout(()=>{loadUiStatus();if(!otaBusy)startUiStream()},d)}}\n"
+		"function startMeshStream(){startUiStream();if(meshVisible)loadMeshStatus('poll')}\n"
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
@@ -4654,7 +5182,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(otaBusy||logStream)return;\n"
 		"  if(!window.EventSource){setLogMode('streamPoll','poll');return;}\n"
 		"  setLogMode('streamRetry','stream');\n"
-		"  try{logStream=new EventSource('/log/stream?from='+cursor);}catch(e){setLogMode('streamPoll','poll');pollFallbackUntil=Date.now()+15000;return;}\n"
+		"  try{logStream=new EventSource('/log/stream?from='+cursor+'&sid='+encodeURIComponent(pageSid));}catch(e){setLogMode('streamPoll','poll');pollFallbackUntil=Date.now()+15000;return;}\n"
 		"  logStream.onopen=()=>{logStreamReady=true;logStreamErrors=0;setLogMode('streamLive','stream');document.getElementById('st').textContent='LIVE'};\n"
 		"  logStream.onmessage=(e)=>{if(e.lastEventId)cursor=parseInt(e.lastEventId)||cursor;appendLogText((e.data||'')+'\\n',false);document.getElementById('st').textContent='LIVE'};\n"
 		"  logStream.addEventListener('reset',(e)=>{if(e.lastEventId)cursor=parseInt(e.lastEventId)||0;appendLogText('',true);setLogMode('streamLive','stream')});\n"
@@ -4698,7 +5226,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(otaBusy||!tasksVisible||otaStatusBusy)return;\n"
 		"  const local=isLocalSelected();\n"
 		"  otaStatusBusy=true;\n"
-		"  try{const url=local?'/ota/status':'/ota/remote/status?mac='+encodeURIComponent(selectedMac||'');const r=await fetchTimeout(url,6000);applyOta(await r.json());}catch(e){otaEnabled=false;otaSupported=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
+		"  try{const url=local?'/ota/status':'/ota/remote/status?mac='+encodeURIComponent(selectedMac||'');const r=await controlFetch(url,6000);applyOta(await r.json());}catch(e){otaEnabled=false;otaSupported=false;otaStatusText='OTA status error';setOtaSlot('A/B ?','otaSlotUnknown');updateOtaUi();}finally{otaStatusBusy=false;}\n"
 		"}\n"
 		"async function startOta(){\n"
 		"  if(otaBusy)return;\n"
@@ -4715,7 +5243,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const phrase=prompt('Type '+confirmPhrase+' to update '+target+' and reboot.');\n"
 		"  if(phrase!==confirmPhrase){alert('OTA cancelled.');return;}\n"
 		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to '+target+' and reboot?'))return;\n"
-		"  notifyStreamClose('all');stopLogStream();stopMeshStream();\n"
+		"  notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
 		"  xhr.open('POST',local?'/ota':'/ota/remote?mac='+encodeURIComponent(selectedMac||''));\n"
@@ -4723,8 +5251,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
 		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
 		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus((!local&&pct>=100)?'OTA relaying to mesh...':'OTA uploading '+pct+'%',true,pct)}};\n"
-		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startLogStream()}};\n"
-		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startLogStream()};\n"
+		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startUiStream();startLogStream()}};\n"
+		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startUiStream();startLogStream()};\n"
 		"  xhr.send(file);\n"
 		"}\n"
 		"async function startReboot(){\n"
@@ -4739,10 +5267,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const phrase=prompt('Type '+confirmPhrase+' to reboot '+target+'.');\n"
 		"  if(phrase!==confirmPhrase){alert('Reboot cancelled.');return;}\n"
 		"  if(!confirm('Reboot '+target+' now?'))return;\n"
-		"  notifyStreamClose('all');stopLogStream();stopMeshStream();\n"
+		"  notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream();\n"
 		"  rebootBusy=true;otaBusy=true;otaSetStatus('rebooting '+target+'...',false,0);\n"
 		"  const url=local?'/reboot':'/reboot/remote?mac='+encodeURIComponent(selectedMac||'');\n"
-		"  try{const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||('rebooting '+target),false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;rebootBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startLogStream();},3000)}}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startLogStream()}\n"
+		"  try{const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||('rebooting '+target),false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;rebootBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startUiStream();startLogStream()}\n"
 		"}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
@@ -4787,7 +5315,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  logBusy=true;\n"
 		"  try{\n"
 		"    setLogMode('streamPoll','poll');\n"
-		"    const r=await fetchTimeout('/log?from='+cursor,7000);\n"
+		"    const r=await controlFetch('/log?from='+cursor,7000);\n"
 		"    const next=r.headers.get('X-Log-Next');\n"
 		"    const reset=r.headers.get('X-Log-Reset');\n"
 		"    const t=await r.text();\n"
@@ -4802,7 +5330,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(document.activeElement===s) return;\n"
 		"  nodesBusy=true;\n"
 		"  try{\n"
-		"    const r=await fetchTimeout('/nodes',6000);\n"
+		"    const r=await controlFetch('/nodes',6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyNodes(JSON.parse(txt),txt);\n"
 		"  }catch(e){}finally{nodesBusy=false;}\n"
@@ -4819,37 +5347,38 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  stopLogStream(true);\n"
 		"  cursor=0;\n"
 		"  document.getElementById('log').innerHTML='';\n"
-		"  try{await fetchTimeout('/select?mac='+mac,6000);}catch(e){}\n"
+		"  try{await controlFetch('/select?mac='+mac,6000);}catch(e){}\n"
 		"  logStreamErrors=0;pollFallbackUntil=Date.now()+2500;await tick();setTimeout(()=>{pollFallbackUntil=0;startLogStream()},900);\n"
 		"  selectionBusy=false;lastNodes='';\n"
 		"  if(tasksVisible){loadTasks(true);loadOtaStatus();loadUiStatus(true)}\n"
 		"}\n"
 		"async function clearServer(){\n"
 		"  cursor=0;\n"
-		"  try{await fetchTimeout('/clear',6000);}catch(e){}\n"
+		"  try{await controlFetch('/clear',6000);}catch(e){}\n"
 		"  document.getElementById('log').innerHTML='';\n"
 		"  logStreamErrors=0;\n"
 		"}\n"
 		"async function loadTasks(fresh){\n"
 		"  if(!tasksVisible||otaBusy||tasksBusyReq) return;\n"
+		"  if(uiStream&&!fresh) return;\n"
 		"  tasksBusyReq=true;\n"
 		"  try{\n"
 		"    const mac=selectedMac||document.getElementById('nodeSel').value||'';\n"
 		"    let url='/tasks'+(mac?'?mac='+encodeURIComponent(mac):'');if(fresh)url+=(url.indexOf('?')>=0?'&':'?')+'fresh=1';\n"
-		"    const r=await fetchTimeout(url,6000);\n"
+		"    const r=await controlFetch(url,6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyTasks(JSON.parse(txt),mac,txt);\n"
 		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
 		"async function loadUiStatus(fresh){\n"
-		"  if(controlPollBusy||otaBusy||selectionBusy)return;\n"
+		"  if(controlPollBusy||otaBusy||selectionBusy||uiStream)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  if(document.activeElement===s)return;\n"
 		"  controlPollBusy=true;\n"
 		"  try{\n"
 		"    const mac=selectedMac||s.value||'';const detail=tasksVisible?'1':'0';\n"
 		"    const url='/ui/status?tasks='+detail+'&ota='+detail+(fresh?'&fresh=1':'')+(mac?'&mac='+encodeURIComponent(mac):'');\n"
-		"    const r=await fetchTimeout(url,7000);const txt=await r.text();const j=JSON.parse(txt);\n"
+		"    const r=await controlFetch(url,7000);const txt=await r.text();const j=JSON.parse(txt);\n"
 		"    applyNodes(j.nodes,JSON.stringify(j.nodes));\n"
 		"    if(tasksVisible){applyTasks(j.tasks,mac,JSON.stringify(j.tasks));applyOta(j.ota);}\n"
 		"  }catch(e){}finally{controlPollBusy=false;}\n"
@@ -4859,13 +5388,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
-		"window.addEventListener('pagehide',()=>{notifyStreamClose('all');stopLogStream();stopMeshStream()});\n"
+		"window.addEventListener('pagehide',()=>{notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream()});\n"
 		"selectedMac=rememberedNode()||selectedMac;\n"
 		"pollFallbackUntil=Date.now()+16000;\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
 		"setInterval(()=>loadTasks(false)," STR(TASKS_FAST_POLL_MS) ");\n"
 		"setInterval(controlPoll," STR(UI_CONTROL_POLL_MS) ");\n"
-		"loadUiStatus().finally(()=>setTimeout(tick,350));\n"
+		"loadUiStatus().finally(()=>{startUiStream();setTimeout(tick,350)});\n"
 		"</script>\n"
 		"</body></html>\n";
 
@@ -4908,6 +5437,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/ui/status",
 		.method		= HTTP_GET,
 		.handler	= http_ui_status_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ui_stream = {
+		.uri		= "/ui/stream",
+		.method		= HTTP_GET,
+		.handler	= http_ui_stream_get,
 		.user_ctx	= NULL
 	};
 
@@ -5005,6 +5541,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ui_status);
 	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ui_stream);
+	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_mesh_status);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_mesh_stream);
@@ -5071,6 +5609,7 @@ esp_err_t log_http_server_init(void)
 		s_log_stream_mutex = NULL;
 	}
 
+#if LOG_HTTP_ENABLE_MESH_STREAM
 	s_mesh_stream_mutex = xSemaphoreCreateMutex();
 	if (!s_mesh_stream_mutex) {
 		ESP_LOGW(TAG, "mesh stream mutex allocation failed; /mesh/stream disabled");
@@ -5080,6 +5619,27 @@ esp_err_t log_http_server_init(void)
 		s_mesh_stream_task = NULL;
 		vSemaphoreDelete(s_mesh_stream_mutex);
 		s_mesh_stream_mutex = NULL;
+	}
+#else
+	ESP_LOGI(TAG, "/mesh/stream debug task disabled; mesh UI uses /ui/stream");
+#endif
+
+	s_ui_stream_mutex = xSemaphoreCreateMutex();
+	if (!s_ui_stream_mutex) {
+		ESP_LOGW(TAG, "ui stream mutex allocation failed; /ui/stream disabled");
+	} else if (xTaskCreate(ui_stream_task, "ui_stream", UI_STREAM_TASK_STACK,
+	                       NULL, 4, &s_ui_stream_task) != pdPASS) {
+		ESP_LOGW(TAG, "ui stream task allocation failed; /ui/stream disabled");
+		s_ui_stream_task = NULL;
+		vSemaphoreDelete(s_ui_stream_mutex);
+		s_ui_stream_mutex = NULL;
+	}
+
+	if (!s_stream_lease_task &&
+	    xTaskCreate(stream_lease_task, "log_lease", 3072, NULL, 4,
+	                &s_stream_lease_task) != pdPASS) {
+		ESP_LOGW(TAG, "log lease task allocation failed; remote log retry disabled");
+		s_stream_lease_task = NULL;
 	}
 
 	ESP_LOGI(TAG, "log_http_server_init: vprintf hook installed");
@@ -5094,7 +5654,7 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
-	config.httpd.max_uri_handlers = 17;
+	config.httpd.max_uri_handlers = 18;
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;

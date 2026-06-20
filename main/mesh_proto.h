@@ -334,6 +334,12 @@ typedef struct __attribute__((packed)) {
 	uint32_t	gap_count;
 	uint32_t	lost_count;
 	uint32_t	replay_count;
+	uint32_t	v1_ok_age_ms;
+	uint32_t	v2_ack_age_ms;
+	int32_t		last_send_err;
+	uint8_t		recovery_phase;
+	uint8_t		log_stream_enabled;
+	uint16_t	diag_flags;
 } mesh_v2_topology_payload_t;
 
 typedef struct __attribute__((packed)) {
