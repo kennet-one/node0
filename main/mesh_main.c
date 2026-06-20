@@ -507,7 +507,7 @@ static void mesh_rx_task(void *arg)
 			if (h->type == MESH_OTA_TYPE_STATUS) {
 				if (data.size >= sizeof(mesh_ota_status_packet_t)) {
 					const mesh_ota_status_packet_t *p = (const mesh_ota_status_packet_t *)rx_buf;
-					log_http_server_remote_ota_status(p->h.src_mac, p);
+					log_http_server_remote_ota_status(p->h.src_mac, p, data.size);
 				}
 				continue;
 			}

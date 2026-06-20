@@ -193,6 +193,10 @@ typedef struct {
 	int32_t last_send_err;
 	uint8_t recovery_phase;
 	bool log_stream_enabled;
+	char ota_running_label[MESH_OTA_SLOT_LABEL_MAX];
+	char ota_update_label[MESH_OTA_SLOT_LABEL_MAX];
+	uint32_t ota_running_size;
+	uint32_t ota_update_size;
 	bool uptime_valid;
 	uint32_t uptime_s;
 	uint32_t uptime_seen_ms;
@@ -267,6 +271,11 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 static size_t append_local_ota_json(char *out, size_t cap, size_t pos);
 static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
                                              const uint8_t mac[6]);
+static void remote_ota_slot_snapshot(const uint8_t mac[6],
+                                     char running_label[MESH_OTA_SLOT_LABEL_MAX],
+                                     char update_label[MESH_OTA_SLOT_LABEL_MAX],
+                                     uint32_t *running_size,
+                                     uint32_t *update_size);
 static bool query_bool_value(const char *q, const char *key);
 static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz);
 static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
@@ -320,6 +329,10 @@ typedef struct {
 	uint32_t written_bytes;
 	uint32_t started_ms;
 	uint32_t finished_ms;
+	char running_label[MESH_OTA_SLOT_LABEL_MAX];
+	char update_label[MESH_OTA_SLOT_LABEL_MAX];
+	uint32_t running_size;
+	uint32_t update_size;
 	char last_error[96];
 	char last_result[96];
 	char remote_message[MESH_OTA_STATUS_MSG_MAX];
@@ -1819,7 +1832,8 @@ void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
 }
 
 void log_http_server_node_topology(const uint8_t mac[6],
-                                   const mesh_v2_topology_payload_t *topology)
+                                   const mesh_v2_topology_payload_t *topology,
+                                   size_t topology_len)
 {
 	if (!mac || !topology) return;
 
@@ -1827,6 +1841,22 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	bool recorded = false;
 	char tag[MESH_V2_TAG_MAX + 1];
 	copy_packet_text(tag, sizeof(tag), topology->tag, sizeof(topology->tag));
+	bool has_ota_slots = topology_len >= sizeof(mesh_v2_topology_v2_payload_t);
+	char ota_running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	char ota_update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	uint32_t ota_running_size = 0;
+	uint32_t ota_update_size = 0;
+
+	if (has_ota_slots) {
+		const mesh_v2_topology_v2_payload_t *v2 =
+			(const mesh_v2_topology_v2_payload_t *)topology;
+		copy_packet_text(ota_running_label, sizeof(ota_running_label),
+		                 v2->ota_running_label, sizeof(v2->ota_running_label));
+		copy_packet_text(ota_update_label, sizeof(ota_update_label),
+		                 v2->ota_update_label, sizeof(v2->ota_update_label));
+		ota_running_size = v2->ota_running_size;
+		ota_update_size = v2->ota_update_size;
+	}
 
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
@@ -1849,6 +1879,16 @@ void log_http_server_node_topology(const uint8_t mac[6],
 				s_nodes[i].last_send_err = topology->last_send_err;
 				s_nodes[i].recovery_phase = topology->recovery_phase;
 				s_nodes[i].log_stream_enabled = topology->log_stream_enabled != 0;
+				if (has_ota_slots) {
+					copy_packet_text(s_nodes[i].ota_running_label,
+					                 sizeof(s_nodes[i].ota_running_label),
+					                 ota_running_label, sizeof(ota_running_label));
+					copy_packet_text(s_nodes[i].ota_update_label,
+					                 sizeof(s_nodes[i].ota_update_label),
+					                 ota_update_label, sizeof(ota_update_label));
+					s_nodes[i].ota_running_size = ota_running_size;
+					s_nodes[i].ota_update_size = ota_update_size;
+				}
 				s_nodes[i].uptime_valid = true;
 				s_nodes[i].uptime_s = topology->uptime_s;
 				s_nodes[i].uptime_seen_ms = now;
@@ -1876,6 +1916,16 @@ void log_http_server_node_topology(const uint8_t mac[6],
 			ent->last_send_err = topology->last_send_err;
 			ent->recovery_phase = topology->recovery_phase;
 			ent->log_stream_enabled = topology->log_stream_enabled != 0;
+			if (has_ota_slots) {
+				copy_packet_text(ent->ota_running_label,
+				                 sizeof(ent->ota_running_label),
+				                 ota_running_label, sizeof(ota_running_label));
+				copy_packet_text(ent->ota_update_label,
+				                 sizeof(ent->ota_update_label),
+				                 ota_update_label, sizeof(ota_update_label));
+				ent->ota_running_size = ota_running_size;
+				ent->ota_update_size = ota_update_size;
+			}
 			ent->uptime_valid = true;
 			ent->uptime_s = topology->uptime_s;
 			ent->uptime_seen_ms = now;
@@ -1967,11 +2017,30 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 }
 
 void log_http_server_remote_ota_status(const uint8_t mac[6],
-                                       const mesh_ota_status_packet_t *status)
+                                       const mesh_ota_status_packet_t *status,
+                                       size_t status_len)
 {
 	if (!mac || !status) return;
 
 	bool give_ack = false;
+	bool has_slot_info = status_len >= sizeof(mesh_ota_status_v2_packet_t);
+	char running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	char update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	uint32_t running_size = 0;
+	uint32_t update_size = 0;
+
+	if (has_slot_info) {
+		const mesh_ota_status_v2_packet_t *v2 =
+			(const mesh_ota_status_v2_packet_t *)status;
+		copy_packet_text(running_label, sizeof(running_label),
+		                 v2->running_label, sizeof(v2->running_label));
+		copy_packet_text(update_label, sizeof(update_label),
+		                 v2->update_label, sizeof(v2->update_label));
+		running_size = v2->running_size;
+		update_size = v2->update_size;
+		has_slot_info = running_label[0] || update_label[0] ||
+		                running_size != 0 || update_size != 0;
+	}
 
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	{
@@ -1981,6 +2050,16 @@ void log_http_server_remote_ota_status(const uint8_t mac[6],
 				s_remote_ota_status.total_bytes = status->total;
 			}
 			s_remote_ota_status.written_bytes = status->offset;
+			if (has_slot_info) {
+				copy_packet_text(s_remote_ota_status.running_label,
+				                 sizeof(s_remote_ota_status.running_label),
+				                 running_label, sizeof(running_label));
+				copy_packet_text(s_remote_ota_status.update_label,
+				                 sizeof(s_remote_ota_status.update_label),
+				                 update_label, sizeof(update_label));
+				s_remote_ota_status.running_size = running_size;
+				s_remote_ota_status.update_size = update_size;
+			}
 
 			if (status->op != MESH_OTA_OP_DATA ||
 			    status->code != MESH_OTA_STATUS_OK) {
@@ -2829,34 +2908,44 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 		                  "\"child_count\":0,\"capabilities\":0,"
 		                  "\"v1_ok_age_ms\":-1,\"v2_ack_age_ms\":-1,"
 		                  "\"last_remote_send_err\":0,\"remote_recovery_phase\":0,"
-		                  "\"remote_log_stream_enabled\":false");
+		                  "\"remote_log_stream_enabled\":false,"
+		                  "\"ota_running_label\":\"\",\"ota_update_label\":\"\","
+		                  "\"ota_running_size\":0,\"ota_update_size\":0");
 	}
 
 	long age_ms = (long)(uint32_t)(now - node->topology_seen_ms);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"topology_valid\":true,\"topology_age_ms\":%ld,"
+	                 "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
+	                 "\"child_count\":%u,\"capabilities\":%lu,"
+	                 "\"v1_ok_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
+	                 "\"last_remote_send_err\":%ld,\"remote_recovery_phase\":%u,"
+	                 "\"remote_log_stream_enabled\":%s,"
+	                 "\"ota_running_label\":",
+	                 age_ms,
+	                 node->parent_mac[0], node->parent_mac[1], node->parent_mac[2],
+	                 node->parent_mac[3], node->parent_mac[4], node->parent_mac[5],
+	                 node->root_mac[0], node->root_mac[1], node->root_mac[2],
+	                 node->root_mac[3], node->root_mac[4], node->root_mac[5],
+	                 (unsigned)node->layer,
+	                 (unsigned)node->max_layer,
+	                 (int)node->parent_rssi,
+	                 (unsigned)node->child_count,
+	                 (unsigned long)node->capabilities,
+	                 node->v1_ok_age_ms == UINT32_MAX ? -1L : (long)node->v1_ok_age_ms,
+	                 node->v2_ack_age_ms == UINT32_MAX ? -1L : (long)node->v2_ack_age_ms,
+	                 (long)node->last_send_err,
+	                 (unsigned)node->recovery_phase,
+	                 node->log_stream_enabled ? "true" : "false");
+	pos = append_json_string(out, cap, pos, node->ota_running_label);
+	pos = append_fmt(out, cap, pos, ",\"ota_update_label\":");
+	pos = append_json_string(out, cap, pos, node->ota_update_label);
 	return append_fmt(out, cap, pos,
-	                  ",\"topology_valid\":true,\"topology_age_ms\":%ld,"
-	                  "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
-	                  "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
-	                  "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
-	                  "\"child_count\":%u,\"capabilities\":%lu,"
-	                  "\"v1_ok_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
-	                  "\"last_remote_send_err\":%ld,\"remote_recovery_phase\":%u,"
-	                  "\"remote_log_stream_enabled\":%s",
-	                  age_ms,
-	                  node->parent_mac[0], node->parent_mac[1], node->parent_mac[2],
-	                  node->parent_mac[3], node->parent_mac[4], node->parent_mac[5],
-	                  node->root_mac[0], node->root_mac[1], node->root_mac[2],
-	                  node->root_mac[3], node->root_mac[4], node->root_mac[5],
-	                  (unsigned)node->layer,
-	                  (unsigned)node->max_layer,
-	                  (int)node->parent_rssi,
-	                  (unsigned)node->child_count,
-	                  (unsigned long)node->capabilities,
-	                  node->v1_ok_age_ms == UINT32_MAX ? -1L : (long)node->v1_ok_age_ms,
-	                  node->v2_ack_age_ms == UINT32_MAX ? -1L : (long)node->v2_ack_age_ms,
-	                  (long)node->last_send_err,
-	                  (unsigned)node->recovery_phase,
-	                  node->log_stream_enabled ? "true" : "false");
+	                  ",\"ota_running_size\":%lu,\"ota_update_size\":%lu",
+	                  (unsigned long)node->ota_running_size,
+	                  (unsigned long)node->ota_update_size);
 }
 
 static size_t append_nodes_json(char *out, size_t cap, size_t pos)
@@ -3024,6 +3113,61 @@ static size_t append_local_ota_json(char *out, size_t cap, size_t pos)
 	return append_fmt(out, cap, pos, "}");
 }
 
+static void remote_ota_slot_snapshot(const uint8_t mac[6],
+                                     char running_label[MESH_OTA_SLOT_LABEL_MAX],
+                                     char update_label[MESH_OTA_SLOT_LABEL_MAX],
+                                     uint32_t *running_size,
+                                     uint32_t *update_size)
+{
+	if (running_label) memset(running_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+	if (update_label) memset(update_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+	if (running_size) *running_size = 0;
+	if (update_size) *update_size = 0;
+	if (!mac) return;
+
+	remote_ota_status_t status;
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	status = s_remote_ota_status;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (status.target_valid && mac_eq(mac, status.target_mac) &&
+	    (status.running_label[0] || status.update_label[0] ||
+	     status.running_size != 0 || status.update_size != 0)) {
+		if (running_label) {
+			copy_packet_text(running_label, MESH_OTA_SLOT_LABEL_MAX,
+			                 status.running_label, sizeof(status.running_label));
+		}
+		if (update_label) {
+			copy_packet_text(update_label, MESH_OTA_SLOT_LABEL_MAX,
+			                 status.update_label, sizeof(status.update_label));
+		}
+		if (running_size) *running_size = status.running_size;
+		if (update_size) *update_size = status.update_size;
+		return;
+	}
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (!mac_eq(mac, s_nodes[i].mac)) continue;
+			if (running_label) {
+				copy_packet_text(running_label, MESH_OTA_SLOT_LABEL_MAX,
+				                 s_nodes[i].ota_running_label,
+				                 sizeof(s_nodes[i].ota_running_label));
+			}
+			if (update_label) {
+				copy_packet_text(update_label, MESH_OTA_SLOT_LABEL_MAX,
+				                 s_nodes[i].ota_update_label,
+				                 sizeof(s_nodes[i].ota_update_label));
+			}
+			if (running_size) *running_size = s_nodes[i].ota_running_size;
+			if (update_size) *update_size = s_nodes[i].ota_update_size;
+			break;
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+}
+
 static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
                                              const uint8_t mac[6])
 {
@@ -3074,6 +3218,12 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	const char *last_result = target_match ? status.last_result : "";
 	const char *last_error = target_match ? status.last_error : "";
 	const char *remote_message = target_match ? status.remote_message : "";
+	char running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	char update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	uint32_t running_size = 0;
+	uint32_t update_size = 0;
+	remote_ota_slot_snapshot(target_mac, running_label, update_label,
+	                         &running_size, &update_size);
 
 	pos = append_fmt(out, cap, pos,
 	                 "{\"enabled\":%s,\"supported\":%s,\"busy\":%s,"
@@ -3090,8 +3240,15 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	                 route_ready ? "true" : "false",
 	                 telemetry_ready ? "true" : "false");
 	pos = append_json_string(out, cap, pos, target_ok ? tag : "");
-	pos = append_fmt(out, cap, pos, ",\"running_label\":\"remote\","
-	                 "\"update_label\":\"remote\",\"last_result\":");
+	pos = append_fmt(out, cap, pos, ",\"running_label\":");
+	pos = append_json_string(out, cap, pos, running_label);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"running_size\":%lu,\"update_label\":",
+	                 (unsigned long)running_size);
+	pos = append_json_string(out, cap, pos, update_label);
+	pos = append_fmt(out, cap, pos,
+	                 ",\"update_size\":%lu,\"last_result\":",
+	                 (unsigned long)update_size);
 	pos = append_json_string(out, cap, pos, last_result);
 	pos = append_fmt(out, cap, pos, ",\"last_error\":");
 	pos = append_json_string(out, cap, pos, target_ok ? last_error : target_err);
@@ -4040,6 +4197,12 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	const char *last_result = target_match ? status.last_result : "";
 	const char *last_error = target_match ? status.last_error : "";
 	const char *remote_message = target_match ? status.remote_message : "";
+	char running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	char update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
+	uint32_t running_size = 0;
+	uint32_t update_size = 0;
+	remote_ota_slot_snapshot(mac, running_label, update_label,
+	                         &running_size, &update_size);
 
 	size_t pos = 0;
 	pos = append_fmt(out, sizeof(out), pos,
@@ -4057,8 +4220,15 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	                 route_ready ? "true" : "false",
 	                 telemetry_ready ? "true" : "false");
 	pos = append_json_string(out, sizeof(out), pos, target_ok ? tag : "");
-	pos = append_fmt(out, sizeof(out), pos, ",\"running_label\":\"remote\","
-	                 "\"update_label\":\"remote\",\"last_result\":");
+	pos = append_fmt(out, sizeof(out), pos, ",\"running_label\":");
+	pos = append_json_string(out, sizeof(out), pos, running_label);
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"running_size\":%lu,\"update_label\":",
+	                 (unsigned long)running_size);
+	pos = append_json_string(out, sizeof(out), pos, update_label);
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"update_size\":%lu,\"last_result\":",
+	                 (unsigned long)update_size);
 	pos = append_json_string(out, sizeof(out), pos, last_result);
 	pos = append_fmt(out, sizeof(out), pos, ",\"last_error\":");
 	pos = append_json_string(out, sizeof(out), pos,
@@ -5285,7 +5455,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
 		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}\n"
-		"  else{setOtaSlot(otaSupported?'remote':'A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
+		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
 		"  updateOtaUi();\n"
 		"}\n"
 		"function applyTasks(j,mac,raw){\n"
@@ -5318,7 +5488,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function updateOtaUi(){\n"
 		"  const b=document.getElementById('otaBtn');const rb=document.getElementById('rebootBtn');const s=document.getElementById('otaStatus');const local=isLocalSelected();\n"
 		"  if(!b||!rb||!s)return;\n"
-		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot('A/B ?','otaSlotUnknown');return;}\n"
+		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  const rebootSupported=local||otaSupported;\n"
 		"  b.disabled=otaBusy||rebootBusy||!otaSupported;rb.disabled=otaBusy||rebootBusy||!rebootSupported;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"

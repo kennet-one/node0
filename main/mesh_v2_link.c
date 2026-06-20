@@ -421,7 +421,7 @@ static void deliver_tunnel_payload(const mesh_v2_tunnel_hdr_t *t, const uint8_t 
 			return;
 		}
 		const mesh_v2_topology_payload_t *p = (const mesh_v2_topology_payload_t *)payload;
-		log_http_server_node_topology(t->origin_mac, p);
+		log_http_server_node_topology(t->origin_mac, p, t->payload_len);
 	}
 }
 

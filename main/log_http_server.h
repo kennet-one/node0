@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "mesh_proto.h"
@@ -18,7 +19,8 @@ void log_http_server_node_seen(const uint8_t mac[6], const char *tag);
 void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
                                       bool uptime_valid, uint32_t uptime_s);
 void log_http_server_node_topology(const uint8_t mac[6],
-                                   const mesh_v2_topology_payload_t *topology);
+                                   const mesh_v2_topology_payload_t *topology,
+                                   size_t topology_len);
 void log_http_server_task_snapshot_v2(const uint8_t mac[6],
                                       const mesh_v2_task_snapshot_payload_t *snapshot);
 
@@ -26,7 +28,8 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line);
 
 void log_http_server_remote_ota_status(const uint8_t mac[6],
-                                       const mesh_ota_status_packet_t *status);
+                                       const mesh_ota_status_packet_t *status,
+                                       size_t status_len);
 void log_http_server_remote_reboot_status(const uint8_t mac[6],
                                           const mesh_reboot_status_packet_t *status);
 

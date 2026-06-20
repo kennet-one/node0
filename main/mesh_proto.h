@@ -37,6 +37,7 @@ extern "C" {
 #define MESH_OTA_VERSION_MAX		32
 #define MESH_OTA_STATUS_MSG_MAX		64
 #define MESH_OTA_ABORT_MSG_MAX		48
+#define MESH_OTA_SLOT_LABEL_MAX		8
 #define MESH_REBOOT_REASON_MAX		48
 #define MESH_REBOOT_STATUS_MSG_MAX	64
 
@@ -197,6 +198,14 @@ typedef struct __attribute__((packed)) {
 } mesh_ota_status_packet_t;
 
 typedef struct __attribute__((packed)) {
+	mesh_ota_status_packet_t base;
+	char		running_label[MESH_OTA_SLOT_LABEL_MAX];
+	char		update_label[MESH_OTA_SLOT_LABEL_MAX];
+	uint32_t	running_size;
+	uint32_t	update_size;
+} mesh_ota_status_v2_packet_t;
+
+typedef struct __attribute__((packed)) {
 	mesh_pkt_hdr_t	h;
 	uint16_t	seq;
 	uint16_t	delay_ms;
@@ -341,6 +350,14 @@ typedef struct __attribute__((packed)) {
 	uint8_t		log_stream_enabled;
 	uint16_t	diag_flags;
 } mesh_v2_topology_payload_t;
+
+typedef struct __attribute__((packed)) {
+	mesh_v2_topology_payload_t base;
+	char		ota_running_label[MESH_OTA_SLOT_LABEL_MAX];
+	char		ota_update_label[MESH_OTA_SLOT_LABEL_MAX];
+	uint32_t	ota_running_size;
+	uint32_t	ota_update_size;
+} mesh_v2_topology_v2_payload_t;
 
 typedef struct __attribute__((packed)) {
 	uint8_t		channel_id;
