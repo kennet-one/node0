@@ -194,6 +194,32 @@ static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t s
 	dst[n] = '\0';
 }
 
+static esp_err_t copy_mesh_config_string(uint8_t *dst, size_t dst_sz,
+                                         const char *src, size_t *out_len,
+                                         const char *label)
+{
+	if (!dst || dst_sz == 0 || !src) {
+		ESP_LOGE(MESH_TAG, "%s config string is invalid", label ? label : "mesh");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	size_t len = strnlen(src, dst_sz + 1);
+	if (len > dst_sz) {
+		ESP_LOGE(MESH_TAG, "%s too long: %u > %u bytes",
+		         label ? label : "mesh",
+		         (unsigned)len,
+		         (unsigned)dst_sz);
+		return ESP_ERR_INVALID_SIZE;
+	}
+
+	memset(dst, 0, dst_sz);
+	memcpy(dst, src, len);
+	if (out_len) {
+		*out_len = len;
+	}
+	return ESP_OK;
+}
+
 #define I_AM_SINGLE_SENDER     0      // debug single-target sender; production node0 must keep this disabled
 
 // -----------------------------SINGLE_SENDER---------------------------------------
@@ -821,21 +847,28 @@ void app_main(void)
 
 	// Router-facing Wi-Fi credentials from menuconfig.
 	cfg.channel        = CONFIG_MESH_CHANNEL;
-	cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
-	memcpy(cfg.router.ssid,
-	       CONFIG_MESH_ROUTER_SSID,
-	       cfg.router.ssid_len);
-	memcpy(cfg.router.password,
-	       CONFIG_MESH_ROUTER_PASSWD,
-	       strlen(CONFIG_MESH_ROUTER_PASSWD));
+	size_t router_ssid_len = 0;
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.ssid,
+	                                        sizeof(cfg.router.ssid),
+	                                        CONFIG_MESH_ROUTER_SSID,
+	                                        &router_ssid_len,
+	                                        "router ssid"));
+	cfg.router.ssid_len = (uint8_t)router_ssid_len;
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.password,
+	                                        sizeof(cfg.router.password),
+	                                        CONFIG_MESH_ROUTER_PASSWD,
+	                                        NULL,
+	                                        "router password"));
 
 	// Mesh AP for child nodes.
 	ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
 	cfg.mesh_ap.max_connection        = CONFIG_MESH_AP_CONNECTIONS;
 	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
-	memcpy(cfg.mesh_ap.password,
-	       CONFIG_MESH_AP_PASSWD,
-	       strlen(CONFIG_MESH_AP_PASSWD));
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.mesh_ap.password,
+	                                        sizeof(cfg.mesh_ap.password),
+	                                        CONFIG_MESH_AP_PASSWD,
+	                                        NULL,
+	                                        "mesh ap password"));
 
 	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 

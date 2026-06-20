@@ -287,6 +287,8 @@ static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
 static bool selected_remote_stream_needs_rearm(const uint8_t mac[6]);
 static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t err);
+static esp_err_t remote_stream_rearm_for_mac(const uint8_t mac[6], bool force);
+static bool stream_sid_matches(const char stored[STREAM_SID_MAX], const char *sid);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -807,17 +809,22 @@ static uint32_t request_fresh_tasks_for_mac(const uint8_t mac[6])
 		return 0;
 	}
 
-	if (!node_has_fresh_telemetry(mac, NODEINFO_STALE_MS) &&
-	    selected_remote_stream_needs_rearm(mac)) {
-		esp_err_t ctrl_err = mesh_send_log_ctrl(mac, true);
-		selected_remote_stream_note_rearm(mac, ctrl_err);
-	}
+	bool telemetry_fresh = node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
+	(void)remote_stream_rearm_for_mac(mac, !telemetry_fresh);
 
 	uint32_t request_id = next_task_request_id();
-	if (mesh_v2_root_send_task_request(mac, request_id) != ESP_OK) {
-		return 0;
+	esp_err_t last_err = ESP_ERR_INVALID_STATE;
+	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+		last_err = mesh_v2_root_send_task_request(mac, request_id);
+		if (last_err == ESP_OK) {
+			return request_id;
+		}
+		(void)remote_stream_rearm_for_mac(mac, true);
+		vTaskDelay(pdMS_TO_TICKS(120));
 	}
-	return request_id;
+	ESP_LOGD(TAG, "fresh task request failed for " MACSTR ": %s",
+	         MAC2STR(mac), esp_err_to_name(last_err));
+	return 0;
 }
 
 static bool taskmon_request_ready(const uint8_t mac[6], uint32_t request_id)
@@ -1506,9 +1513,11 @@ static bool build_time_prefix(char *out, size_t out_sz)
 
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 {
-	if (mesh_v2_root_send_log_ctrl(to_mac, enable) == ESP_OK) {
-		return ESP_OK;
+	if (!to_mac) {
+		return ESP_ERR_INVALID_ARG;
 	}
+
+	esp_err_t v2_err = mesh_v2_root_send_log_ctrl(to_mac, enable);
 
 	mesh_log_ctrl_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -1532,7 +1541,11 @@ static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 	memset(&dest, 0, sizeof(dest));
 	memcpy(dest.addr, to_mac, 6);
 
-	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	esp_err_t v1_err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	if (v2_err == ESP_OK || v1_err == ESP_OK) {
+		return ESP_OK;
+	}
+	return v1_err != ESP_OK ? v1_err : v2_err;
 }
 
 static void select_stream_node(const uint8_t mac[6], const char *tag)
@@ -1581,6 +1594,8 @@ static void select_stream_node(const uint8_t mac[6], const char *tag)
 			s_stream_selected_ms = 0;
 			s_stream_last_line_ms = 0;
 			memset(s_stream_mac, 0, sizeof(s_stream_mac));
+			memset(s_last_rearm_mac, 0, sizeof(s_last_rearm_mac));
+			s_last_rearm_ms = 0;
 			enable_local_stream = true;
 		} else {
 			s_stream_active = true;
@@ -1642,9 +1657,9 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6])
 {
 	bool rearm = false;
 	uint32_t now = ms_now();
-	bool app_fresh = node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
 
 	if (!mac) return false;
+	bool app_fresh = node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
 
 	portENTER_CRITICAL(&s_selection_lock);
 	{
@@ -1687,6 +1702,33 @@ static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t er
 		}
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
+}
+
+static esp_err_t remote_stream_rearm_for_mac(const uint8_t mac[6], bool force)
+{
+	if (!mac || mac_eq(mac, s_local_mac)) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	uint32_t now = ms_now();
+	bool send = force;
+	if (!send) {
+		portENTER_CRITICAL(&s_selection_lock);
+		{
+			bool same_mac = mac_eq(mac, s_last_rearm_mac);
+			bool throttled = same_mac &&
+			                 (uint32_t)(now - s_last_rearm_ms) < REMOTE_LOG_RETRY_MS;
+			send = !throttled;
+		}
+		portEXIT_CRITICAL(&s_selection_lock);
+	}
+	if (!send) {
+		return ESP_OK;
+	}
+
+	esp_err_t err = mesh_send_log_ctrl(mac, true);
+	selected_remote_stream_note_rearm(mac, err);
+	return err;
 }
 
 static void stream_lease_task(void *arg)
@@ -2368,7 +2410,7 @@ static void log_stream_complete(httpd_req_t *req)
 	}
 }
 
-static void log_stream_request_close(void)
+static void log_stream_request_close(const char *sid)
 {
 	if (!s_log_stream_mutex || !s_log_stream_task) {
 		return;
@@ -2376,7 +2418,7 @@ static void log_stream_request_close(void)
 
 	bool notify = false;
 	if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-		if (s_log_stream.req) {
+		if (s_log_stream.req && stream_sid_matches(s_log_stream.sid, sid)) {
 			s_log_stream.client_close = true;
 			notify = true;
 		}
@@ -2385,6 +2427,32 @@ static void log_stream_request_close(void)
 
 	if (notify) {
 		xTaskNotifyGive(s_log_stream_task);
+	}
+}
+
+static bool log_stream_wait_idle(uint32_t timeout_ms)
+{
+	uint32_t start = ms_now();
+
+	for (;;) {
+		bool idle = true;
+		if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			return false;
+		}
+		if (s_log_stream.req) {
+			s_log_stream.client_close = true;
+			idle = false;
+		}
+		xSemaphoreGive(s_log_stream_mutex);
+
+		if (idle) {
+			return true;
+		}
+		log_stream_notify();
+		if ((uint32_t)(ms_now() - start) >= timeout_ms) {
+			return false;
+		}
+		vTaskDelay(pdMS_TO_TICKS(40));
 	}
 }
 
@@ -2502,25 +2570,8 @@ static esp_err_t http_log_stream_get(httpd_req_t *req)
 	char sid[STREAM_SID_MAX];
 	stream_sid_from_req(req, sid, sizeof(sid));
 
-	for (int attempt = 0; attempt < 6; attempt++) {
-		if (xSemaphoreTake(s_log_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-			return http_log_stream_busy(req);
-		}
-
-		bool busy = (s_log_stream.req != NULL);
-		if (!busy) {
-			xSemaphoreGive(s_log_stream_mutex);
-			break;
-		}
-
-		s_log_stream.client_close = true;
-		xSemaphoreGive(s_log_stream_mutex);
-		log_stream_notify();
-		vTaskDelay(pdMS_TO_TICKS(40));
-
-		if (attempt == 5) {
-			return http_log_stream_busy(req);
-		}
+	if (!log_stream_wait_idle(1400)) {
+		return http_log_stream_busy(req);
 	}
 
 	httpd_req_t *async_req = NULL;
@@ -2832,8 +2883,22 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	long remote_line_age_ms = -1;
 	long last_remote_app_ms = app_last_ms ? (long)app_last_ms : -1;
 	int last_log_ctrl_err = 0;
+	int32_t last_send_err = 0;
+	uint8_t recovery_phase = 0;
 
 	if (remote) {
+		portENTER_CRITICAL(&s_nodes_lock);
+		{
+			for (uint32_t i = 0; i < s_nodes_count; i++) {
+				if (mac_eq(mac, s_nodes[i].mac)) {
+					last_send_err = s_nodes[i].last_send_err;
+					recovery_phase = s_nodes[i].recovery_phase;
+					break;
+				}
+			}
+		}
+		portEXIT_CRITICAL(&s_nodes_lock);
+
 		portENTER_CRITICAL(&s_selection_lock);
 		{
 			if (s_stream_active && mac_eq(mac, s_stream_mac)) {
@@ -2886,12 +2951,13 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	pos = append_json_string(out, cap, pos, stream_state);
 	return append_fmt(out, cap, pos,
 	                  ",\"log_ctrl_age_ms\":%ld,\"remote_line_age_ms\":%ld,"
-	                  "\"last_log_ctrl_err\":%d,\"last_send_err\":0,\"recovery_phase\":%s,"
+	                  "\"last_log_ctrl_err\":%d,\"last_send_err\":%ld,\"recovery_phase\":%u,"
 	                  "\"stale\":%s,\"offline\":%s",
 	                  log_ctrl_age_ms,
 	                  remote_line_age_ms,
 	                  last_log_ctrl_err,
-	                  remote ? "\"unknown\"" : "\"ok\"",
+	                  (long)last_send_err,
+	                  (unsigned)recovery_phase,
 	                  stale ? "true" : "false",
 	                  offline ? "true" : "false");
 }
@@ -3201,12 +3267,12 @@ static size_t append_remote_ota_json_for_mac(char *out, size_t cap, size_t pos,
 	bool route_ready = target_supported && node_route_current(target_mac);
 	bool telemetry_ready = target_supported &&
 	                       node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS);
-	bool supported = target_supported && route_ready && telemetry_ready;
+	bool supported = target_supported && route_ready;
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	} else if (target_ok && target_supported && !telemetry_ready) {
-		strncpy(target_err, "target telemetry stale", sizeof(target_err) - 1);
+		strncpy(target_err, "target telemetry stale, resyncing", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
 
@@ -3852,6 +3918,9 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 			snprintf(err_msg, sizeof(err_msg), "target route not ready");
 			break;
 		}
+		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
+			(void)remote_stream_rearm_for_mac(target_mac, true);
+		}
 
 		mesh_reboot_request_packet_t p;
 		memset(&p, 0, sizeof(p));
@@ -4180,12 +4249,12 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	bool route_ready = target_supported && node_route_current(mac);
 	bool telemetry_ready = target_supported &&
 	                       node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
-	bool supported = target_supported && route_ready && telemetry_ready;
+	bool supported = target_supported && route_ready;
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	} else if (target_ok && target_supported && !telemetry_ready) {
-		strncpy(target_err, "target telemetry stale", sizeof(target_err) - 1);
+		strncpy(target_err, "target telemetry stale, resyncing", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
 
@@ -4295,8 +4364,7 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			break;
 		}
 		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
-			snprintf(err_msg, sizeof(err_msg), "target telemetry stale");
-			break;
+			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
 
 		size_t total_len = req->content_len;
@@ -4617,6 +4685,20 @@ static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz)
 	}
 }
 
+static bool stream_sid_matches(const char stored[STREAM_SID_MAX], const char *sid)
+{
+	if (!sid) {
+		return true;
+	}
+	if (sid[0] == '\0') {
+		return true;
+	}
+	if (strcmp(sid, "nosid") == 0) {
+		return stored[0] == '\0' || strcmp(stored, "nosid") == 0;
+	}
+	return stored[0] != '\0' && strcmp(stored, sid) == 0;
+}
+
 static size_t append_health_json(char *out, size_t cap, size_t pos)
 {
 	bool log_active = false;
@@ -4859,7 +4941,6 @@ static esp_err_t mesh_stream_send_heartbeat(httpd_req_t *req)
 	static const char heartbeat[] = ": ping\n\n";
 	return httpd_resp_send_chunk(req, heartbeat, sizeof(heartbeat) - 1);
 }
-#endif
 
 static void mesh_stream_complete(httpd_req_t *req)
 {
@@ -4871,8 +4952,9 @@ static void mesh_stream_complete(httpd_req_t *req)
 		ESP_LOGD(TAG, "mesh stream async complete failed: %s", esp_err_to_name(err));
 	}
 }
+#endif
 
-static void mesh_stream_request_close(void)
+static void mesh_stream_request_close(const char *sid)
 {
 	if (!s_mesh_stream_mutex || !s_mesh_stream_task) {
 		return;
@@ -4880,7 +4962,7 @@ static void mesh_stream_request_close(void)
 
 	bool notify = false;
 	if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-		if (s_mesh_stream.req) {
+		if (s_mesh_stream.req && stream_sid_matches(s_mesh_stream.sid, sid)) {
 			s_mesh_stream.client_close = true;
 			notify = true;
 		}
@@ -4974,6 +5056,7 @@ static void mesh_stream_task(void *arg)
 }
 #endif
 
+#if LOG_HTTP_ENABLE_MESH_STREAM
 static esp_err_t http_mesh_stream_busy(httpd_req_t *req)
 {
 	httpd_resp_set_status(req, "503 Stream Busy");
@@ -4990,6 +5073,9 @@ static esp_err_t http_mesh_stream_get(httpd_req_t *req)
 		httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 		return httpd_resp_send(req, "mesh stream unavailable\n", HTTPD_RESP_USE_STRLEN);
 	}
+
+	char sid[STREAM_SID_MAX];
+	stream_sid_from_req(req, sid, sizeof(sid));
 
 	if (xSemaphoreTake(s_mesh_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
 		return http_mesh_stream_busy(req);
@@ -5018,11 +5104,14 @@ static esp_err_t http_mesh_stream_get(httpd_req_t *req)
 	s_mesh_stream.req = async_req;
 	s_mesh_stream.seq = 0;
 	s_mesh_stream.headers_sent = false;
+	s_mesh_stream.client_close = false;
+	copy_packet_text(s_mesh_stream.sid, sizeof(s_mesh_stream.sid), sid, sizeof(sid));
 	xSemaphoreGive(s_mesh_stream_mutex);
 
 	mesh_stream_notify();
 	return ESP_OK;
 }
+#endif
 
 static esp_err_t ui_stream_send_preamble(httpd_req_t *req)
 {
@@ -5088,7 +5177,7 @@ static void ui_stream_complete(httpd_req_t *req)
 	}
 }
 
-static void ui_stream_request_close(void)
+static void ui_stream_request_close(const char *sid)
 {
 	if (!s_ui_stream_mutex || !s_ui_stream_task) {
 		return;
@@ -5096,7 +5185,7 @@ static void ui_stream_request_close(void)
 
 	bool notify = false;
 	if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-		if (s_ui_stream.req) {
+		if (s_ui_stream.req && stream_sid_matches(s_ui_stream.sid, sid)) {
 			s_ui_stream.client_close = true;
 			notify = true;
 		}
@@ -5105,6 +5194,32 @@ static void ui_stream_request_close(void)
 
 	if (notify) {
 		xTaskNotifyGive(s_ui_stream_task);
+	}
+}
+
+static bool ui_stream_wait_idle(uint32_t timeout_ms)
+{
+	uint32_t start = ms_now();
+
+	for (;;) {
+		bool idle = true;
+		if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+			return false;
+		}
+		if (s_ui_stream.req) {
+			s_ui_stream.client_close = true;
+			idle = false;
+		}
+		xSemaphoreGive(s_ui_stream_mutex);
+
+		if (idle) {
+			return true;
+		}
+		ui_stream_notify();
+		if ((uint32_t)(ms_now() - start) >= timeout_ms) {
+			return false;
+		}
+		vTaskDelay(pdMS_TO_TICKS(40));
 	}
 }
 
@@ -5208,25 +5323,8 @@ static esp_err_t http_ui_stream_get(httpd_req_t *req)
 	char sid[STREAM_SID_MAX];
 	stream_sid_from_req(req, sid, sizeof(sid));
 
-	for (int attempt = 0; attempt < 6; attempt++) {
-		if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-			return http_ui_stream_busy(req);
-		}
-
-		bool busy = (s_ui_stream.req != NULL);
-		if (!busy) {
-			xSemaphoreGive(s_ui_stream_mutex);
-			break;
-		}
-
-		s_ui_stream.client_close = true;
-		xSemaphoreGive(s_ui_stream_mutex);
-		ui_stream_notify();
-		vTaskDelay(pdMS_TO_TICKS(40));
-
-		if (attempt == 5) {
-			return http_ui_stream_busy(req);
-		}
+	if (!ui_stream_wait_idle(1400)) {
+		return http_ui_stream_busy(req);
 	}
 
 	httpd_req_t *async_req = NULL;
@@ -5261,22 +5359,24 @@ static esp_err_t http_ui_stream_get(httpd_req_t *req)
 
 static esp_err_t http_stream_close_post(httpd_req_t *req)
 {
-	char q[32] = {0};
+	char q[96] = {0};
 	char which[8] = "all";
+	char sid[STREAM_SID_MAX];
 
 	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
 		(void)httpd_query_key_value(q, "which", which, sizeof(which));
 	}
+	stream_sid_from_req(req, sid, sizeof(sid));
 
 	bool close_all = strcmp(which, "all") == 0;
 	if (close_all || strcmp(which, "log") == 0) {
-		log_stream_request_close();
+		log_stream_request_close(sid);
 	}
 	if (close_all || strcmp(which, "mesh") == 0) {
-		mesh_stream_request_close();
+		mesh_stream_request_close(sid);
 	}
 	if (close_all || strcmp(which, "ui") == 0) {
-		ui_stream_request_close();
+		ui_stream_request_close(sid);
 	}
 
 	httpd_resp_set_type(req, "text/plain");
@@ -5376,6 +5476,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let meshVisible=false;\n"
 		"let cursor=0;\n"
 		"let lastNodes='';\n"
+		"let lastGoodNodes=[];\n"
 		"let lastTasks='';\n"
 		"let selectedMac='';\n"
 		"let localMac='';\n"
@@ -5443,7 +5544,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!j)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  const txt=raw||JSON.stringify(j);if(txt===lastNodes)return;lastNodes=txt;\n"
-		"  const nodes=j.nodes||[];const serverCur=j.selected_mac;localMac=j.local_mac||localMac;const prev=s.value;let cur=(selectionBusy?(selectedMac||prev):serverCur)||prev||selectedMac;const remembered=rememberedNode();const rememberedTag=rememberedNodeTag();\n"
+		"  let nodes=j.nodes||[];if((!nodes||nodes.length===0)&&lastGoodNodes.length>0){nodes=lastGoodNodes}else if(nodes&&nodes.length>0){lastGoodNodes=nodes.slice(0)}const serverCur=j.selected_mac;localMac=j.local_mac||localMac;const prev=s.value;let cur=(selectionBusy?(selectedMac||prev):serverCur)||prev||selectedMac;const remembered=rememberedNode();const rememberedTag=rememberedNodeTag();\n"
 		"  const rememberedMissing=remembered&&remembered!==serverCur&&!nodeInList(nodes,remembered);\n"
 		"  if(!selectionBusy&&remembered&&remembered!==serverCur&&nodeInList(nodes,remembered)&&!reselectBusy){cur=remembered;setTimeout(()=>reselectNode(remembered),0)}\n"
 		"  else if(!selectionBusy&&rememberedMissing){cur=remembered}\n"
@@ -5754,12 +5855,14 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+#if LOG_HTTP_ENABLE_MESH_STREAM
 	httpd_uri_t uri_mesh_stream = {
 		.uri		= "/mesh/stream",
 		.method		= HTTP_GET,
 		.handler	= http_mesh_stream_get,
 		.user_ctx	= NULL
 	};
+#endif
 
 	httpd_uri_t uri_stream_close = {
 		.uri		= "/stream/close",
@@ -5845,8 +5948,10 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_mesh_status);
 	if (err != ESP_OK) return err;
+#if LOG_HTTP_ENABLE_MESH_STREAM
 	err = httpd_register_uri_handler(server, &uri_mesh_stream);
 	if (err != ESP_OK) return err;
+#endif
 	err = httpd_register_uri_handler(server, &uri_stream_close);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_reboot);
