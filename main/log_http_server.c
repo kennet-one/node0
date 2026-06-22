@@ -94,6 +94,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define NODEINFO_STALE_MS		75000U
 #define STREAM_SID_MAX			32
 #define NODE_OFFLINE_MS		180000U
+#define RECENT_REBOOT_WINDOW_MS		180000U
 
 #ifndef LOG_HTTP_ENABLE_MESH_STREAM
 #define LOG_HTTP_ENABLE_MESH_STREAM	0
@@ -197,6 +198,19 @@ typedef struct {
 	char ota_update_label[MESH_OTA_SLOT_LABEL_MAX];
 	uint32_t ota_running_size;
 	uint32_t ota_update_size;
+	bool diag_valid;
+	uint16_t diag_flags;
+	uint16_t reset_reason;
+	uint32_t boot_seq;
+	uint16_t parent_disconnect_count;
+	uint16_t no_parent_count;
+	uint16_t rootless_count;
+	uint16_t soft_reconnect_count;
+	uint16_t mesh_restart_count;
+	uint8_t last_parent_disconnect_reason;
+	int32_t last_mesh_send_err;
+	uint32_t last_recovery_action_ms;
+	uint32_t recent_reboot_seen_ms;
 	bool uptime_valid;
 	uint32_t uptime_s;
 	uint32_t uptime_seen_ms;
@@ -1884,10 +1898,22 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	char tag[MESH_V2_TAG_MAX + 1];
 	copy_packet_text(tag, sizeof(tag), topology->tag, sizeof(topology->tag));
 	bool has_ota_slots = topology_len >= sizeof(mesh_v2_topology_v2_payload_t);
+	bool has_diag = topology_len >= sizeof(mesh_v2_topology_v3_payload_t);
 	char ota_running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	char ota_update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	uint32_t ota_running_size = 0;
 	uint32_t ota_update_size = 0;
+	uint16_t diag_flags = topology->diag_flags;
+	uint16_t reset_reason = 0;
+	uint32_t boot_seq = 0;
+	uint16_t parent_disconnect_count = 0;
+	uint16_t no_parent_count = 0;
+	uint16_t rootless_count = 0;
+	uint16_t soft_reconnect_count = 0;
+	uint16_t mesh_restart_count = 0;
+	uint8_t last_parent_disconnect_reason = 0;
+	int32_t last_mesh_send_err = topology->last_send_err;
+	uint32_t last_recovery_action_ms = 0;
 
 	if (has_ota_slots) {
 		const mesh_v2_topology_v2_payload_t *v2 =
@@ -1898,6 +1924,21 @@ void log_http_server_node_topology(const uint8_t mac[6],
 		                 v2->ota_update_label, sizeof(v2->ota_update_label));
 		ota_running_size = v2->ota_running_size;
 		ota_update_size = v2->ota_update_size;
+	}
+	if (has_diag) {
+		const mesh_v2_topology_v3_payload_t *v3 =
+			(const mesh_v2_topology_v3_payload_t *)topology;
+		diag_flags = v3->v2.base.diag_flags;
+		reset_reason = v3->reset_reason;
+		boot_seq = v3->boot_seq;
+		parent_disconnect_count = v3->parent_disconnect_count;
+		no_parent_count = v3->no_parent_count;
+		rootless_count = v3->rootless_count;
+		soft_reconnect_count = v3->soft_reconnect_count;
+		mesh_restart_count = v3->mesh_restart_count;
+		last_parent_disconnect_reason = v3->last_parent_disconnect_reason;
+		last_mesh_send_err = v3->last_mesh_send_err;
+		last_recovery_action_ms = v3->last_recovery_action_ms;
 	}
 
 	portENTER_CRITICAL(&s_nodes_lock);
@@ -1918,9 +1959,26 @@ void log_http_server_node_topology(const uint8_t mac[6],
 				s_nodes[i].capabilities = topology->capabilities;
 				s_nodes[i].v1_ok_age_ms = topology->v1_ok_age_ms;
 				s_nodes[i].v2_ack_age_ms = topology->v2_ack_age_ms;
-				s_nodes[i].last_send_err = topology->last_send_err;
+				s_nodes[i].last_send_err = last_mesh_send_err;
 				s_nodes[i].recovery_phase = topology->recovery_phase;
 				s_nodes[i].log_stream_enabled = topology->log_stream_enabled != 0;
+				s_nodes[i].diag_valid = has_diag;
+				s_nodes[i].diag_flags = diag_flags;
+				s_nodes[i].reset_reason = reset_reason;
+				s_nodes[i].boot_seq = boot_seq;
+				s_nodes[i].parent_disconnect_count = parent_disconnect_count;
+				s_nodes[i].no_parent_count = no_parent_count;
+				s_nodes[i].rootless_count = rootless_count;
+				s_nodes[i].soft_reconnect_count = soft_reconnect_count;
+				s_nodes[i].mesh_restart_count = mesh_restart_count;
+				s_nodes[i].last_parent_disconnect_reason = last_parent_disconnect_reason;
+				s_nodes[i].last_mesh_send_err = last_mesh_send_err;
+				s_nodes[i].last_recovery_action_ms = last_recovery_action_ms;
+				if ((diag_flags & MESH_V2_TOPO_DIAG_RECENT_REBOOT) ||
+				    (s_nodes[i].uptime_valid &&
+				     topology->uptime_s + 10U < s_nodes[i].uptime_s)) {
+					s_nodes[i].recent_reboot_seen_ms = now;
+				}
 				if (has_ota_slots) {
 					copy_packet_text(s_nodes[i].ota_running_label,
 					                 sizeof(s_nodes[i].ota_running_label),
@@ -1955,9 +2013,24 @@ void log_http_server_node_topology(const uint8_t mac[6],
 			ent->capabilities = topology->capabilities;
 			ent->v1_ok_age_ms = topology->v1_ok_age_ms;
 			ent->v2_ack_age_ms = topology->v2_ack_age_ms;
-			ent->last_send_err = topology->last_send_err;
+			ent->last_send_err = last_mesh_send_err;
 			ent->recovery_phase = topology->recovery_phase;
 			ent->log_stream_enabled = topology->log_stream_enabled != 0;
+			ent->diag_valid = has_diag;
+			ent->diag_flags = diag_flags;
+			ent->reset_reason = reset_reason;
+			ent->boot_seq = boot_seq;
+			ent->parent_disconnect_count = parent_disconnect_count;
+			ent->no_parent_count = no_parent_count;
+			ent->rootless_count = rootless_count;
+			ent->soft_reconnect_count = soft_reconnect_count;
+			ent->mesh_restart_count = mesh_restart_count;
+			ent->last_parent_disconnect_reason = last_parent_disconnect_reason;
+			ent->last_mesh_send_err = last_mesh_send_err;
+			ent->last_recovery_action_ms = last_recovery_action_ms;
+			if (diag_flags & MESH_V2_TOPO_DIAG_RECENT_REBOOT) {
+				ent->recent_reboot_seen_ms = now;
+			}
 			if (has_ota_slots) {
 				copy_packet_text(ent->ota_running_label,
 				                 sizeof(ent->ota_running_label),
@@ -2976,10 +3049,22 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 		                  "\"last_remote_send_err\":0,\"remote_recovery_phase\":0,"
 		                  "\"remote_log_stream_enabled\":false,"
 		                  "\"ota_running_label\":\"\",\"ota_update_label\":\"\","
-		                  "\"ota_running_size\":0,\"ota_update_size\":0");
+		                  "\"ota_running_size\":0,\"ota_update_size\":0,"
+		                  "\"diag_valid\":false,\"diag_flags\":0,"
+		                  "\"reset_reason\":0,\"boot_seq\":0,"
+		                  "\"parent_disconnect_count\":0,\"no_parent_count\":0,"
+		                  "\"rootless_count\":0,\"soft_reconnect_count\":0,"
+		                  "\"mesh_restart_count\":0,"
+		                  "\"last_parent_disconnect_reason\":0,"
+		                  "\"last_mesh_send_err\":0,"
+		                  "\"last_recovery_action_ms\":0,"
+		                  "\"recent_reboot\":false");
 	}
 
 	long age_ms = (long)(uint32_t)(now - node->topology_seen_ms);
+	bool recent_reboot = node->recent_reboot_seen_ms != 0 &&
+	                     (uint32_t)(now - node->recent_reboot_seen_ms) <=
+	                     RECENT_REBOOT_WINDOW_MS;
 	pos = append_fmt(out, cap, pos,
 	                 ",\"topology_valid\":true,\"topology_age_ms\":%ld,"
 	                 "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
@@ -3009,9 +3094,33 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	pos = append_fmt(out, cap, pos, ",\"ota_update_label\":");
 	pos = append_json_string(out, cap, pos, node->ota_update_label);
 	return append_fmt(out, cap, pos,
-	                  ",\"ota_running_size\":%lu,\"ota_update_size\":%lu",
+	                  ",\"ota_running_size\":%lu,\"ota_update_size\":%lu,"
+	                  "\"diag_valid\":%s,\"diag_flags\":%u,"
+	                  "\"reset_reason\":%u,\"boot_seq\":%lu,"
+	                  "\"parent_disconnect_count\":%u,"
+	                  "\"no_parent_count\":%u,"
+	                  "\"rootless_count\":%u,"
+	                  "\"soft_reconnect_count\":%u,"
+	                  "\"mesh_restart_count\":%u,"
+	                  "\"last_parent_disconnect_reason\":%u,"
+	                  "\"last_mesh_send_err\":%ld,"
+	                  "\"last_recovery_action_ms\":%lu,"
+	                  "\"recent_reboot\":%s",
 	                  (unsigned long)node->ota_running_size,
-	                  (unsigned long)node->ota_update_size);
+	                  (unsigned long)node->ota_update_size,
+	                  node->diag_valid ? "true" : "false",
+	                  (unsigned)node->diag_flags,
+	                  (unsigned)node->reset_reason,
+	                  (unsigned long)node->boot_seq,
+	                  (unsigned)node->parent_disconnect_count,
+	                  (unsigned)node->no_parent_count,
+	                  (unsigned)node->rootless_count,
+	                  (unsigned)node->soft_reconnect_count,
+	                  (unsigned)node->mesh_restart_count,
+	                  (unsigned)node->last_parent_disconnect_reason,
+	                  (long)node->last_mesh_send_err,
+	                  (unsigned long)node->last_recovery_action_ms,
+	                  recent_reboot ? "true" : "false");
 }
 
 static size_t append_nodes_json(char *out, size_t cap, size_t pos)
@@ -5553,7 +5662,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(rememberedMissing){const o=document.createElement('option');o.value=remembered;o.dataset.tag=rememberedTag;o.textContent=rememberedTag+' · waiting';s.appendChild(o)}\n"
 		"  s.value=cur||prev;selectedMac=s.value||selectedMac;updateOtaUi();\n"
 		"}\n"
-		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);const err=n.last_mesh_send_err||n.last_remote_send_err||0;if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':(n.app_stale||n.stale)?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
 		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
 		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"

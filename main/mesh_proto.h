@@ -359,6 +359,30 @@ typedef struct __attribute__((packed)) {
 	uint32_t	ota_update_size;
 } mesh_v2_topology_v2_payload_t;
 
+#define MESH_V2_TOPO_DIAG_HAS_EXT		0x0001
+#define MESH_V2_TOPO_DIAG_RECENT_REBOOT		0x0002
+#define MESH_V2_TOPO_DIAG_COMPOSITE_HEALTH	0x0004
+
+typedef struct __attribute__((packed)) {
+	mesh_v2_topology_v2_payload_t v2;
+	uint32_t	boot_seq;
+	uint32_t	last_recovery_action_ms;
+	int32_t		last_mesh_send_err;
+	uint16_t	reset_reason;
+	uint16_t	parent_disconnect_count;
+	uint16_t	no_parent_count;
+	uint16_t	rootless_count;
+	uint16_t	soft_reconnect_count;
+	uint16_t	mesh_restart_count;
+	uint8_t		last_parent_disconnect_reason;
+	uint8_t		rsv[3];
+} mesh_v2_topology_v3_payload_t;
+
+#ifndef __cplusplus
+_Static_assert(sizeof(mesh_v2_topology_v3_payload_t) <= MESH_V2_TUNNEL_INNER_MAX,
+               "mesh_v2_topology_v3_payload_t exceeds tunnel inner payload");
+#endif
+
 typedef struct __attribute__((packed)) {
 	uint8_t		channel_id;
 	uint8_t		flags;
