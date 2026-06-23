@@ -229,9 +229,11 @@ typedef struct {
 	uint32_t internal_min_free_bytes;
 	uint32_t internal_total_bytes;
 	bool psram_valid;
+	bool psram_enabled;
 	uint32_t psram_free_bytes;
 	uint32_t psram_min_free_bytes;
 	uint32_t psram_total_bytes;
+	uint32_t psram_expected_bytes;
 } ram_status_t;
 
 typedef struct {
@@ -733,6 +735,8 @@ static ram_status_t ram_status_for_mac(const uint8_t mac[6])
 		ram.psram_free_bytes = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 		ram.psram_min_free_bytes = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 		ram.psram_valid = ram.psram_total_bytes > 0;
+		ram.psram_enabled = ram.psram_valid;
+		ram.psram_expected_bytes = ram.psram_total_bytes;
 	}
 	else if (mac) {
 		portENTER_CRITICAL(&s_taskmon_lock);
@@ -1221,6 +1225,62 @@ static bool parse_taskmon_ram(const char *line, ram_status_t *ram)
 	return true;
 }
 
+static bool parse_taskmon_ramx(const char *line, ram_status_t *ram)
+{
+	if (!line || !ram) return false;
+
+	const char *body = body_after_marker(line, "[STACKMON]");
+	const char *p = body ? body : line;
+	while (*p == ' ') p++;
+	if (strncmp(p, "RAMX:", 5) != 0) return false;
+
+	unsigned heap_free = 0;
+	unsigned heap_min = 0;
+	unsigned heap_total = 0;
+	unsigned int_free = 0;
+	unsigned int_min = 0;
+	unsigned int_total = 0;
+	unsigned psram_enabled = 0;
+	unsigned psram_free = 0;
+	unsigned psram_min = 0;
+	unsigned psram_total = 0;
+	unsigned psram_expected = 0;
+	int parsed = sscanf(p,
+	                    "RAMX: heap_free=%u heap_min=%u heap_total=%u int_free=%u int_min=%u int_total=%u psram_enabled=%u psram_free=%u psram_min=%u psram_total=%u psram_expected=%u",
+	                    &heap_free, &heap_min, &heap_total,
+	                    &int_free, &int_min, &int_total,
+	                    &psram_enabled, &psram_free, &psram_min,
+	                    &psram_total, &psram_expected);
+	if (parsed != 11) {
+		parsed = sscanf(p,
+		                "RAMX: hf=%u hm=%u ht=%u if=%u im=%u it=%u pe=%u pf=%u pm=%u pt=%u pc=%u",
+		                &heap_free, &heap_min, &heap_total,
+		                &int_free, &int_min, &int_total,
+		                &psram_enabled, &psram_free, &psram_min,
+		                &psram_total, &psram_expected);
+	}
+	if (parsed != 11) {
+		return false;
+	}
+
+	memset(ram, 0, sizeof(*ram));
+	ram->valid = true;
+	ram->free_bytes = heap_free;
+	ram->min_free_bytes = heap_min;
+	ram->total_bytes = heap_total;
+	ram->internal_valid = int_total > 0;
+	ram->internal_free_bytes = int_free;
+	ram->internal_min_free_bytes = int_min;
+	ram->internal_total_bytes = int_total;
+	ram->psram_enabled = psram_enabled != 0;
+	ram->psram_valid = psram_total > 0;
+	ram->psram_free_bytes = psram_free;
+	ram->psram_min_free_bytes = psram_min;
+	ram->psram_total_bytes = psram_total;
+	ram->psram_expected_bytes = psram_expected;
+	return true;
+}
+
 static bool parse_taskmon_persistent(const char *line, persistent_status_t *persistent)
 {
 	if (!line || !persistent) return false;
@@ -1270,7 +1330,7 @@ static bool taskmon_ingest_line(const uint8_t mac[6], const char *tag, const cha
 	bool has_task = parse_taskmon_task(line, &task);
 	bool has_cpu = parse_taskmon_cpu(line, &cpu_load_x10);
 	bool has_slots = parse_taskmon_slots(line, &slot_count);
-	bool has_ram = parse_taskmon_ram(line, &ram);
+	bool has_ram = parse_taskmon_ramx(line, &ram) || parse_taskmon_ram(line, &ram);
 	bool has_persistent = parse_taskmon_persistent(line, &persistent);
 
 	if (!is_start && !is_end && !has_task && !has_cpu && !has_slots &&
@@ -3524,9 +3584,11 @@ static size_t append_ram_json_fields(char *out, size_t cap, size_t pos,
 	                  "\"ram_internal_min_free_bytes\":%lu,"
 	                  "\"ram_internal_total_bytes\":%lu,"
 	                  "\"ram_psram_valid\":%s,"
+	                  "\"ram_psram_enabled\":%s,"
 	                  "\"ram_psram_free_bytes\":%lu,"
 	                  "\"ram_psram_min_free_bytes\":%lu,"
-	                  "\"ram_psram_total_bytes\":%lu",
+	                  "\"ram_psram_total_bytes\":%lu,"
+	                  "\"ram_psram_expected_bytes\":%lu",
 	                  ram->valid ? "true" : "false",
 	                  (unsigned long)ram->free_bytes,
 	                  (unsigned long)ram->min_free_bytes,
@@ -3536,9 +3598,11 @@ static size_t append_ram_json_fields(char *out, size_t cap, size_t pos,
 	                  (unsigned long)ram->internal_min_free_bytes,
 	                  (unsigned long)ram->internal_total_bytes,
 	                  ram->psram_valid ? "true" : "false",
+	                  ram->psram_enabled ? "true" : "false",
 	                  (unsigned long)ram->psram_free_bytes,
 	                  (unsigned long)ram->psram_min_free_bytes,
-	                  (unsigned long)ram->psram_total_bytes);
+	                  (unsigned long)ram->psram_total_bytes,
+	                  (unsigned long)ram->psram_expected_bytes);
 }
 
 static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
@@ -5608,8 +5672,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"button:hover:not(:disabled){background:#2f3740;border-color:#52606c;color:#fff}\n"
 		"button:active:not(:disabled){transform:translateY(1px)}\n"
 		"button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}\n"
-		".adminOn{color:#caffdf;background:#103724;border-color:#1d6e44}\n"
-		".adminOn:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
+		".topActive{color:#caffdf;background:#103724;border-color:#1d6e44}\n"
+		".topActive:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
 		"select{padding:3px 8px;min-width:130px;background:#191d21;color:#dfe6ee}\n"
 		".taskTop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;color:#eee}\n"
 		".taskLeft{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'title uptime' 'node node';column-gap:8px;row-gap:2px;align-items:baseline;min-width:0;flex:1}\n"
@@ -5652,11 +5716,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"</style></head>\n"
 		"<body>\n"
 		"<div id='top'>\n"
-		"<button onclick='toggleFollow()'>follow: <span id=\"f\">ON</span></button>\n"
+		"<button id='freezeBtn' onclick='toggleFreeze()'>freeze: <span id=\"fz\">OFF</span></button>\n"
 		"<button onclick='clearServer()'>clear</button>\n"
-		"<button onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
+		"<button id='tasksBtn' onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
 		"<button id='adminBtn' onclick='toggleAdmin()'>admin</button>\n"
-		"<button onclick='toggleMesh()'>mesh: <span id=\"mm\">OFF</span></button>\n"
+		"<button id='meshBtn' onclick='toggleMesh()'>mesh: <span id=\"mm\">OFF</span></button>\n"
 		"<select id='nodeSel'></select>\n"
 		"<span id='logMode' class='logMode streamOff' title='log transport'><span class='streamDot'></span></span>\n"
 		"<span id='st'>...</span>\n"
@@ -5664,11 +5728,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
 		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / fw ? / app slot ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"const pageSid=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).replace(/[^a-zA-Z0-9_-]/g,'');\n"
-		"let follow=true;\n"
+		"let freeze=false;\n"
 		"let tasksVisible=false;\n"
 		"let meshVisible=false;\n"
 		"let cursor=0;\n"
@@ -5683,7 +5747,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let rebootBusy=false;\n"
 		"let adminPin='';\n"
 		"let adminUnlocked=false;\n"
-		"let otaStatusText='OTA ...';\n"
+		"let otaStatusText='';\n"
 		"let otaSlotText='A/B ?';\n"
 		"let otaSlotClass='otaSlotUnknown';\n"
 		"let logBusy=false;\n"
@@ -5702,9 +5766,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let pollFallbackUntil=0;\n"
 		"let reselectBusy=false;\n"
 		"let selectionBusy=false;\n"
-		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true);startUiStream()}}\n"
-		"function updateAdminUi(){const b=document.getElementById('adminBtn');if(!b)return;b.textContent=adminUnlocked?'admin: ON':'admin';b.className=adminUnlocked?'adminOn':''}\n"
+		"function setTopActive(id,on){const b=document.getElementById(id);if(b)b.className=on?'topActive':''}\n"
+		"function toggleFreeze(){freeze=!freeze;document.getElementById('fz').textContent=freeze?'ON':'OFF';setTopActive('freezeBtn',freeze)}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';setTopActive('tasksBtn',tasksVisible);if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true);startUiStream()}}\n"
+		"function updateAdminUi(){const b=document.getElementById('adminBtn');if(!b)return;b.textContent=adminUnlocked?'admin: ON':'admin';b.className=adminUnlocked?'topActive':''}\n"
 		"function clearAdmin(){adminPin='';adminUnlocked=false;updateAdminUi();updateOtaUi()}\n"
 		"async function toggleAdmin(){\n"
 		"  if(adminUnlocked){clearAdmin();return;}\n"
@@ -5712,19 +5777,20 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!pin)return;\n"
 		"  try{const r=await fetch('/admin/check',{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);adminPin=pin;adminUnlocked=true;updateAdminUi();updateOtaUi();otaSetStatus(msg||'admin unlocked',false,0)}catch(e){clearAdmin();alert('Admin unlock failed: '+(e&&e.message?e.message:e))}\n"
 		"}\n"
-		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible){loadMeshStatus('poll');startUiStream()}else document.getElementById('meshState').textContent='off'}\n"
+		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';setTopActive('meshBtn',meshVisible);if(meshVisible){loadMeshStatus('poll');startUiStream()}else document.getElementById('meshState').textContent='off'}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
 		"function taskSlotsText(count,slots){return count+'/'+(slots>=0?slots:'?')}\n"
 		"function pad2(n){return String(n).padStart(2,'0')}\n"
 		"function fmtUptime(valid,sec){if(!valid)return 'up ?';sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;return 'up '+(d>0?d+'d ':'')+pad2(h)+':'+pad2(m)+':'+pad2(s)}\n"
-		"function fmtKb(bytes){return Math.round((Number(bytes)||0)/1024)+' KB'}\n"
+		"function fmtKbNum(bytes){return Math.round((Number(bytes)||0)/1024)}\n"
+		"function fmtKb(bytes){return fmtKbNum(bytes)+' KB'}\n"
 		"function fmtMb(bytes){return Math.round((Number(bytes)||0)/1048576)+' MB'}\n"
 		"function fmtUsedKb(free,total){free=Number(free)||0;total=Number(total)||0;if(total<=0)return '?';return fmtKb(Math.max(0,total-free))+'/'+fmtKb(total)+' used'}\n"
 		"function fmtRamPool(label,valid,free,total){return valid&&Number(total)>0?label+' '+fmtUsedKb(free,total):label+' ?'}\n"
-		"function fmtRam(j){if(!j.ram_valid)return 'RAM int ? / PSRAM ?';const iv=!!j.ram_internal_valid;const pv=!!j.ram_psram_valid;let s=iv?fmtRamPool('RAM int',true,j.ram_internal_free_bytes,j.ram_internal_total_bytes):fmtRamPool('RAM',true,j.ram_free_bytes,j.ram_total_bytes);return s+' / '+(pv?fmtRamPool('PSRAM',true,j.ram_psram_free_bytes,j.ram_psram_total_bytes):(iv?'PSRAM off':'PSRAM ?'))}\n"
-		"function fmtFlash(j){const flash=j.flash_valid?'FLASH '+fmtMb(j.flash_chip_bytes)+' / app '+fmtKb(j.app_used_bytes)+'/'+fmtKb(j.app_partition_bytes):'FLASH ? / app ?';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
+		"function fmtRam(j){if(!j.ram_valid)return 'RAM int ? / PSRAM ?';const iv=!!j.ram_internal_valid;const pv=!!j.ram_psram_valid;let s=iv?fmtRamPool('RAM int',true,j.ram_internal_free_bytes,j.ram_internal_total_bytes):fmtRamPool('RAM',true,j.ram_free_bytes,j.ram_total_bytes);if(pv)return s+' / '+fmtRamPool('PSRAM',true,j.ram_psram_free_bytes,j.ram_psram_total_bytes);if(iv){const cap=Number(j.ram_psram_expected_bytes)||0;return s+' / PSRAM inactive / cap '+(cap>0?fmtKb(cap):'?')}return s+' / PSRAM ?'}\n"
+		"function fmtFlash(j){if(!j.flash_valid)return 'FLASH ? / fw ? / app slot ? / NVS ?';const chip=Number(j.flash_chip_bytes)||0;const app=Number(j.app_used_bytes)||0;const slot=Number(j.app_partition_bytes)||0;const pct=chip>0?Math.round(app*100/chip)+'%':'?';const flash='FLASH '+fmtMb(chip)+' chip / fw '+fmtKb(app)+' ('+pct+') / app slot '+fmtKbNum(app)+'/'+fmtKbNum(slot)+' KB';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"async function fetchTimeout(url,ms){\n"
 		"  ms=Math.max(ms||0,12000);\n"
 		"  const opt={cache:'no-store'};let timer=null;\n"
@@ -5733,7 +5799,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"async function controlFetch(url,ms){const start=Date.now();while(activeFetch){if(Date.now()-start>Math.max(ms||0,3000))throw new Error('fetch busy');await new Promise(r=>setTimeout(r,50));}activeFetch=true;try{return await fetchTimeout(url,ms)}finally{activeFetch=false}}\n"
 		"function setLogMode(cls,text){const el=document.getElementById('logMode');if(el){el.className='logMode '+cls;el.title='log transport: '+(text||'off')}}\n"
-		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(follow)el.scrollTop=el.scrollHeight}\n"
+		"function appendLogText(text,reset){const el=document.getElementById('log');if(reset)el.innerHTML='';if(text&&text.length>0)el.insertAdjacentHTML('beforeend',renderChunk(text));if(!freeze)el.scrollTop=el.scrollHeight}\n"
 		"function notifyStreamClose(which){try{const url='/stream/close?which='+(which||'all')+'&sid='+encodeURIComponent(pageSid);if(navigator.sendBeacon){navigator.sendBeacon(url,'');return;}fetch(url,{method:'POST',cache:'no-store',keepalive:true}).catch(()=>{})}catch(e){}}\n"
 		"function stopLogStream(notify){if(notify)notifyStreamClose('log');if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
 		"function stopMeshStream(notify){if(notify)notifyStreamClose('mesh');if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
@@ -5773,8 +5839,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
-		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'ready':'PIN not set';}\n"
-		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='ready';}\n"
+		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'':'PIN not set';}\n"
+		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='';}\n"
 		"  updateOtaUi();\n"
 		"}\n"
 		"function applyTasks(j,mac,raw){\n"
@@ -5799,7 +5865,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  logStream.onerror=()=>{logStreamReady=false;logStreamErrors++;setLogMode(logStreamErrors>=2?'streamPoll':'streamRetry',logStreamErrors>=2?'poll':'retry');document.getElementById('st').textContent='RETRY';stopLogStream(false);pollFallbackUntil=Date.now()+8000;tick();const d=Math.min(12000,1200*logStreamErrors);setTimeout(()=>{if(!otaBusy&&Date.now()>pollFallbackUntil-1000){pollFallbackUntil=0;startLogStream()}},d)};\n"
 		"}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
-		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / fw ? / app slot ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
 		"function selectedNodeTag(){const s=document.getElementById('nodeSel');const o=s&&s.selectedOptions&&s.selectedOptions[0];return o?(o.dataset.tag||o.textContent||'node'):'node'}\n"
 		"function selectedOtaTarget(){return isLocalSelected()?'node0':(selectedNodeTag()||'node')}\n"
@@ -5810,10 +5876,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  const rebootSupported=local||otaSupported;\n"
-		"  b.disabled=otaBusy||rebootBusy||!adminUnlocked||!otaSupported;rb.disabled=otaBusy||rebootBusy||!adminUnlocked||!rebootSupported;s.textContent=otaSupported?(adminUnlocked?(otaStatusText||'ready'):'admin locked'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  b.disabled=otaBusy||rebootBusy||!adminUnlocked||!otaSupported;rb.disabled=otaBusy||rebootBusy||!adminUnlocked||!rebootSupported;s.textContent=otaSupported?(adminUnlocked?(otaStatusText||''):'admin locked'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
-		"  otaStatusText=text||'OTA ready';\n"
+		"  otaStatusText=text||'';\n"
 		"  const p=document.getElementById('otaProg');\n"
 		"  if(p){p.style.display=showProg?'inline-block':'none';if(typeof pctVal==='number')p.value=Math.max(0,Math.min(100,pctVal));}\n"
 		"  updateOtaUi();\n"
@@ -5970,7 +6036,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const r=await controlFetch(url,6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyTasks(JSON.parse(txt),mac,txt);\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app ? / NVS ?'}finally{tasksBusyReq=false;}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / fw ? / app slot ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
 		"async function loadUiStatus(fresh){\n"
 		"  if(controlPollBusy||otaBusy||selectionBusy||uiStream)return;\n"
