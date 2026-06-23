@@ -3953,6 +3953,20 @@ static bool ota_check_pin(httpd_req_t *req)
 	return strcmp(pin, CONFIG_NODE0_OTA_PIN) == 0;
 }
 
+static esp_err_t http_admin_check_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		return http_json_error(req, "403 Forbidden",
+		                       "admin disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+
+	if (!ota_check_pin(req)) {
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	return http_json_ok(req, "admin unlocked");
+}
+
 static int ota_recv_retry(httpd_req_t *req, uint8_t *buf, size_t len)
 {
 	if (!req || !buf || len == 0) {
@@ -5594,6 +5608,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"button:hover:not(:disabled){background:#2f3740;border-color:#52606c;color:#fff}\n"
 		"button:active:not(:disabled){transform:translateY(1px)}\n"
 		"button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}\n"
+		".adminOn{color:#caffdf;background:#103724;border-color:#1d6e44}\n"
+		".adminOn:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
 		"select{padding:3px 8px;min-width:130px;background:#191d21;color:#dfe6ee}\n"
 		".taskTop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;color:#eee}\n"
 		".taskLeft{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'title uptime' 'node node';column-gap:8px;row-gap:2px;align-items:baseline;min-width:0;flex:1}\n"
@@ -5639,6 +5655,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<button onclick='toggleFollow()'>follow: <span id=\"f\">ON</span></button>\n"
 		"<button onclick='clearServer()'>clear</button>\n"
 		"<button onclick='toggleTasks()'>tasks: <span id=\"tm\">OFF</span></button>\n"
+		"<button id='adminBtn' onclick='toggleAdmin()'>admin</button>\n"
 		"<button onclick='toggleMesh()'>mesh: <span id=\"mm\">OFF</span></button>\n"
 		"<select id='nodeSel'></select>\n"
 		"<span id='logMode' class='logMode streamOff' title='log transport'><span class='streamDot'></span></span>\n"
@@ -5664,6 +5681,8 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let otaSupported=false;\n"
 		"let otaBusy=false;\n"
 		"let rebootBusy=false;\n"
+		"let adminPin='';\n"
+		"let adminUnlocked=false;\n"
 		"let otaStatusText='OTA ...';\n"
 		"let otaSlotText='A/B ?';\n"
 		"let otaSlotClass='otaSlotUnknown';\n"
@@ -5685,6 +5704,14 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let selectionBusy=false;\n"
 		"function toggleFollow(){follow=!follow;document.getElementById('f').textContent=follow?'ON':'OFF'}\n"
 		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true);startUiStream()}}\n"
+		"function updateAdminUi(){const b=document.getElementById('adminBtn');if(!b)return;b.textContent=adminUnlocked?'admin: ON':'admin';b.className=adminUnlocked?'adminOn':''}\n"
+		"function clearAdmin(){adminPin='';adminUnlocked=false;updateAdminUi();updateOtaUi()}\n"
+		"async function toggleAdmin(){\n"
+		"  if(adminUnlocked){clearAdmin();return;}\n"
+		"  const pin=prompt('Admin PIN');\n"
+		"  if(!pin)return;\n"
+		"  try{const r=await fetch('/admin/check',{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);adminPin=pin;adminUnlocked=true;updateAdminUi();updateOtaUi();otaSetStatus(msg||'admin unlocked',false,0)}catch(e){clearAdmin();alert('Admin unlock failed: '+(e&&e.message?e.message:e))}\n"
+		"}\n"
 		"function toggleMesh(){meshVisible=!meshVisible;document.body.classList.toggle('showMesh',meshVisible);document.getElementById('mm').textContent=meshVisible?'ON':'OFF';if(meshVisible){loadMeshStatus('poll');startUiStream()}else document.getElementById('meshState').textContent='off'}\n"
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
@@ -5783,7 +5810,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  const rebootSupported=local||otaSupported;\n"
-		"  b.disabled=otaBusy||rebootBusy||!otaSupported;rb.disabled=otaBusy||rebootBusy||!rebootSupported;s.textContent=otaSupported?(otaStatusText||'ready'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  b.disabled=otaBusy||rebootBusy||!adminUnlocked||!otaSupported;rb.disabled=otaBusy||rebootBusy||!adminUnlocked||!rebootSupported;s.textContent=otaSupported?(adminUnlocked?(otaStatusText||'ready'):'admin locked'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
 		"  otaStatusText=text||'OTA ready';\n"
@@ -5817,24 +5844,20 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  await loadOtaStatus();\n"
 		"  if(!local&&!otaSupported){return;}\n"
 		"  if(!otaEnabled){alert('OTA is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
+		"  if(!adminUnlocked||!adminPin){alert('Unlock admin first.');return;}\n"
 		"  const file=await chooseOtaFile();\n"
 		"  if(!file)return;\n"
 		"  if(!file.name.toLowerCase().endsWith('.bin')&&!confirm('Selected file is not .bin. Continue anyway?'))return;\n"
-		"  const pin=prompt('OTA PIN');\n"
-		"  if(!pin)return;\n"
-		"  const confirmPhrase='UPDATE '+String(target||'node').toUpperCase();\n"
-		"  const phrase=prompt('Type '+confirmPhrase+' to update '+target+' and reboot.');\n"
-		"  if(phrase!==confirmPhrase){alert('OTA cancelled.');return;}\n"
 		"  if(!confirm('Upload '+file.name+' ('+fmtKb(file.size)+') to '+target+' and reboot?'))return;\n"
 		"  notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream();\n"
 		"  otaBusy=true;lastNodes='';lastTasks='';otaSetStatus('OTA uploading 0%',true,0);\n"
 		"  const xhr=new XMLHttpRequest();\n"
 		"  xhr.open('POST',local?'/ota':'/ota/remote?mac='+encodeURIComponent(selectedMac||''));\n"
 		"  xhr.setRequestHeader('Content-Type','application/octet-stream');\n"
-		"  xhr.setRequestHeader('X-OTA-PIN',pin);\n"
+		"  xhr.setRequestHeader('X-OTA-PIN',adminPin);\n"
 		"  xhr.setRequestHeader('X-OTA-Filename',safeHeader(file.name));\n"
 		"  xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded*100/e.total);otaSetStatus((!local&&pct>=100)?'OTA relaying to mesh...':'OTA uploading '+pct+'%',true,pct)}};\n"
-		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}else{otaBusy=false;otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startUiStream();startLogStream()}};\n"
+		"  xhr.onload=()=>{let msg=xhr.responseText||'';try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(xhr.status>=200&&xhr.status<300){otaSetStatus(msg||'OTA OK, rebooting',false,100);if(local){adminPin='';adminUnlocked=false;updateAdminUi();setTimeout(()=>location.reload(),9000)}else{otaBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}else{otaBusy=false;if(xhr.status===403){clearAdmin();alert('Admin expired or bad PIN. Unlock admin again.')}otaSetStatus('OTA failed: '+(msg||xhr.status),false,0);startUiStream();startLogStream()}};\n"
 		"  xhr.onerror=()=>{otaBusy=false;otaSetStatus('OTA network error',false,0);startUiStream();startLogStream()};\n"
 		"  xhr.send(file);\n"
 		"}\n"
@@ -5844,16 +5867,12 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  await loadOtaStatus();\n"
 		"  if(!local&&!otaSupported){return;}\n"
 		"  if(!otaEnabled){alert('Reboot is disabled. Set CONFIG_NODE0_OTA_PIN locally and rebuild.');return;}\n"
-		"  const pin=prompt('OTA PIN');\n"
-		"  if(!pin)return;\n"
-		"  const confirmPhrase='REBOOT '+String(target||'node').toUpperCase();\n"
-		"  const phrase=prompt('Type '+confirmPhrase+' to reboot '+target+'.');\n"
-		"  if(phrase!==confirmPhrase){alert('Reboot cancelled.');return;}\n"
+		"  if(!adminUnlocked||!adminPin){alert('Unlock admin first.');return;}\n"
 		"  if(!confirm('Reboot '+target+' now?'))return;\n"
 		"  notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream();\n"
 		"  rebootBusy=true;otaBusy=true;otaSetStatus('rebooting '+target+'...',false,0);\n"
 		"  const url=local?'/reboot':'/reboot/remote?mac='+encodeURIComponent(selectedMac||'');\n"
-		"  try{const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':pin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok)throw new Error(msg||r.status);otaSetStatus(msg||('rebooting '+target),false,100);if(local){setTimeout(()=>location.reload(),9000)}else{otaBusy=false;rebootBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startUiStream();startLogStream()}\n"
+		"  try{const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'X-OTA-PIN':adminPin}});let msg=await r.text();try{const j=JSON.parse(msg);msg=j.message||j.error||msg}catch(e){};if(!r.ok){if(r.status===403){clearAdmin();alert('Admin expired or bad PIN. Unlock admin again.')}throw new Error(msg||r.status)}otaSetStatus(msg||('rebooting '+target),false,100);if(local){adminPin='';adminUnlocked=false;updateAdminUi();setTimeout(()=>location.reload(),9000)}else{otaBusy=false;rebootBusy=false;updateOtaUi();setTimeout(()=>{loadNodes();startUiStream();startLogStream();},3000)}}catch(e){rebootBusy=false;otaBusy=false;otaSetStatus('reboot failed: '+(e&&e.message?e.message:e),false,0);startUiStream();startLogStream()}\n"
 		"}\n"
 		"function lvlClassByRest(rest){\n"
 		"  if(!rest||rest.length===0) return '';\n"
@@ -5971,8 +5990,9 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!e.isTrusted) return;\n"
 		"  onNodeSel();\n"
 		"});\n"
-		"window.addEventListener('pagehide',()=>{notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream()});\n"
+		"window.addEventListener('pagehide',()=>{adminPin='';adminUnlocked=false;notifyStreamClose('all');stopLogStream();stopMeshStream();stopUiStream()});\n"
 		"selectedMac=rememberedNode()||selectedMac;\n"
+		"updateAdminUi();\n"
 		"pollFallbackUntil=Date.now()+16000;\n"
 		"setInterval(tick," STR(WEB_POLL_MS) ");\n"
 		"setInterval(()=>loadTasks(false)," STR(TASKS_FAST_POLL_MS) ");\n"
@@ -6050,6 +6070,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/stream/close",
 		.method		= HTTP_POST,
 		.handler	= http_stream_close_post,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_admin_check = {
+		.uri		= "/admin/check",
+		.method		= HTTP_POST,
+		.handler	= http_admin_check_post,
 		.user_ctx	= NULL
 	};
 
@@ -6135,6 +6162,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 #endif
 	err = httpd_register_uri_handler(server, &uri_stream_close);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_admin_check);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_reboot);
 	if (err != ESP_OK) return err;
