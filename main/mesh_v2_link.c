@@ -54,6 +54,8 @@ typedef struct {
 	bool has_gap;
 	bool tunnel_seen;
 	uint32_t last_tunnel_ms;
+	uint32_t last_ack_tx_ms;
+	int32_t last_ack_err;
 	uint32_t capabilities;
 	tunnel_rx_channel_t rx[MESH_V2_TUNNEL_CHANNEL_MAX + 1];
 	tunnel_tx_channel_t tx[MESH_V2_TUNNEL_CHANNEL_MAX + 1];
@@ -205,6 +207,8 @@ static void reset_session_locked(root_node_state_t *st, const mesh_v2_hdr_t *h)
 	st->last_v2_ms = ms_now();
 	st->last_tunnel_ms = 0;
 	st->tunnel_seen = false;
+	st->last_ack_tx_ms = 0;
+	st->last_ack_err = 0;
 	for (uint32_t ch = 0; ch <= MESH_V2_TUNNEL_CHANNEL_MAX; ch++) {
 		memset(&st->rx[ch], 0, sizeof(st->rx[ch]));
 		memset(&st->tx[ch], 0, sizeof(st->tx[ch]));
@@ -317,6 +321,21 @@ static esp_err_t send_tunnel_nack(const uint8_t dst[6], const mesh_v2_hdr_t *h,
 	                                  h->session_id, &p, sizeof(p));
 }
 
+static void note_ack_tx_result(const uint8_t mac[6], esp_err_t err)
+{
+	if (!mac) {
+		return;
+	}
+
+	portENTER_CRITICAL(&s_lock);
+	root_node_state_t *st = find_node_locked(mac, false);
+	if (st) {
+		st->last_ack_tx_ms = ms_now();
+		st->last_ack_err = (int32_t)err;
+	}
+	portEXIT_CRITICAL(&s_lock);
+}
+
 static void handle_hello(const mesh_addr_t *from, const mesh_v2_hdr_t *h, const uint8_t *payload)
 {
 	char tag[MESH_V2_TAG_MAX + 1] = "node";
@@ -344,7 +363,9 @@ static void handle_hello(const mesh_addr_t *from, const mesh_v2_hdr_t *h, const 
 	portEXIT_CRITICAL(&s_lock);
 
 	log_http_server_node_seen_uptime(h->src_mac, tag, true, uptime_s);
-	send_control(from, h->src_mac, MESH_V2_TYPE_ACK, h->session_id, 0, 0);
+	esp_err_t ack_err = send_control(from, h->src_mac, MESH_V2_TYPE_ACK,
+	                                 h->session_id, 0, 0);
+	note_ack_tx_result(h->src_mac, ack_err);
 	ESP_LOGI(TAG, "HELLO from " MACSTR " tag=%s session=%lu cap=0x%08lx",
 	         MAC2STR(h->src_mac), tag, (unsigned long)h->session_id,
 	         (unsigned long)capabilities);
@@ -594,11 +615,10 @@ static void handle_tunnel_data(const mesh_v2_hdr_t *h, const uint8_t *payload)
 	}
 	portEXIT_CRITICAL(&s_lock);
 
-	if (send_nack) {
-		send_tunnel_nack(h->src_mac, h, t, missing_seq);
-	} else {
-		send_tunnel_ack(h->src_mac, h, t, ack_seq);
-	}
+	esp_err_t ack_err = send_nack
+		? send_tunnel_nack(h->src_mac, h, t, missing_seq)
+		: send_tunnel_ack(h->src_mac, h, t, ack_seq);
+	note_ack_tx_result(t->origin_mac, ack_err);
 
 	if (deliver) {
 		deliver_tunnel_payload(t, inner);
@@ -657,11 +677,12 @@ static void handle_reliable_legacy_v2(const mesh_addr_t *from, const mesh_v2_hdr
 	}
 	portEXIT_CRITICAL(&s_lock);
 
-	if (send_nack) {
-		send_control(from, h->src_mac, MESH_V2_TYPE_NACK, h->session_id, ack_seq, missing_seq);
-	} else {
-		send_control(from, h->src_mac, MESH_V2_TYPE_ACK, h->session_id, ack_seq, 0);
-	}
+	esp_err_t ack_err = send_nack
+		? send_control(from, h->src_mac, MESH_V2_TYPE_NACK,
+		               h->session_id, ack_seq, missing_seq)
+		: send_control(from, h->src_mac, MESH_V2_TYPE_ACK,
+		               h->session_id, ack_seq, 0);
+	note_ack_tx_result(h->src_mac, ack_err);
 
 	if (deliver) {
 		deliver_legacy_v2_payload(h, payload);
@@ -740,6 +761,8 @@ bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out)
 		out->lost_count = st->lost_count;
 		out->last_v2_ms = st->last_v2_ms;
 		out->last_tunnel_ms = st->last_tunnel_ms;
+		out->last_ack_tx_ms = st->last_ack_tx_ms;
+		out->last_ack_err = st->last_ack_err;
 		for (uint32_t ch = 1; ch <= MESH_V2_TUNNEL_CHANNEL_MAX; ch++) {
 			const tunnel_rx_channel_t *rx = &st->rx[ch];
 			out->gap_count += rx->gap_count;
@@ -821,8 +844,11 @@ esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable)
 	mac_copy(t->target_mac, mac);
 	memcpy(payload + sizeof(*t), &ctrl, sizeof(ctrl));
 
-	return send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA, session_id, 0, 0,
-	                          payload, sizeof(*t) + sizeof(ctrl));
+	esp_err_t err = send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA,
+	                                   session_id, 0, 0,
+	                                   payload, sizeof(*t) + sizeof(ctrl));
+	note_ack_tx_result(mac, err);
+	return err;
 }
 
 esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_id)
@@ -872,6 +898,9 @@ esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_
 	mac_copy(t->target_mac, mac);
 	memcpy(payload + sizeof(*t), &req, sizeof(req));
 
-	return send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA, session_id, 0, 0,
-	                          payload, sizeof(*t) + sizeof(req));
+	esp_err_t err = send_packet_to_mac(mac, MESH_V2_TYPE_TUNNEL_DATA,
+	                                   session_id, 0, 0,
+	                                   payload, sizeof(*t) + sizeof(req));
+	note_ack_tx_result(mac, err);
+	return err;
 }

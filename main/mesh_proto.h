@@ -362,6 +362,17 @@ typedef struct __attribute__((packed)) {
 #define MESH_V2_TOPO_DIAG_HAS_EXT		0x0001
 #define MESH_V2_TOPO_DIAG_RECENT_REBOOT		0x0002
 #define MESH_V2_TOPO_DIAG_COMPOSITE_HEALTH	0x0004
+#define MESH_V2_TOPO_DIAG_ACK_HEALTH		0x0008
+#define MESH_V2_TOPO_DIAG_TX_WITHOUT_ACK	0x0010
+
+#define MESH_V2_RECOVERY_REASON_NONE		0
+#define MESH_V2_RECOVERY_REASON_ACK_STALE	1
+#define MESH_V2_RECOVERY_REASON_TX_NO_ACK	2
+#define MESH_V2_RECOVERY_REASON_ROOTLESS		3
+#define MESH_V2_RECOVERY_REASON_NO_PARENT	4
+#define MESH_V2_RECOVERY_REASON_PARENT_DISC	5
+#define MESH_V2_RECOVERY_REASON_SOFT_RECONNECT	6
+#define MESH_V2_RECOVERY_REASON_MESH_RESTART	7
 
 typedef struct __attribute__((packed)) {
 	mesh_v2_topology_v2_payload_t v2;
@@ -375,7 +386,10 @@ typedef struct __attribute__((packed)) {
 	uint16_t	soft_reconnect_count;
 	uint16_t	mesh_restart_count;
 	uint8_t		last_parent_disconnect_reason;
-	uint8_t		rsv[3];
+	uint8_t		last_recovery_reason;
+	uint32_t	ack_stale_count;
+	uint32_t	tx_without_ack_count;
+	uint8_t		rsv[2];
 } mesh_v2_topology_v3_payload_t;
 
 #ifndef __cplusplus

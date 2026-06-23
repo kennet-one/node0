@@ -22,6 +22,8 @@ typedef struct {
 	uint32_t lost_count;
 	uint32_t last_v2_ms;
 	uint32_t last_tunnel_ms;
+	uint32_t last_ack_tx_ms;
+	int32_t last_ack_err;
 } mesh_v2_root_stats_t;
 
 esp_err_t mesh_v2_root_handle_rx(const mesh_addr_t *from, const void *pkt_buf, size_t pkt_len);
