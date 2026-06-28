@@ -593,11 +593,21 @@ static uint32_t node_last_app_ms(const uint8_t mac[6])
 	return last_ms;
 }
 
+static long timestamp_age_ms(uint32_t now, uint32_t timestamp)
+{
+	if (timestamp == 0) return -1;
+
+	uint32_t age = (uint32_t)(now - timestamp);
+	if (timestamp > now && (uint32_t)(timestamp - now) < 60000U) {
+		age = 0;
+	}
+	return (long)age;
+}
+
 static long node_app_age_ms_at(const uint8_t mac[6], uint32_t now)
 {
 	uint32_t last_ms = node_last_app_ms(mac);
-	if (last_ms == 0) return -1;
-	return (long)(uint32_t)(now - last_ms);
+	return timestamp_age_ms(now, last_ms);
 }
 
 static bool node_has_fresh_telemetry(const uint8_t mac[6], uint32_t max_age_ms)
@@ -2208,6 +2218,51 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 	ui_stream_notify();
 }
 
+void log_http_server_memory_snapshot_v2(const uint8_t mac[6],
+                                        const mesh_v2_memory_payload_t *snapshot)
+{
+	if (!mac || !snapshot) return;
+
+	char tag[MESH_V2_TAG_MAX + 1];
+	copy_packet_text(tag, sizeof(tag), snapshot->tag, sizeof(snapshot->tag));
+	log_http_server_node_seen_uptime(mac, tag, true, snapshot->uptime_s);
+
+	portENTER_CRITICAL(&s_taskmon_lock);
+	{
+		taskmon_ent_t *ent = taskmon_find_locked(mac, true);
+		if (ent) {
+			taskmon_update_tag_locked(ent, tag);
+			ent->ram.valid = true;
+			ent->ram.free_bytes = snapshot->heap_free;
+			ent->ram.min_free_bytes = snapshot->heap_min_free;
+			ent->ram.total_bytes = snapshot->heap_total;
+			ent->ram.internal_valid = snapshot->internal_total > 0;
+			ent->ram.internal_free_bytes = snapshot->internal_free;
+			ent->ram.internal_min_free_bytes = snapshot->internal_min_free;
+			ent->ram.internal_total_bytes = snapshot->internal_total;
+			ent->ram.psram_valid = snapshot->psram_total > 0;
+			ent->ram.psram_enabled = snapshot->psram_enabled != 0;
+			ent->ram.psram_free_bytes = snapshot->psram_free;
+			ent->ram.psram_min_free_bytes = snapshot->psram_min_free;
+			ent->ram.psram_total_bytes = snapshot->psram_total;
+			ent->ram.psram_expected_bytes = snapshot->psram_expected;
+
+			ent->persistent.flash_valid = snapshot->flash_chip > 0 &&
+			                              snapshot->app_slot > 0;
+			ent->persistent.flash_chip_bytes = snapshot->flash_chip;
+			ent->persistent.app_used_bytes = snapshot->app_used;
+			ent->persistent.app_partition_bytes = snapshot->app_slot;
+			ent->persistent.nvs_valid = snapshot->nvs_total > 0;
+			ent->persistent.nvs_used_entries = snapshot->nvs_used;
+			ent->persistent.nvs_free_entries = snapshot->nvs_free;
+			ent->persistent.nvs_available_entries = snapshot->nvs_available;
+			ent->persistent.nvs_total_entries = snapshot->nvs_total;
+		}
+	}
+	portEXIT_CRITICAL(&s_taskmon_lock);
+	ui_stream_notify();
+}
+
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
 {
 	if (!mac || !line) return;
@@ -2980,13 +3035,14 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	mesh_v2_root_stats_t st;
 	bool has_v2 = mac && mesh_v2_root_stats_for_mac(mac, &st);
 	long v2_age_ms = -1;
-	long v2_ack_age_ms = -1;
+	long v2_ack_tx_age_ms = -1;
 
 	pos = append_fmt(out, cap, pos, ",\"proto\":");
 	if (mac && mac_eq(mac, s_local_mac)) {
 		pos = append_json_string(out, cap, pos, "local");
 	} else {
 		pos = append_json_string(out, cap, pos,
+		                         (has_v2 && st.reliable_ready) ? "lossless" :
 		                         (has_v2 && st.tunnel_seen) ? "tunnel" :
 		                         (has_v2 ? "v2" : "v1"));
 	}
@@ -2996,26 +3052,29 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  ",\"v2_session\":0,\"expected_seq\":0,"
 		                  "\"gap_count\":0,\"replay_count\":0,"
 		                  "\"lost_count\":0,\"last_v2_ms\":0,"
-		                  "\"last_tunnel_ms\":0,\"v2_age_ms\":-1,\"v2_ack_age_ms\":-1,"
+		                  "\"last_tunnel_ms\":0,\"v2_age_ms\":-1,\"v2_ack_tx_age_ms\":-1,"
 		                  "\"v2_ack_err\":0,\"v2_ack_err_name\":\"\","
-		                  "\"tunnel_age_ms\":-1,\"has_gap\":false");
+		                  "\"tunnel_age_ms\":-1,\"rel_log_age_ms\":-1,\"has_gap\":false,"
+		                  "\"reliable_ready\":false,\"root_session\":0,"
+		                  "\"node_session\":0,\"tx_unacked\":0,\"reorder_depth\":0,"
+		                  "\"rto_ms\":0,\"retry_count\":0,\"ack_age_ms\":-1,"
+		                  "\"rtt_ms\":0,\"overflow_count\":0,\"lost_reason\":0");
 	}
 
 	if (st.last_v2_ms != 0) {
-		v2_age_ms = (long)(uint32_t)(now - st.last_v2_ms);
+		v2_age_ms = timestamp_age_ms(now, st.last_v2_ms);
 	}
 	if (st.last_ack_tx_ms != 0) {
-		v2_ack_age_ms = (long)(uint32_t)(now - st.last_ack_tx_ms);
+		v2_ack_tx_age_ms = timestamp_age_ms(now, st.last_ack_tx_ms);
 	}
-	long tunnel_age_ms = st.last_tunnel_ms != 0
-		? (long)(uint32_t)(now - st.last_tunnel_ms)
-		: -1;
+	long tunnel_age_ms = timestamp_age_ms(now, st.last_tunnel_ms);
+	long rel_log_age_ms = timestamp_age_ms(now, st.last_rel_log_ms);
 
 	pos = append_fmt(out, cap, pos,
 	                 ",\"v2_session\":%lu,\"expected_seq\":%lu,"
 	                 "\"gap_count\":%lu,\"replay_count\":%lu,"
 	                 "\"lost_count\":%lu,\"last_v2_ms\":%lu,"
-	                 "\"last_tunnel_ms\":%lu,\"v2_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
+	                 "\"last_tunnel_ms\":%lu,\"v2_age_ms\":%ld,\"v2_ack_tx_age_ms\":%ld,"
 	                 "\"v2_ack_err\":%ld,\"v2_ack_err_name\":",
 	                 (unsigned long)st.session_id,
 	                 (unsigned long)st.expected_seq,
@@ -3025,13 +3084,31 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                 (unsigned long)st.last_v2_ms,
 	                 (unsigned long)st.last_tunnel_ms,
 	                 v2_age_ms,
-	                 v2_ack_age_ms,
+	                 v2_ack_tx_age_ms,
 	                 (long)st.last_ack_err);
 	pos = append_json_string(out, cap, pos, mesh_err_label(st.last_ack_err));
 	return append_fmt(out, cap, pos,
-	                  ",\"tunnel_age_ms\":%ld,\"has_gap\":%s",
+	                  ",\"tunnel_age_ms\":%ld,\"rel_log_age_ms\":%ld,\"has_gap\":%s,"
+	                  "\"reliable_ready\":%s,\"root_session\":%lu,"
+	                  "\"node_session\":%lu,\"tx_unacked\":%lu,"
+	                  "\"reorder_depth\":%lu,\"rto_ms\":%lu,"
+	                  "\"retry_count\":%lu,\"ack_age_ms\":%ld,"
+	                  "\"rtt_ms\":%lu,\"overflow_count\":%lu,"
+	                  "\"lost_reason\":%u",
 	                  tunnel_age_ms,
-	                  st.has_gap ? "true" : "false");
+	                  rel_log_age_ms,
+	                  st.has_gap ? "true" : "false",
+	                  st.reliable_ready ? "true" : "false",
+	                  (unsigned long)st.root_session_id,
+	                  (unsigned long)st.node_session_id,
+	                  (unsigned long)st.tx_unacked,
+	                  (unsigned long)st.reorder_depth,
+	                  (unsigned long)st.rto_ms,
+	                  (unsigned long)st.retry_count,
+	                  st.ack_age_ms == UINT32_MAX ? -1L : (long)st.ack_age_ms,
+	                  (unsigned long)st.rtt_ms,
+	                  (unsigned long)st.overflow_count,
+	                  (unsigned)st.lost_reason);
 }
 
 static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
@@ -3047,9 +3124,9 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 	bool has_nodeinfo = last_nodeinfo_ms != 0;
 	bool has_route_history = last_route_ms != 0;
 	uint32_t app_last_ms = node_last_app_ms(mac);
-	long route_age_ms = has_route_history ? (long)(uint32_t)(now - last_route_ms) : -1;
-	long nodeinfo_age_ms = has_nodeinfo ? (long)(uint32_t)(now - last_nodeinfo_ms) : -1;
-	long telemetry_age_ms = app_last_ms ? (long)(uint32_t)(now - app_last_ms) : -1;
+	long route_age_ms = timestamp_age_ms(now, last_route_ms);
+	long nodeinfo_age_ms = timestamp_age_ms(now, last_nodeinfo_ms);
+	long telemetry_age_ms = node_app_age_ms_at(mac, now);
 
 	bool fresh_telemetry = remote
 		? (telemetry_age_ms >= 0 && (uint32_t)telemetry_age_ms <= NODEINFO_STALE_MS)
@@ -3087,10 +3164,8 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
 				               route_seen ? "telemetry_stale" :
 				               fresh_telemetry ? "waiting_log" :
 				               "waiting_route";
-				log_ctrl_age_ms = s_last_log_ctrl_ms ?
-					(long)(uint32_t)(now - s_last_log_ctrl_ms) : -1;
-				remote_line_age_ms = s_stream_last_line_ms ?
-					(long)(uint32_t)(now - s_stream_last_line_ms) : -1;
+				log_ctrl_age_ms = timestamp_age_ms(now, s_last_log_ctrl_ms);
+				remote_line_age_ms = timestamp_age_ms(now, s_stream_last_line_ms);
 				last_log_ctrl_err = (int)s_last_log_ctrl_err;
 			}
 		}
@@ -3177,7 +3252,7 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 		                  "\"recent_reboot\":false");
 	}
 
-	long age_ms = (long)(uint32_t)(now - node->topology_seen_ms);
+	long age_ms = timestamp_age_ms(now, node->topology_seen_ms);
 	bool recent_reboot = node->recent_reboot_seen_ms != 0 &&
 	                     (uint32_t)(now - node->recent_reboot_seen_ms) <=
 	                     RECENT_REBOOT_WINDOW_MS;
@@ -3301,7 +3376,10 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	local_node.layer = 1;
 	local_node.max_layer = CONFIG_MESH_MAX_LAYER;
 	local_node.parent_rssi = 0;
-	local_node.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
+	local_node.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY |
+	                          MESH_V2_CAP_TOPOLOGY | MESH_V2_CAP_RELIABLE_E2E |
+	                          MESH_V2_CAP_SACK | MESH_V2_CAP_FRAGMENT |
+	                          MESH_V2_CAP_TYPED_CONTROL | MESH_V2_CAP_TYPED_MEMORY;
 	pos = append_node_topology_json_fields(out, cap, pos, &local_node, now);
 	pos = append_node_health_json_fields(out, cap, pos, s_local_mac,
 	                                     true, now, now, now);
@@ -4998,10 +5076,10 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	}
 	portEXIT_CRITICAL(&s_selection_lock);
 
-	long selected_age = selected_ms ? (long)(uint32_t)(now - selected_ms) : -1;
-	long line_age = last_line_ms ? (long)(uint32_t)(now - last_line_ms) : -1;
-	long rearm_age = last_rearm_ms ? (long)(uint32_t)(now - last_rearm_ms) : -1;
-	long ctrl_age = last_log_ctrl_ms ? (long)(uint32_t)(now - last_log_ctrl_ms) : -1;
+	long selected_age = timestamp_age_ms(now, selected_ms);
+	long line_age = timestamp_age_ms(now, last_line_ms);
+	long rearm_age = timestamp_age_ms(now, last_rearm_ms);
+	long ctrl_age = timestamp_age_ms(now, last_log_ctrl_ms);
 	long app_age = remote_stream ? node_app_age_ms_at(selected_mac, now) : -1;
 	size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	size_t internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -5728,7 +5806,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
 		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / fw ? / app slot ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app slot ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"const pageSid=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).replace(/[^a-zA-Z0-9_-]/g,'');\n"
@@ -5790,7 +5868,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function fmtUsedKb(free,total){free=Number(free)||0;total=Number(total)||0;if(total<=0)return '?';return fmtKb(Math.max(0,total-free))+'/'+fmtKb(total)+' used'}\n"
 		"function fmtRamPool(label,valid,free,total){return valid&&Number(total)>0?label+' '+fmtUsedKb(free,total):label+' ?'}\n"
 		"function fmtRam(j){if(!j.ram_valid)return 'RAM int ? / PSRAM ?';const iv=!!j.ram_internal_valid;const pv=!!j.ram_psram_valid;let s=iv?fmtRamPool('RAM int',true,j.ram_internal_free_bytes,j.ram_internal_total_bytes):fmtRamPool('RAM',true,j.ram_free_bytes,j.ram_total_bytes);if(pv)return s+' / '+fmtRamPool('PSRAM',true,j.ram_psram_free_bytes,j.ram_psram_total_bytes);if(iv){const cap=Number(j.ram_psram_expected_bytes)||0;return s+' / PSRAM inactive / cap '+(cap>0?fmtKb(cap):'?')}return s+' / PSRAM ?'}\n"
-		"function fmtFlash(j){if(!j.flash_valid)return 'FLASH ? / fw ? / app slot ? / NVS ?';const chip=Number(j.flash_chip_bytes)||0;const app=Number(j.app_used_bytes)||0;const slot=Number(j.app_partition_bytes)||0;const pct=chip>0?Math.round(app*100/chip)+'%':'?';const flash='FLASH '+fmtMb(chip)+' chip / fw '+fmtKb(app)+' ('+pct+') / app slot '+fmtKbNum(app)+'/'+fmtKbNum(slot)+' KB';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
+		"function fmtFlash(j){if(!j.flash_valid)return 'FLASH ? / app slot ? / NVS ?';const chip=Number(j.flash_chip_bytes)||0;const app=Number(j.app_used_bytes)||0;const slot=Number(j.app_partition_bytes)||0;const pct=slot>0?Math.round(app*100/slot)+'%':'?';const flash='FLASH '+fmtMb(chip)+' chip / app slot '+fmtKbNum(app)+'/'+fmtKbNum(slot)+' KB ('+pct+')';const nvs=j.nvs_valid?'NVS '+j.nvs_used_entries+'/'+j.nvs_total_entries+' used':'NVS ?';return flash+' / '+nvs}\n"
 		"async function fetchTimeout(url,ms){\n"
 		"  ms=Math.max(ms||0,12000);\n"
 		"  const opt={cache:'no-store'};let timer=null;\n"
@@ -5813,24 +5891,27 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function rememberNode(mac,tag){try{if(mac)localStorage.setItem('logSelectedMac',mac);if(tag)localStorage.setItem('logSelectedTag',tag)}catch(e){}}\n"
 		"function nodeInList(nodes,mac){return !!(mac&&(nodes||[]).some(n=>n.mac===mac))}\n"
 		"async function reselectNode(mac){if(!mac||reselectBusy)return;reselectBusy=true;try{await controlFetch('/select?mac='+encodeURIComponent(mac),6000);lastNodes='';await loadUiStatus();}catch(e){}finally{reselectBusy=false}}\n"
+		"function nodeStateLabel(n){return n.lost_reason&&n.lost_count?'lost':(n.has_gap?'gap':(n.offline?'offline':(n.app_stale?'app stale':(n.stale?'stale':(n.route_table_seen&&!n.telemetry_fresh?'route':(n.proto==='lossless'?'lossless':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))))))))}\n"
+		"function nodeListKey(nodes,cur,waiting){return (cur||'')+'|'+(waiting?'1':'0')+'|'+(nodes||[]).map(n=>(n.mac||'')+'\\t'+(n.tag||'node')+'\\t'+nodeStateLabel(n)).join('\\n')}\n"
 		"function applyNodes(j,raw){\n"
 		"  if(!j)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
-		"  const txt=raw||JSON.stringify(j);if(txt===lastNodes)return;lastNodes=txt;\n"
+		"  if(document.activeElement===s)return;\n"
 		"  let nodes=j.nodes||[];if((!nodes||nodes.length===0)&&lastGoodNodes.length>0){nodes=lastGoodNodes}else if(nodes&&nodes.length>0){lastGoodNodes=nodes.slice(0)}const serverCur=j.selected_mac;localMac=j.local_mac||localMac;const prev=s.value;let cur=(selectionBusy?(selectedMac||prev):serverCur)||prev||selectedMac;const remembered=rememberedNode();const rememberedTag=rememberedNodeTag();\n"
 		"  const rememberedMissing=remembered&&remembered!==serverCur&&!nodeInList(nodes,remembered);\n"
 		"  if(!selectionBusy&&remembered&&remembered!==serverCur&&nodeInList(nodes,remembered)&&!reselectBusy){cur=remembered;setTimeout(()=>reselectNode(remembered),0)}\n"
 		"  else if(!selectionBusy&&rememberedMissing){cur=remembered}\n"
+		"  const key=nodeListKey(nodes,cur,rememberedMissing);if(key===lastNodes)return;lastNodes=key;\n"
 		"  selectedMac=cur||selectedMac;s.innerHTML='';\n"
-		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=n.has_gap?'gap':(n.offline?'offline':(n.app_stale?'app stale':(n.stale?'stale':(n.route_table_seen&&!n.telemetry_fresh?'route':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))))));o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
+		"  for(const n of nodes){const o=document.createElement('option');o.value=n.mac;o.dataset.tag=n.tag||'node';const p=nodeStateLabel(n);o.textContent=(n.tag||'node')+(p?' · '+p:'');s.appendChild(o)}\n"
 		"  if(rememberedMissing){const o=document.createElement('option');o.value=remembered;o.dataset.tag=rememberedTag;o.textContent=rememberedTag+' · waiting';s.appendChild(o)}\n"
 		"  s.value=cur||prev;selectedMac=s.value||selectedMac;updateOtaUi();\n"
 		"}\n"
 		"function errName(e){e=Number(e)||0;if(e===16399)return 'NO_ROUTE';if(e===259)return 'INVALID_STATE';return e?String(e):''}\n"
 		"function recReasonName(r){r=Number(r)||0;const m=['','ack stale','tx/noack','rootless','no parent','parent disc','soft reconnect','mesh restart'];return m[r]||String(r)}\n"
-		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.has_gap)parts.push('gap');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.reliable_ready){parts.push('rtt '+(n.rtt_ms||'?')+'ms');parts.push('rto '+(n.rto_ms||'?')+'ms');parts.push('tx '+(n.tx_unacked||0));if(typeof n.rel_log_age_ms==='number'&&n.rel_log_age_ms>=0&&n.rel_log_age_ms<15000)parts.push('log v2');if(n.reorder_depth)parts.push('reorder '+n.reorder_depth);if(n.retry_count)parts.push('retry '+n.retry_count);if(n.overflow_count)parts.push('overflow '+n.overflow_count)}if(n.lost_reason&&n.lost_count)parts.push('explicit lost '+n.lost_reason);else if(n.has_gap)parts.push('gap');else if(n.replay_count)parts.push('replayed');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':(n.app_stale||n.stale)?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
-		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';return mode||'live'}\n"
+		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.lost_reason&&n.lost_count))return 'explicit lost';if(rem.some(n=>n.has_gap))return 'recovering';if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';if(rem.some(n=>(n.replay_count||0)>0))return 'replayed';if(rem.length&&rem.every(n=>n.reliable_ready))return 'healthy';return mode||'live'}\n"
 		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
 		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
 		"function applyUiStatus(j,mode){if(!j)return;applyNodes(j.nodes,JSON.stringify(j.nodes));if(tasksVisible&&j.tasks)applyTasks(j.tasks,selectedMac||'',JSON.stringify(j.tasks));if(tasksVisible&&j.ota)applyOta(j.ota);if(meshVisible&&j.nodes)applyMeshStatus(j.nodes,mode||'live')}\n"
@@ -5865,7 +5946,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  logStream.onerror=()=>{logStreamReady=false;logStreamErrors++;setLogMode(logStreamErrors>=2?'streamPoll':'streamRetry',logStreamErrors>=2?'poll':'retry');document.getElementById('st').textContent='RETRY';stopLogStream(false);pollFallbackUntil=Date.now()+8000;tick();const d=Math.min(12000,1200*logStreamErrors);setTimeout(()=>{if(!otaBusy&&Date.now()>pollFallbackUntil-1000){pollFallbackUntil=0;startLogStream()}},d)};\n"
 		"}\n"
 		"function setTaskHeader(tag,mac,age,up){document.getElementById('taskNode').textContent=tag||'';document.getElementById('taskUp').textContent=up||'up ?';document.getElementById('taskMac').textContent=mac||'...';document.getElementById('taskAge').textContent=age||'...'}\n"
-		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / fw ? / app slot ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
+		"function clearTasksPanel(){lastTasks='';setTaskHeader('',selectedMac,'...','up ?');document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app slot ? / NVS ?';document.getElementById('taskTable').textContent='waiting for STACKMON'}\n"
 		"function isLocalSelected(){return !!(localMac&&selectedMac&&localMac===selectedMac)}\n"
 		"function selectedNodeTag(){const s=document.getElementById('nodeSel');const o=s&&s.selectedOptions&&s.selectedOptions[0];return o?(o.dataset.tag||o.textContent||'node'):'node'}\n"
 		"function selectedOtaTarget(){return isLocalSelected()?'node0':(selectedNodeTag()||'node')}\n"
@@ -5876,7 +5957,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!local&&!otaSupported){b.disabled=true;rb.disabled=true;s.textContent=otaStatusText||'';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  if(!otaEnabled){b.disabled=true;rb.disabled=true;s.textContent='PIN not set';setOtaSlot(otaSlotText,otaSlotClass);return;}\n"
 		"  const rebootSupported=local||otaSupported;\n"
-		"  b.disabled=otaBusy||rebootBusy||!adminUnlocked||!otaSupported;rb.disabled=otaBusy||rebootBusy||!adminUnlocked||!rebootSupported;s.textContent=otaSupported?(adminUnlocked?(otaStatusText||''):'admin locked'):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
+		"  b.disabled=otaBusy||rebootBusy||!adminUnlocked||!otaSupported;rb.disabled=otaBusy||rebootBusy||!adminUnlocked||!rebootSupported;s.textContent=otaSupported&&adminUnlocked?(otaStatusText||''):'';setOtaSlot(otaSlotText,otaSlotClass);\n"
 		"}\n"
 		"function otaSetStatus(text,showProg,pctVal){\n"
 		"  otaStatusText=text||'';\n"
@@ -6006,6 +6087,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"async function onNodeSel(){\n"
 		"  const s=document.getElementById('nodeSel');\n"
 		"  const mac=s.value;\n"
+		"  if(!mac||mac===selectedMac){rememberNode(mac,selectedNodeTag());return;}\n"
 		"  selectionBusy=true;\n"
 		"  selectedMac=mac;\n"
 		"  rememberNode(mac,selectedNodeTag());\n"
@@ -6036,7 +6118,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"    const r=await controlFetch(url,6000);\n"
 		"    const txt=await r.text();\n"
 		"    applyTasks(JSON.parse(txt),mac,txt);\n"
-		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / fw ? / app slot ? / NVS ?'}finally{tasksBusyReq=false;}\n"
+		"  }catch(e){document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';document.getElementById('taskRam').textContent='RAM int ? / PSRAM ?';document.getElementById('taskFlash').textContent='FLASH ? / app slot ? / NVS ?'}finally{tasksBusyReq=false;}\n"
 		"}\n"
 		"async function loadUiStatus(fresh){\n"
 		"  if(controlPollBusy||otaBusy||selectionBusy||uiStream)return;\n"

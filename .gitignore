@@ -5,3 +5,4 @@ sdkconfig.old
 
 # Local self-signed HTTPS cert/key for the embedded log server.
 /main/certs/*.pem
+/managed_components/

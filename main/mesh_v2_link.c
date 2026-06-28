@@ -7,12 +7,16 @@
 #include "esp_mac.h"
 #include "esp_mesh.h"
 #include "esp_wifi.h"
+#include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "keemash_mesh_core.h"
 #include "log_http_server.h"
+#include "legacy_proto.h"
 #include "mesh_proto.h"
 
 static const char *TAG = "mesh_v2";
@@ -54,6 +58,7 @@ typedef struct {
 	bool has_gap;
 	bool tunnel_seen;
 	uint32_t last_tunnel_ms;
+	uint32_t last_rel_log_ms;
 	uint32_t last_ack_tx_ms;
 	int32_t last_ack_err;
 	uint32_t capabilities;
@@ -63,6 +68,181 @@ typedef struct {
 
 static root_node_state_t s_nodes[MESH_V2_MAX_NODES];
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static keemash_rel_ctx_t *s_rel = NULL;
+static SemaphoreHandle_t s_rel_lock = NULL;
+static TaskHandle_t s_rel_task = NULL;
+
+static void mac_copy(uint8_t dst[6], const uint8_t src[6]);
+static void local_mac(uint8_t mac[6]);
+static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz);
+static uint32_t ms_now(void);
+static root_node_state_t *find_node_locked(const uint8_t mac[6], bool create);
+
+static void note_reliable_delivery(const uint8_t peer[6], uint8_t channel)
+{
+	uint32_t now = ms_now();
+	portENTER_CRITICAL(&s_lock);
+	root_node_state_t *st = find_node_locked(peer, true);
+	if (st) {
+		st->last_v2_ms = now;
+		st->last_tunnel_ms = now;
+		st->tunnel_seen = true;
+		if (channel == MESH_V2_TUNNEL_CHANNEL_LOG) {
+			st->last_rel_log_ms = now;
+		}
+	}
+	portEXIT_CRITICAL(&s_lock);
+}
+
+static esp_err_t rel_send_cb(void *user, const uint8_t dst[6],
+                             const void *packet, size_t packet_len)
+{
+	(void)user;
+	if (!dst || !packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
+	mesh_addr_t dest = {0};
+	mac_copy(dest.addr, dst);
+	mesh_data_t data = {
+		.data = (uint8_t *)packet,
+		.size = packet_len,
+		.proto = MESH_PROTO_BIN,
+		.tos = MESH_TOS_P2P,
+	};
+	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+}
+
+static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
+                           const void *payload, size_t payload_len,
+                           uint32_t stream_id)
+{
+	(void)user;
+	(void)stream_id;
+	if (!peer || !payload) return;
+	note_reliable_delivery(peer, channel);
+
+	if (channel == MESH_V2_TUNNEL_CHANNEL_NODEINFO &&
+	    payload_len >= sizeof(mesh_v2_tunnel_nodeinfo_payload_t)) {
+		const mesh_v2_tunnel_nodeinfo_payload_t *p = payload;
+		char tag[MESH_V2_TAG_MAX + 1];
+		copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
+		log_http_server_node_seen_uptime(peer, tag, true, p->uptime_s);
+		return;
+	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_LOG &&
+	    payload_len >= sizeof(mesh_v2_tunnel_log_payload_t)) {
+		const mesh_v2_tunnel_log_payload_t *p = payload;
+		char tag[MESH_V2_TAG_MAX + 1];
+		char line[MESH_V2_TUNNEL_LOG_LINE_MAX + 1];
+		copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
+		copy_packet_text(line, sizeof(line), p->line, sizeof(p->line));
+		log_http_server_node_seen(peer, tag);
+		log_http_server_remote_line(peer, tag, line);
+		return;
+	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_TASK &&
+	    payload_len >= sizeof(mesh_v2_task_snapshot_payload_t)) {
+		log_http_server_task_snapshot_v2(peer, payload);
+		return;
+	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_MEMORY &&
+	    payload_len >= sizeof(mesh_v2_memory_payload_t)) {
+		log_http_server_memory_snapshot_v2(peer, payload);
+		return;
+	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_TOPOLOGY &&
+	    payload_len >= sizeof(mesh_v2_topology_payload_t)) {
+		log_http_server_node_topology(peer, payload, payload_len);
+		return;
+	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_CONTROL &&
+	    payload_len >= offsetof(mesh_v2_control_payload_t, text)) {
+		const mesh_v2_control_payload_t *p = payload;
+		if ((p->kind == MESH_V2_CONTROL_RESULT ||
+		     p->kind == MESH_V2_CONTROL_EVENT) &&
+		    p->text_len > 0 && p->text_len <= sizeof(p->text)) {
+			char text[MESH_V2_CONTROL_TEXT_MAX + 1];
+			size_t n = p->text_len;
+			memcpy(text, p->text, n);
+			text[n] = '\0';
+			if (p->kind == MESH_V2_CONTROL_EVENT) {
+				legacy_handle_text(text);
+			} else {
+				ESP_LOGI(TAG, "command result id=%lu status=%u text=%s",
+				         (unsigned long)p->command_id,
+				         (unsigned)p->status, text);
+			}
+		}
+	}
+}
+
+static void rel_event_cb(void *user, const uint8_t peer[6], uint8_t channel,
+                         uint8_t reason, uint32_t first, uint32_t last)
+{
+	(void)user;
+	ESP_LOGW(TAG, "reliable lost peer=" MACSTR " ch=%u seq=%lu..%lu reason=%u",
+	         MAC2STR(peer), (unsigned)channel, (unsigned long)first,
+	         (unsigned long)last, (unsigned)reason);
+	log_http_server_mesh_state_changed();
+}
+
+static void rel_poll_task(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		if (s_rel && s_rel_lock &&
+		    xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+			keemash_rel_poll(s_rel);
+			xSemaphoreGiveRecursive(s_rel_lock);
+		}
+		vTaskDelay(pdMS_TO_TICKS(250));
+	}
+}
+
+esp_err_t mesh_v2_root_init(void)
+{
+	if (s_rel) return ESP_OK;
+	if (!s_rel_lock) {
+		s_rel_lock = xSemaphoreCreateRecursiveMutex();
+		if (!s_rel_lock) return ESP_ERR_NO_MEM;
+	}
+	uint8_t mac[6] = {0};
+	local_mac(mac);
+	keemash_rel_config_t cfg = {
+		.root_role = true,
+		.max_peers = MESH_V2_MAX_NODES,
+		.tx_slots = 64,
+		.rx_slots = 64,
+		.reassembly_slots = 8,
+		.reserved_control_slots = 8,
+		.initial_rto_ms = CONFIG_KEEMASH_REL_INITIAL_RTO_MS,
+		.min_rto_ms = CONFIG_KEEMASH_REL_MIN_RTO_MS,
+		.max_rto_ms = CONFIG_KEEMASH_REL_MAX_RTO_MS,
+		.fragment_timeout_ms = CONFIG_KEEMASH_REL_FRAGMENT_TIMEOUT_MS,
+		.max_retries = CONFIG_KEEMASH_REL_MAX_RETRIES,
+		.fault_drop_data_every = CONFIG_KEEMASH_REL_FAULT_DROP_DATA_EVERY,
+		.fault_drop_ack_every = CONFIG_KEEMASH_REL_FAULT_DROP_ACK_EVERY,
+		.fault_drop_nack_every = CONFIG_KEEMASH_REL_FAULT_DROP_NACK_EVERY,
+		.fault_duplicate_every = CONFIG_KEEMASH_REL_FAULT_DUPLICATE_EVERY,
+		.fault_delay_every = CONFIG_KEEMASH_REL_FAULT_DELAY_EVERY,
+		.fault_delay_ms = CONFIG_KEEMASH_REL_FAULT_DELAY_MS,
+		.fault_reorder_every = CONFIG_KEEMASH_REL_FAULT_REORDER_EVERY,
+		.fault_overflow_every = CONFIG_KEEMASH_REL_FAULT_OVERFLOW_EVERY,
+		.send = rel_send_cb,
+		.deliver = rel_deliver_cb,
+		.event = rel_event_cb,
+	};
+	mac_copy(cfg.local_mac, mac);
+	esp_err_t err = keemash_rel_init(&s_rel, &cfg);
+	if (err != ESP_OK) return err;
+	if (!s_rel_task &&
+	    xTaskCreate(rel_poll_task, "mesh_rel", 4096, NULL, 6, &s_rel_task) != pdPASS) {
+		keemash_rel_deinit(s_rel);
+		s_rel = NULL;
+		return ESP_ERR_NO_MEM;
+	}
+	ESP_LOGI(TAG, "reliable root profile started session=%lu",
+	         (unsigned long)keemash_rel_local_session(s_rel));
+	return ESP_OK;
+}
 
 static uint32_t ms_now(void)
 {
@@ -206,6 +386,7 @@ static void reset_session_locked(root_node_state_t *st, const mesh_v2_hdr_t *h)
 	st->has_gap = false;
 	st->last_v2_ms = ms_now();
 	st->last_tunnel_ms = 0;
+	st->last_rel_log_ms = 0;
 	st->tunnel_seen = false;
 	st->last_ack_tx_ms = 0;
 	st->last_ack_err = 0;
@@ -691,6 +872,27 @@ static void handle_reliable_legacy_v2(const mesh_addr_t *from, const mesh_v2_hdr
 
 esp_err_t mesh_v2_root_handle_rx(const mesh_addr_t *from, const void *pkt_buf, size_t pkt_len)
 {
+	if (pkt_buf && pkt_len >= sizeof(mesh_v2_hdr_t)) {
+		const mesh_v2_hdr_t *probe = pkt_buf;
+		if (probe->magic == MESH_PKT_MAGIC &&
+		    probe->version == MESH_PKT_VERSION_V2 &&
+		    probe->type >= MESH_V2_TYPE_RELIABLE_HELLO &&
+		    probe->type <= MESH_V2_TYPE_RELIABLE_LOST) {
+			if (!s_rel) {
+				esp_err_t init_err = mesh_v2_root_init();
+				if (init_err != ESP_OK) return init_err;
+			}
+			if (xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+				return ESP_ERR_TIMEOUT;
+			}
+			esp_err_t rel_err = keemash_rel_handle_rx(s_rel, from->addr,
+			                                          pkt_buf, pkt_len);
+			xSemaphoreGiveRecursive(s_rel_lock);
+			log_http_server_mesh_state_changed();
+			return rel_err;
+		}
+	}
+
 	const mesh_v2_hdr_t *h = NULL;
 	const uint8_t *payload = NULL;
 
@@ -761,6 +963,7 @@ bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out)
 		out->lost_count = st->lost_count;
 		out->last_v2_ms = st->last_v2_ms;
 		out->last_tunnel_ms = st->last_tunnel_ms;
+		out->last_rel_log_ms = st->last_rel_log_ms;
 		out->last_ack_tx_ms = st->last_ack_tx_ms;
 		out->last_ack_err = st->last_ack_err;
 		for (uint32_t ch = 1; ch <= MESH_V2_TUNNEL_CHANNEL_MAX; ch++) {
@@ -778,6 +981,29 @@ bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out)
 		}
 	}
 	portEXIT_CRITICAL(&s_lock);
+
+	if (s_rel && s_rel_lock &&
+	    xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+		keemash_rel_stats_t rel;
+		if (keemash_rel_stats(s_rel, mac, &rel)) {
+			out->seen = true;
+			out->reliable_ready = rel.ready;
+			out->root_session_id = rel.root_session_id;
+			out->node_session_id = rel.node_session_id;
+			out->tx_unacked = rel.tx_unacked;
+			out->reorder_depth = rel.reorder_depth;
+			out->rto_ms = rel.rto_ms;
+			out->retry_count = rel.retry_count;
+			out->ack_age_ms = rel.ack_age_ms;
+			out->rtt_ms = rel.rtt_ms;
+			out->overflow_count = rel.overflow_count;
+			out->lost_reason = rel.lost_reason;
+			out->replay_count += rel.replay_count;
+			out->lost_count += rel.lost_count;
+			out->has_gap = out->has_gap || rel.lost_count > 0;
+		}
+		xSemaphoreGiveRecursive(s_rel_lock);
+	}
 
 	return out->seen;
 }
@@ -802,6 +1028,26 @@ esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable)
 {
 	if (!mac) {
 		return ESP_ERR_INVALID_ARG;
+	}
+	if (s_rel && s_rel_lock &&
+	    xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+		if (keemash_rel_peer_ready(s_rel, mac)) {
+			mesh_v2_control_payload_t command = {0};
+			command.kind = MESH_V2_CONTROL_COMMAND;
+			command.command_id = ms_now();
+			const char *text = enable ? "@log:1" : "@log:0";
+			command.text_len = (uint8_t)strlen(text);
+			memcpy(command.text, text, command.text_len);
+			esp_err_t rel_err = keemash_rel_send(s_rel, mac,
+				MESH_V2_TUNNEL_CHANNEL_CONTROL,
+				&command, offsetof(mesh_v2_control_payload_t, text) +
+				          command.text_len,
+				KEEMASH_REL_PRIORITY_CONTROL);
+			xSemaphoreGiveRecursive(s_rel_lock);
+			if (rel_err == ESP_OK) return ESP_OK;
+		} else {
+			xSemaphoreGiveRecursive(s_rel_lock);
+		}
 	}
 
 	uint32_t session_id = 0;
@@ -856,6 +1102,22 @@ esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_
 	if (!mac) {
 		return ESP_ERR_INVALID_ARG;
 	}
+	if (s_rel && s_rel_lock &&
+	    xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+		if (keemash_rel_peer_ready(s_rel, mac)) {
+			mesh_v2_task_request_payload_t req = {
+				.request_id = request_id,
+				.detail = 1,
+			};
+			esp_err_t rel_err = keemash_rel_send(s_rel, mac,
+				MESH_V2_TUNNEL_CHANNEL_TASK, &req, sizeof(req),
+				KEEMASH_REL_PRIORITY_HIGH);
+			xSemaphoreGiveRecursive(s_rel_lock);
+			if (rel_err == ESP_OK) return ESP_OK;
+		} else {
+			xSemaphoreGiveRecursive(s_rel_lock);
+		}
+	}
 
 	uint32_t session_id = 0;
 	uint32_t seq = 0;
@@ -903,4 +1165,50 @@ esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_
 	                                   payload, sizeof(*t) + sizeof(req));
 	note_ack_tx_result(mac, err);
 	return err;
+}
+
+esp_err_t mesh_v2_root_send_command(const uint8_t mac[6], uint32_t command_id,
+				    const char *command)
+{
+	if (!mac || !command || !command[0]) return ESP_ERR_INVALID_ARG;
+	size_t len = strnlen(command, MESH_V2_CONTROL_TEXT_MAX);
+	if (len == 0 || len >= MESH_V2_CONTROL_TEXT_MAX) return ESP_ERR_INVALID_SIZE;
+	if (!s_rel || !s_rel_lock) return ESP_ERR_INVALID_STATE;
+	if (xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+		return ESP_ERR_TIMEOUT;
+	}
+	mesh_v2_control_payload_t payload = {0};
+	payload.kind = MESH_V2_CONTROL_COMMAND;
+	payload.command_id = command_id;
+	payload.text_len = (uint8_t)len;
+	memcpy(payload.text, command, len);
+	esp_err_t err = keemash_rel_send(s_rel, mac,
+		MESH_V2_TUNNEL_CHANNEL_CONTROL, &payload,
+		offsetof(mesh_v2_control_payload_t, text) + len,
+		KEEMASH_REL_PRIORITY_CONTROL);
+	xSemaphoreGiveRecursive(s_rel_lock);
+	return err;
+}
+
+bool mesh_v2_root_find_ready_by_tag(const char *tag, uint8_t mac[6])
+{
+	if (!tag || !tag[0] || !mac) return false;
+	bool found = false;
+	portENTER_CRITICAL(&s_lock);
+	for (uint32_t i = 0; i < MESH_V2_MAX_NODES; i++) {
+		if (s_nodes[i].used &&
+		    strncmp(s_nodes[i].tag, tag, sizeof(s_nodes[i].tag)) == 0) {
+			mac_copy(mac, s_nodes[i].mac);
+			found = true;
+			break;
+		}
+	}
+	portEXIT_CRITICAL(&s_lock);
+	if (!found || !s_rel || !s_rel_lock) return false;
+	if (xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+		return false;
+	}
+	bool ready = keemash_rel_peer_ready(s_rel, mac);
+	xSemaphoreGiveRecursive(s_rel_lock);
+	return ready;
 }
