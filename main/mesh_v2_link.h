@@ -11,6 +11,16 @@
 extern "C" {
 #endif
 
+
+typedef struct {
+	bool seen;
+	uint8_t status;
+	uint32_t seen_count;
+	uint32_t updated_ms;
+	char text[64];
+	char first_text[64];
+	bool text_changed;
+} mesh_v2_command_result_t;
 typedef struct {
 	bool seen;
 	bool tunnel_seen;
@@ -46,6 +56,8 @@ esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable);
 esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_id);
 esp_err_t mesh_v2_root_send_command(const uint8_t mac[6], uint32_t command_id,
 				    const char *command);
+bool mesh_v2_root_command_result(uint32_t command_id,
+					 mesh_v2_command_result_t *out);
 bool mesh_v2_root_find_ready_by_tag(const char *tag, uint8_t mac[6]);
 
 #ifdef __cplusplus

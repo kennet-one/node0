@@ -218,4 +218,12 @@ menu "Example Configuration"
         help
             PIN required by the node0 HTTPS OTA endpoint. Leave empty to keep
             web OTA disabled. Do not commit real local PIN values.
+
+    config NODE0_LOSSLESS_DEBUG_ENABLE
+        bool "Enable node0 lossless debug endpoints"
+        default n
+        help
+            Registers /debug/lossless/run for deterministic reliable-mesh
+            diagnostics. Keep disabled in normal firmware builds; when enabled,
+            the endpoint still requires the OTA/admin PIN.
 endmenu

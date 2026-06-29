@@ -71,6 +71,21 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static keemash_rel_ctx_t *s_rel = NULL;
 static SemaphoreHandle_t s_rel_lock = NULL;
 static TaskHandle_t s_rel_task = NULL;
+#define COMMAND_RESULT_CACHE_SIZE 8
+
+typedef struct {
+	bool used;
+	uint32_t command_id;
+	uint8_t status;
+	uint32_t seen_count;
+	uint32_t updated_ms;
+	char text[64];
+	char first_text[64];
+	bool text_changed;
+} command_result_slot_t;
+
+static command_result_slot_t s_command_results[COMMAND_RESULT_CACHE_SIZE];
+static uint8_t s_command_result_next = 0;
 
 static void mac_copy(uint8_t dst[6], const uint8_t src[6]);
 static void local_mac(uint8_t mac[6]);
@@ -110,6 +125,41 @@ static esp_err_t rel_send_cb(void *user, const uint8_t dst[6],
 	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 
+static void note_command_result(uint32_t command_id, uint8_t status, const char *text)
+{
+	uint32_t now = ms_now();
+	char new_text[64] = {0};
+	if (text) {
+		strncpy(new_text, text, sizeof(new_text) - 1);
+		new_text[sizeof(new_text) - 1] = '\0';
+	}
+
+	portENTER_CRITICAL(&s_lock);
+	command_result_slot_t *slot = NULL;
+	for (uint8_t i = 0; i < COMMAND_RESULT_CACHE_SIZE; i++) {
+		if (s_command_results[i].used &&
+		    s_command_results[i].command_id == command_id) {
+			slot = &s_command_results[i];
+			break;
+		}
+	}
+	if (!slot) {
+		slot = &s_command_results[s_command_result_next++ % COMMAND_RESULT_CACHE_SIZE];
+		memset(slot, 0, sizeof(*slot));
+		slot->used = true;
+		slot->command_id = command_id;
+		strncpy(slot->first_text, new_text, sizeof(slot->first_text) - 1);
+		slot->first_text[sizeof(slot->first_text) - 1] = '\0';
+	} else if (strcmp(slot->text, new_text) != 0) {
+		slot->text_changed = true;
+	}
+	slot->status = status;
+	slot->seen_count++;
+	slot->updated_ms = now;
+	strncpy(slot->text, new_text, sizeof(slot->text) - 1);
+	slot->text[sizeof(slot->text) - 1] = '\0';
+	portEXIT_CRITICAL(&s_lock);
+}
 static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
                            const void *payload, size_t payload_len,
                            uint32_t stream_id)
@@ -166,6 +216,7 @@ static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
 			if (p->kind == MESH_V2_CONTROL_EVENT) {
 				legacy_handle_text(text);
 			} else {
+				note_command_result(p->command_id, p->status, text);
 				ESP_LOGI(TAG, "command result id=%lu status=%u text=%s",
 				         (unsigned long)p->command_id,
 				         (unsigned)p->status, text);
@@ -1190,6 +1241,28 @@ esp_err_t mesh_v2_root_send_command(const uint8_t mac[6], uint32_t command_id,
 	return err;
 }
 
+
+bool mesh_v2_root_command_result(uint32_t command_id,
+					 mesh_v2_command_result_t *out)
+{
+	if (!out) return false;
+	memset(out, 0, sizeof(*out));
+	portENTER_CRITICAL(&s_lock);
+	for (uint8_t i = 0; i < COMMAND_RESULT_CACHE_SIZE; i++) {
+		const command_result_slot_t *slot = &s_command_results[i];
+		if (!slot->used || slot->command_id != command_id) continue;
+		out->seen = true;
+		out->status = slot->status;
+		out->seen_count = slot->seen_count;
+		out->updated_ms = slot->updated_ms;
+		strncpy(out->text, slot->text, sizeof(out->text) - 1);
+		strncpy(out->first_text, slot->first_text, sizeof(out->first_text) - 1);
+		out->text_changed = slot->text_changed;
+		break;
+	}
+	portEXIT_CRITICAL(&s_lock);
+	return out->seen;
+}
 bool mesh_v2_root_find_ready_by_tag(const char *tag, uint8_t mac[6])
 {
 	if (!tag || !tag[0] || !mac) return false;

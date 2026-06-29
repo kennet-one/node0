@@ -32,6 +32,7 @@
 #include "freertos/semphr.h"
 
 #include "mesh_proto.h"
+#include "keemash_mesh_core.h"
 #include "mesh_v2_link.h"
 #include "stack_monitor.h"
 
@@ -4109,6 +4110,138 @@ static esp_err_t http_admin_check_post(httpd_req_t *req)
 	return http_json_ok(req, "admin unlocked");
 }
 
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static esp_err_t http_lossless_debug_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		return http_json_error(req, "403 Forbidden",
+		                       "debug disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+	if (!ota_check_pin(req)) {
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	char q[128] = {0};
+	char case_name[32] = "core";
+	uint8_t mac[6] = {0};
+	bool have_mac = false;
+	selection_snapshot(mac, NULL, 0);
+	if (!mac_eq(mac, s_local_mac)) {
+		have_mac = true;
+	}
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[64] = {0};
+		if (httpd_query_key_value(q, "case", v, sizeof(v)) == ESP_OK && v[0]) {
+			strncpy(case_name, v, sizeof(case_name) - 1);
+			case_name[sizeof(case_name) - 1] = '\0';
+		}
+		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
+			uint8_t parsed[6];
+			if (!parse_mac_hex(v, parsed)) {
+				return http_json_error(req, "400 Bad Request", "bad mac");
+			}
+			mac_copy(mac, parsed);
+			have_mac = true;
+		}
+	}
+	if (!have_mac) {
+		have_mac = mesh_v2_root_find_ready_by_tag("choinka", mac);
+	}
+
+	keemash_rel_debug_result_t core = {0};
+	bool run_core = strcmp(case_name, "core") == 0 || strcmp(case_name, "all") == 0 ||
+	                strcmp(case_name, "seq_wrap") == 0 ||
+	                strcmp(case_name, "session_reset") == 0 ||
+	                strcmp(case_name, "fragment_timeout") == 0 ||
+	                strcmp(case_name, "retry_exhausted") == 0;
+	uint32_t mask = 0;
+	if (strcmp(case_name, "seq_wrap") == 0) mask = KEEMASH_REL_DEBUG_CASE_SEQ_WRAP;
+	else if (strcmp(case_name, "session_reset") == 0) mask = KEEMASH_REL_DEBUG_CASE_SESSION_RESET;
+	else if (strcmp(case_name, "fragment_timeout") == 0) mask = KEEMASH_REL_DEBUG_CASE_FRAGMENT_TIMEOUT;
+	else if (strcmp(case_name, "retry_exhausted") == 0) mask = KEEMASH_REL_DEBUG_CASE_RETRY_EXHAUSTED;
+	else mask = KEEMASH_REL_DEBUG_CASE_ALL;
+
+	if (run_core) {
+		esp_err_t err = keemash_rel_debug_run_selftest(mask, &core);
+		if (err != ESP_OK) {
+			return http_json_error(req, "500 Internal Server Error",
+			                       esp_err_to_name(err));
+		}
+	}
+
+	bool run_dedupe = strcmp(case_name, "dedupe") == 0 || strcmp(case_name, "all") == 0;
+	bool dedupe_pass = false;
+	mesh_v2_command_result_t result = {0};
+	uint32_t command_id = 0;
+	esp_err_t dedupe_err = ESP_OK;
+	if (run_dedupe) {
+		if (!have_mac || mac_eq(mac, s_local_mac)) {
+			dedupe_err = ESP_ERR_INVALID_STATE;
+		} else {
+			command_id = ms_now() | 0xD0000000UL;
+			dedupe_err = mesh_v2_root_send_command(mac, command_id, "@dbg:dedupe");
+			if (dedupe_err == ESP_OK) {
+				dedupe_err = mesh_v2_root_send_command(mac, command_id, "@dbg:dedupe");
+			}
+			for (uint8_t i = 0; dedupe_err == ESP_OK && i < 50; i++) {
+				vTaskDelay(pdMS_TO_TICKS(100));
+				if (mesh_v2_root_command_result(command_id, &result) &&
+				    result.seen_count >= 2) {
+					break;
+				}
+			}
+			dedupe_pass = result.seen && result.seen_count >= 2 &&
+			              !result.text_changed &&
+			              strstr(result.text, "debug action count=") != NULL;
+			if (!dedupe_pass && dedupe_err == ESP_OK) dedupe_err = ESP_ERR_TIMEOUT;
+		}
+	}
+
+	char mac_hex[13] = "";
+	if (have_mac) mac_to_hex(mac, mac_hex);
+	bool overall_pass = (!run_core || core.pass) && (!run_dedupe || dedupe_pass);
+	char out[768];
+	size_t pos = append_fmt(out, sizeof(out), 0,
+		"{\"ok\":%s,\"pass\":%s,\"case\":",
+		overall_pass ? "true" : "false",
+		overall_pass ? "true" : "false");
+	pos = append_json_string(out, sizeof(out), pos, case_name);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"core_run\":%s,\"core_pass\":%s,"
+		"\"cases_run\":%lu,\"cases_passed\":%lu,\"failed_mask\":%lu,"
+		"\"lost_count\":%lu,\"overflow_count\":%lu,"
+		"\"replay_count\":%lu,\"retry_count\":%lu,\"message\":",
+		run_core ? "true" : "false",
+		(!run_core || core.pass) ? "true" : "false",
+		(unsigned long)core.cases_run,
+		(unsigned long)core.cases_passed,
+		(unsigned long)core.failed_mask,
+		(unsigned long)core.lost_count,
+		(unsigned long)core.overflow_count,
+		(unsigned long)core.replay_count,
+		(unsigned long)core.retry_count);
+	pos = append_json_string(out, sizeof(out), pos, run_core ? core.message : "not run");
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"dedupe_run\":%s,\"dedupe_pass\":%s,\"dedupe_err\":%d,"
+		"\"dedupe_target\":\"%s\",\"command_id\":%lu,"
+		"\"result_seen\":%s,\"result_seen_count\":%lu,"
+		"\"result_status\":%u,\"result_text_changed\":%s,\"result_text\":",
+		run_dedupe ? "true" : "false",
+		(!run_dedupe || dedupe_pass) ? "true" : "false",
+		(int)dedupe_err,
+		mac_hex,
+		(unsigned long)command_id,
+		result.seen ? "true" : "false",
+		(unsigned long)result.seen_count,
+		(unsigned)result.status, result.text_changed ? "true" : "false");
+	pos = append_json_string(out, sizeof(out), pos, result.text);
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+#endif
 static int ota_recv_retry(httpd_req_t *req, uint8_t *buf, size_t len)
 {
 	if (!req || !buf || len == 0) {
@@ -6221,6 +6354,14 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	httpd_uri_t uri_lossless_debug = {
+		.uri		= "/debug/lossless/run",
+		.method		= HTTP_POST,
+		.handler	= http_lossless_debug_post,
+		.user_ctx	= NULL
+	};
+#endif
 	httpd_uri_t uri_admin_check = {
 		.uri		= "/admin/check",
 		.method		= HTTP_POST,
@@ -6311,6 +6452,10 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 #endif
 	err = httpd_register_uri_handler(server, &uri_stream_close);
 	if (err != ESP_OK) return err;
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	err = httpd_register_uri_handler(server, &uri_lossless_debug);
+	if (err != ESP_OK) return err;
+#endif
 	err = httpd_register_uri_handler(server, &uri_admin_check);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_reboot);
@@ -6418,7 +6563,11 @@ esp_err_t log_http_server_start(void)
 	config.httpd.lru_purge_enable = true;
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	config.httpd.max_uri_handlers = 19;
+#else
 	config.httpd.max_uri_handlers = 18;
+#endif
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;
