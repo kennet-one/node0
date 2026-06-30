@@ -4153,12 +4153,20 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	                strcmp(case_name, "seq_wrap") == 0 ||
 	                strcmp(case_name, "session_reset") == 0 ||
 	                strcmp(case_name, "fragment_timeout") == 0 ||
-	                strcmp(case_name, "retry_exhausted") == 0;
+	                strcmp(case_name, "retry_exhausted") == 0 ||
+	                strcmp(case_name, "log_stress") == 0 ||
+	                strcmp(case_name, "parallel") == 0 ||
+	                strcmp(case_name, "parallel_channels") == 0;
 	uint32_t mask = 0;
 	if (strcmp(case_name, "seq_wrap") == 0) mask = KEEMASH_REL_DEBUG_CASE_SEQ_WRAP;
 	else if (strcmp(case_name, "session_reset") == 0) mask = KEEMASH_REL_DEBUG_CASE_SESSION_RESET;
 	else if (strcmp(case_name, "fragment_timeout") == 0) mask = KEEMASH_REL_DEBUG_CASE_FRAGMENT_TIMEOUT;
 	else if (strcmp(case_name, "retry_exhausted") == 0) mask = KEEMASH_REL_DEBUG_CASE_RETRY_EXHAUSTED;
+	else if (strcmp(case_name, "log_stress") == 0) mask = KEEMASH_REL_DEBUG_CASE_LOG_STRESS;
+	else if (strcmp(case_name, "parallel") == 0 ||
+	         strcmp(case_name, "parallel_channels") == 0) {
+		mask = KEEMASH_REL_DEBUG_CASE_PARALLEL_CHANNELS;
+	}
 	else mask = KEEMASH_REL_DEBUG_CASE_ALL;
 
 	if (run_core) {
@@ -4200,7 +4208,7 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	char mac_hex[13] = "";
 	if (have_mac) mac_to_hex(mac, mac_hex);
 	bool overall_pass = (!run_core || core.pass) && (!run_dedupe || dedupe_pass);
-	char out[768];
+	char out[1024];
 	size_t pos = append_fmt(out, sizeof(out), 0,
 		"{\"ok\":%s,\"pass\":%s,\"case\":",
 		overall_pass ? "true" : "false",
@@ -4210,7 +4218,11 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		",\"core_run\":%s,\"core_pass\":%s,"
 		"\"cases_run\":%lu,\"cases_passed\":%lu,\"failed_mask\":%lu,"
 		"\"lost_count\":%lu,\"overflow_count\":%lu,"
-		"\"replay_count\":%lu,\"retry_count\":%lu,\"message\":",
+		"\"replay_count\":%lu,\"retry_count\":%lu,"
+		"\"delivered_control\":%lu,\"delivered_log\":%lu,"
+		"\"delivered_task\":%lu,\"delivered_memory\":%lu,"
+		"\"stress_frames\":%lu,\"max_tx_unacked\":%lu,"
+		"\"max_reorder_depth\":%lu,\"message\":",
 		run_core ? "true" : "false",
 		(!run_core || core.pass) ? "true" : "false",
 		(unsigned long)core.cases_run,
@@ -4219,7 +4231,14 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		(unsigned long)core.lost_count,
 		(unsigned long)core.overflow_count,
 		(unsigned long)core.replay_count,
-		(unsigned long)core.retry_count);
+		(unsigned long)core.retry_count,
+		(unsigned long)core.delivered_control,
+		(unsigned long)core.delivered_log,
+		(unsigned long)core.delivered_task,
+		(unsigned long)core.delivered_memory,
+		(unsigned long)core.stress_frames,
+		(unsigned long)core.max_tx_unacked,
+		(unsigned long)core.max_reorder_depth);
 	pos = append_json_string(out, sizeof(out), pos, run_core ? core.message : "not run");
 	pos = append_fmt(out, sizeof(out), pos,
 		",\"dedupe_run\":%s,\"dedupe_pass\":%s,\"dedupe_err\":%d,"
