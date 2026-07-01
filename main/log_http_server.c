@@ -316,6 +316,7 @@ static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
                                             bool include_ota);
 static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s);
+static bool node_boot_seq_for_mac(const uint8_t mac[6], uint32_t *boot_seq);
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable);
 static bool selected_remote_stream_needs_rearm(const uint8_t mac[6]);
 static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t err);
@@ -377,6 +378,10 @@ typedef struct {
 	char last_error[96];
 	char last_result[96];
 	char remote_message[MESH_OTA_STATUS_MSG_MAX];
+	bool reboot_uptime_valid;
+	uint32_t reboot_baseline_uptime_s;
+	bool reboot_boot_seq_valid;
+	uint32_t reboot_baseline_boot_seq;
 } remote_ota_status_t;
 
 static SemaphoreHandle_t s_remote_ota_ack_sem = NULL;
@@ -743,6 +748,31 @@ static bool node_uptime_for_mac(const uint8_t mac[6], uint32_t *uptime_s)
 
 	if (valid) {
 		*uptime_s = value;
+	}
+	return valid;
+}
+
+static bool node_boot_seq_for_mac(const uint8_t mac[6], uint32_t *boot_seq)
+{
+	if (!mac || !boot_seq) return false;
+
+	bool valid = false;
+	uint32_t value = 0;
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	{
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac) && s_nodes[i].diag_valid) {
+				valid = true;
+				value = s_nodes[i].boot_seq;
+				break;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	if (valid) {
+		*boot_seq = value;
 	}
 	return valid;
 }
@@ -2176,6 +2206,7 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	}
 	portEXIT_CRITICAL(&s_nodes_lock);
 
+	remote_ota_note_node_seen(mac, true, topology->uptime_s);
 	mesh_stream_mark_changed();
 }
 
@@ -3063,6 +3094,16 @@ static void remote_ota_status_begin(const uint8_t mac[6], const char *tag,
 	status.started_ms = ms_now();
 	strncpy(status.last_result, "remote upload started",
 	        sizeof(status.last_result) - 1);
+	uint32_t uptime_s = 0;
+	if (node_uptime_for_mac(mac, &uptime_s)) {
+		status.reboot_uptime_valid = true;
+		status.reboot_baseline_uptime_s = uptime_s;
+	}
+	uint32_t boot_seq = 0;
+	if (node_boot_seq_for_mac(mac, &boot_seq)) {
+		status.reboot_boot_seq_valid = true;
+		status.reboot_baseline_boot_seq = boot_seq;
+	}
 
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	s_remote_ota_status = status;
@@ -3103,6 +3144,26 @@ static void remote_ota_status_finish(node0_ota_state_t state, const char *msg)
 	portEXIT_CRITICAL(&s_remote_ota_lock);
 }
 
+static bool remote_ota_reboot_observed(const remote_ota_status_t *status,
+                                       uint32_t uptime_s,
+                                       bool boot_seq_valid,
+                                       uint32_t boot_seq)
+{
+	if (!status) return false;
+
+	if (status->reboot_boot_seq_valid &&
+	    boot_seq_valid &&
+	    boot_seq != status->reboot_baseline_boot_seq) {
+		return true;
+	}
+
+	if (status->reboot_uptime_valid) {
+		return uptime_s + 5U < status->reboot_baseline_uptime_s;
+	}
+
+	return uptime_s <= 30U;
+}
+
 static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
                                       uint32_t uptime_s)
 {
@@ -3115,10 +3176,15 @@ static void remote_ota_note_node_seen(const uint8_t mac[6], bool uptime_valid,
 	         "remote OTA booted, uptime %lus",
 	         (unsigned long)uptime_s);
 
+	uint32_t boot_seq = 0;
+	bool boot_seq_valid = node_boot_seq_for_mac(mac, &boot_seq);
+
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	if (s_remote_ota_status.target_valid &&
 	    mac_eq(mac, s_remote_ota_status.target_mac) &&
-	    s_remote_ota_status.state == NODE0_OTA_REBOOTING) {
+	    s_remote_ota_status.state == NODE0_OTA_REBOOTING &&
+	    remote_ota_reboot_observed(&s_remote_ota_status, uptime_s,
+	                               boot_seq_valid, boot_seq)) {
 		s_remote_ota_status.state = NODE0_OTA_SUCCESS;
 		s_remote_ota_status.finished_ms = ms_now();
 		strncpy(s_remote_ota_status.last_result, result,
