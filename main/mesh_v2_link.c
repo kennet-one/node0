@@ -198,6 +198,11 @@ static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
 		log_http_server_memory_snapshot_v2(peer, payload);
 		return;
 	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_OTA &&
+	    payload_len >= sizeof(mesh_v2_ota_status_payload_t)) {
+		log_http_server_remote_ota_status_v2(peer, payload, payload_len);
+		return;
+	}
 	if (channel == MESH_V2_TUNNEL_CHANNEL_TOPOLOGY &&
 	    payload_len >= sizeof(mesh_v2_topology_payload_t)) {
 		log_http_server_node_topology(peer, payload, payload_len);
@@ -1017,6 +1022,7 @@ bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out)
 		out->last_rel_log_ms = st->last_rel_log_ms;
 		out->last_ack_tx_ms = st->last_ack_tx_ms;
 		out->last_ack_err = st->last_ack_err;
+		out->capabilities = st->capabilities;
 		for (uint32_t ch = 1; ch <= MESH_V2_TUNNEL_CHANNEL_MAX; ch++) {
 			const tunnel_rx_channel_t *rx = &st->rx[ch];
 			out->gap_count += rx->gap_count;
@@ -1215,6 +1221,29 @@ esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_
 	                                   session_id, 0, 0,
 	                                   payload, sizeof(*t) + sizeof(req));
 	note_ack_tx_result(mac, err);
+	return err;
+}
+
+esp_err_t mesh_v2_root_send_ota_payload(const uint8_t mac[6],
+                                        const void *payload,
+                                        size_t payload_len)
+{
+	if (!mac || !payload || payload_len == 0) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	if (!s_rel || !s_rel_lock) {
+		return ESP_ERR_INVALID_STATE;
+	}
+	if (xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+		return ESP_ERR_TIMEOUT;
+	}
+	esp_err_t err = ESP_ERR_INVALID_STATE;
+	if (keemash_rel_peer_ready(s_rel, mac)) {
+		err = keemash_rel_send(s_rel, mac, MESH_V2_TUNNEL_CHANNEL_OTA,
+		                       payload, payload_len,
+		                       KEEMASH_REL_PRIORITY_HIGH);
+	}
+	xSemaphoreGiveRecursive(s_rel_lock);
 	return err;
 }
 

@@ -21,6 +21,7 @@
 #include "esp_mac.h"
 #include "esp_mesh.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
@@ -30,6 +31,8 @@
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "freertos/semphr.h"
+
+#include "mbedtls/md.h"
 
 #include "mesh_proto.h"
 #include "keemash_mesh_core.h"
@@ -74,6 +77,14 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_OTA_ACK_TIMEOUT_MS	8000U
 #define REMOTE_OTA_SEND_RETRIES		3
 #define REMOTE_OTA_RETRY_DELAY_MS	120U
+#define REMOTE_OTA_V2_SEND_RETRIES	6
+#define REMOTE_OTA_V2_ACK_TIMEOUT_MS	30000U
+#define REMOTE_OTA_V2_RESYNC_TIMEOUT_MS	45000U
+#define REMOTE_OTA_V2_RESYNC_POLL_MS	1000U
+#define REMOTE_OTA_V2_CHUNK_SIZE	256U
+#if REMOTE_OTA_V2_CHUNK_SIZE > MESH_V2_OTA_CHUNK_MAX
+	#error "REMOTE_OTA_V2_CHUNK_SIZE exceeds MESH_V2_OTA_CHUNK_MAX"
+#endif
 #define REMOTE_REBOOT_ACK_TIMEOUT_MS	7000U
 #define REMOTE_REBOOT_SEND_RETRIES	3
 #define REMOTE_REBOOT_RETRY_DELAY_MS	150U
@@ -337,10 +348,13 @@ static node0_ota_status_t s_ota_status = {
 
 typedef struct {
 	bool waiting;
+	bool v2;
 	uint8_t mac[6];
 	uint8_t op;
 	uint16_t seq;
+	uint32_t op_id;
 	mesh_ota_status_packet_t ack;
+	mesh_v2_ota_status_payload_t ack_v2;
 } remote_ota_wait_t;
 
 typedef struct {
@@ -356,6 +370,10 @@ typedef struct {
 	char update_label[MESH_OTA_SLOT_LABEL_MAX];
 	uint32_t running_size;
 	uint32_t update_size;
+	bool v2_active;
+	uint32_t v2_op_id;
+	uint32_t v2_chunk_size;
+	uint32_t last_status_ms;
 	char last_error[96];
 	char last_result[96];
 	char remote_message[MESH_OTA_STATUS_MSG_MAX];
@@ -2347,6 +2365,7 @@ void log_http_server_remote_ota_status(const uint8_t mac[6],
 		}
 
 		if (s_remote_ota_wait.waiting &&
+		    !s_remote_ota_wait.v2 &&
 		    mac_eq(mac, s_remote_ota_wait.mac) &&
 		    status->op == s_remote_ota_wait.op &&
 		    status->seq == s_remote_ota_wait.seq) {
@@ -2367,6 +2386,76 @@ void log_http_server_remote_ota_status(const uint8_t mac[6],
 		ESP_LOGI(TAG, "remote OTA status from " MACSTR ": op=%u code=%u seq=%u %s",
 		         MAC2STR(mac), (unsigned)status->op, (unsigned)status->code,
 		         (unsigned)status->seq, msg);
+	}
+}
+
+void log_http_server_remote_ota_status_v2(const uint8_t mac[6],
+                                          const mesh_v2_ota_status_payload_t *status,
+                                          size_t status_len)
+{
+	(void)status_len;
+	if (!mac || !status) return;
+
+	bool give_ack = false;
+	uint8_t ack_op = (uint8_t)status->c.rsv;
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	{
+		if (s_remote_ota_status.target_valid &&
+		    mac_eq(mac, s_remote_ota_status.target_mac)) {
+			s_remote_ota_status.v2_active = true;
+			s_remote_ota_status.v2_op_id = status->c.op_id;
+			s_remote_ota_status.last_status_ms = ms_now();
+			if (status->c.image_size > 0) {
+				s_remote_ota_status.total_bytes = status->c.image_size;
+			}
+			s_remote_ota_status.written_bytes = status->c.offset;
+			copy_packet_text(s_remote_ota_status.running_label,
+			                 sizeof(s_remote_ota_status.running_label),
+			                 status->running_label, sizeof(status->running_label));
+			copy_packet_text(s_remote_ota_status.update_label,
+			                 sizeof(s_remote_ota_status.update_label),
+			                 status->update_label, sizeof(status->update_label));
+			s_remote_ota_status.running_size = status->running_size;
+			s_remote_ota_status.update_size = status->update_size;
+
+			if (ack_op != MESH_V2_OTA_OP_DATA ||
+			    status->c.status != MESH_V2_OTA_STATUS_OK) {
+				copy_packet_text(s_remote_ota_status.remote_message,
+				                 sizeof(s_remote_ota_status.remote_message),
+				                 status->c.message, sizeof(status->c.message));
+			}
+
+			if (status->c.status != MESH_V2_OTA_STATUS_OK) {
+				s_remote_ota_status.state = NODE0_OTA_FAILED;
+				copy_packet_text(s_remote_ota_status.last_error,
+				                 sizeof(s_remote_ota_status.last_error),
+				                 status->c.message, sizeof(status->c.message));
+			}
+		}
+
+		if (s_remote_ota_wait.waiting &&
+		    s_remote_ota_wait.v2 &&
+		    mac_eq(mac, s_remote_ota_wait.mac) &&
+		    status->c.op_id == s_remote_ota_wait.op_id &&
+		    ack_op == s_remote_ota_wait.op) {
+			s_remote_ota_wait.ack_v2 = *status;
+			s_remote_ota_wait.waiting = false;
+			give_ack = true;
+		}
+	}
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (give_ack && s_remote_ota_ack_sem) {
+		xSemaphoreGive(s_remote_ota_ack_sem);
+	}
+
+	if (ack_op != MESH_V2_OTA_OP_DATA || status->c.status != MESH_V2_OTA_STATUS_OK) {
+		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
+		copy_packet_text(msg, sizeof(msg), status->c.message, sizeof(status->c.message));
+		ESP_LOGI(TAG, "remote OTA v2 status from " MACSTR ": op=%u code=%u id=%lu %s",
+		         MAC2STR(mac), (unsigned)ack_op, (unsigned)status->c.status,
+		         (unsigned long)status->c.op_id, msg);
 	}
 }
 
@@ -2984,6 +3073,16 @@ static void remote_ota_status_progress(uint32_t written_bytes)
 {
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	s_remote_ota_status.written_bytes = written_bytes;
+	s_remote_ota_status.last_status_ms = ms_now();
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static void remote_ota_status_mark_v2(uint32_t op_id, uint32_t chunk_size)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_remote_ota_status.v2_active = true;
+	s_remote_ota_status.v2_op_id = op_id;
+	s_remote_ota_status.v2_chunk_size = chunk_size;
 	portEXIT_CRITICAL(&s_remote_ota_lock);
 }
 
@@ -3845,6 +3944,85 @@ static uint16_t remote_ota_next_seq(void)
 	return seq;
 }
 
+static uint32_t remote_ota_next_op_id(void)
+{
+	static uint32_t op_id = 0;
+	if (op_id == 0) {
+		op_id = esp_random();
+		if (op_id == 0) {
+			op_id = 1;
+		}
+	}
+	op_id++;
+	if (op_id == 0) {
+		op_id = 1;
+	}
+	return op_id;
+}
+
+typedef enum {
+	REMOTE_OTA_MODE_AUTO = 0,
+	REMOTE_OTA_MODE_V1,
+	REMOTE_OTA_MODE_V2,
+} remote_ota_mode_t;
+
+static bool remote_ota_mode_from_req(httpd_req_t *req, remote_ota_mode_t *mode,
+                                     char *err, size_t err_sz)
+{
+	if (!mode) return false;
+	*mode = REMOTE_OTA_MODE_AUTO;
+	char q[96] = {0};
+	if (!req || httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) {
+		return true;
+	}
+	char v[12] = {0};
+	if (httpd_query_key_value(q, "mode", v, sizeof(v)) != ESP_OK || v[0] == '\0') {
+		return true;
+	}
+	if (strcmp(v, "auto") == 0) {
+		*mode = REMOTE_OTA_MODE_AUTO;
+		return true;
+	}
+	if (strcmp(v, "v1") == 0) {
+		*mode = REMOTE_OTA_MODE_V1;
+		return true;
+	}
+	if (strcmp(v, "v2") == 0) {
+		*mode = REMOTE_OTA_MODE_V2;
+		return true;
+	}
+	snprintf(err, err_sz, "bad OTA mode");
+	return false;
+}
+
+static uint32_t node_table_capabilities_for_mac(const uint8_t mac[6])
+{
+	uint32_t caps = 0;
+	if (!mac) {
+		return 0;
+	}
+
+	portENTER_CRITICAL(&s_nodes_lock);
+		for (uint32_t i = 0; i < s_nodes_count; i++) {
+			if (mac_eq(s_nodes[i].mac, mac)) {
+				caps = s_nodes[i].capabilities;
+				break;
+			}
+		}
+	portEXIT_CRITICAL(&s_nodes_lock);
+	return caps;
+}
+
+static bool remote_ota_v2_supported_for_mac(const uint8_t mac[6])
+{
+	mesh_v2_root_stats_t st;
+	if (!mac || !mesh_v2_root_stats_for_mac(mac, &st)) {
+		return false;
+	}
+	uint32_t caps = st.capabilities | node_table_capabilities_for_mac(mac);
+	return st.reliable_ready && ((caps & MESH_V2_CAP_OTA) != 0);
+}
+
 static void mesh_ota_fill_header(mesh_pkt_hdr_t *h, uint8_t type)
 {
 	if (!h) return;
@@ -3954,6 +4132,108 @@ static esp_err_t remote_ota_send_wait(const uint8_t mac[6], const void *pkt,
 	return ESP_OK;
 }
 
+static bool remote_ota_v2_wait_ready_for_retry(const uint8_t mac[6])
+{
+	uint32_t start = ms_now();
+	for (;;) {
+		if (node_route_current(mac) && remote_ota_v2_supported_for_mac(mac)) {
+			return true;
+		}
+		if ((uint32_t)(ms_now() - start) >= REMOTE_OTA_V2_RESYNC_TIMEOUT_MS) {
+			return false;
+		}
+		vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_V2_RESYNC_POLL_MS));
+	}
+}
+
+static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *payload,
+                                         size_t payload_len, uint8_t op,
+                                         uint32_t op_id,
+                                         mesh_v2_ota_status_payload_t *ack,
+                                         char *err, size_t err_sz)
+{
+	if (!s_remote_ota_ack_sem) {
+		snprintf(err, err_sz, "remote OTA ACK semaphore unavailable");
+		return ESP_ERR_INVALID_STATE;
+	}
+	if (!mac || !payload || payload_len == 0 || op_id == 0) {
+		snprintf(err, err_sz, "bad remote OTA v2 request");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	esp_err_t last_err = ESP_ERR_TIMEOUT;
+
+	for (uint32_t attempt = 1; attempt <= REMOTE_OTA_V2_SEND_RETRIES; attempt++) {
+		while (xSemaphoreTake(s_remote_ota_ack_sem, 0) == pdTRUE) {
+		}
+
+		portENTER_CRITICAL(&s_remote_ota_lock);
+		memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
+		s_remote_ota_wait.waiting = true;
+		s_remote_ota_wait.v2 = true;
+		mac_copy(s_remote_ota_wait.mac, mac);
+		s_remote_ota_wait.op = op;
+		s_remote_ota_wait.op_id = op_id;
+		portEXIT_CRITICAL(&s_remote_ota_lock);
+
+		esp_err_t send_err = mesh_v2_root_send_ota_payload(mac, payload, payload_len);
+		if (send_err != ESP_OK) {
+			remote_ota_clear_wait();
+			last_err = send_err;
+			snprintf(err, err_sz, "mesh v2 send failed: %s", esp_err_to_name(send_err));
+			if (send_err == ESP_ERR_INVALID_STATE ||
+			    send_err == ESP_ERR_MESH_NO_ROUTE_FOUND ||
+			    !node_route_current(mac)) {
+				if (!remote_ota_v2_wait_ready_for_retry(mac)) {
+					snprintf(err, err_sz, "mesh v2 route/session not ready after retry wait");
+					break;
+				}
+			} else {
+				vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
+			}
+			continue;
+		}
+
+		if (xSemaphoreTake(s_remote_ota_ack_sem,
+		                   pdMS_TO_TICKS(REMOTE_OTA_V2_ACK_TIMEOUT_MS)) == pdTRUE) {
+			last_err = ESP_OK;
+			break;
+		}
+
+		remote_ota_clear_wait();
+		last_err = ESP_ERR_TIMEOUT;
+		snprintf(err, err_sz, "remote OTA v2 ACK timeout op=%u id=%lu try=%lu/%u",
+		         (unsigned)op, (unsigned long)op_id, (unsigned long)attempt,
+		         (unsigned)REMOTE_OTA_V2_SEND_RETRIES);
+		if (!remote_ota_v2_wait_ready_for_retry(mac)) {
+			snprintf(err, err_sz, "remote OTA v2 ACK timeout and route/session did not recover");
+			break;
+		}
+	}
+
+	if (last_err != ESP_OK) {
+		return last_err;
+	}
+
+	mesh_v2_ota_status_payload_t got;
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	got = s_remote_ota_wait.ack_v2;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (ack) {
+		*ack = got;
+	}
+
+	if (got.c.status != MESH_V2_OTA_STATUS_OK) {
+		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
+		copy_packet_text(msg, sizeof(msg), got.c.message, sizeof(got.c.message));
+		snprintf(err, err_sz, "remote OTA v2 error: %s", msg[0] ? msg : "unknown");
+		return ESP_FAIL;
+	}
+
+	return ESP_OK;
+}
+
 static uint16_t remote_reboot_next_seq(void)
 {
 	static uint16_t seq = 0;
@@ -4057,6 +4337,23 @@ static void remote_ota_send_abort(const uint8_t mac[6], const char *reason)
 	}
 
 	mesh_ota_send_to(mac, &p, sizeof(p));
+}
+
+static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
+                                     const char *reason)
+{
+	if (!mac || op_id == 0) return;
+	mesh_v2_ota_abort_payload_t p;
+	memset(&p, 0, sizeof(p));
+	p.c.op = MESH_V2_OTA_OP_ABORT;
+	p.c.op_id = op_id;
+	if (reason) {
+		strncpy(p.c.message, reason, sizeof(p.c.message) - 1);
+		p.c.message[sizeof(p.c.message) - 1] = '\0';
+	}
+	(void)remote_ota_send_wait_v2(mac, &p, sizeof(p),
+	                              MESH_V2_OTA_OP_ABORT, op_id,
+	                              NULL, (char [32]){0}, 32);
 }
 
 static esp_err_t http_json_error(httpd_req_t *req, const char *status, const char *msg)
@@ -4326,6 +4623,39 @@ static bool ota_validate_first_chunk(const uint8_t *data, size_t len,
 	}
 
 	return true;
+}
+
+static esp_err_t ota_sha256_start(mbedtls_md_context_t *ctx)
+{
+	if (!ctx) return ESP_ERR_INVALID_ARG;
+	const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	if (!info) return ESP_ERR_INVALID_ARG;
+	mbedtls_md_init(ctx);
+	int ret = mbedtls_md_setup(ctx, info, 0);
+	if (ret == 0) {
+		ret = mbedtls_md_starts(ctx);
+	}
+	if (ret != 0) {
+		mbedtls_md_free(ctx);
+		return ESP_FAIL;
+	}
+	return ESP_OK;
+}
+
+static esp_err_t ota_sha256_update(mbedtls_md_context_t *ctx,
+                                   const uint8_t *data, size_t len)
+{
+	if (!ctx || !data || len == 0) return ESP_ERR_INVALID_ARG;
+	return mbedtls_md_update(ctx, data, len) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t ota_sha256_finish(mbedtls_md_context_t *ctx,
+                                   uint8_t out[MESH_V2_OTA_SHA256_LEN])
+{
+	if (!ctx || !out) return ESP_ERR_INVALID_ARG;
+	int ret = mbedtls_md_finish(ctx, out);
+	mbedtls_md_free(ctx);
+	return ret == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static void ota_restart_task(void *arg)
@@ -4718,9 +5048,81 @@ static esp_err_t remote_ota_send_chunks_from_buffer(const uint8_t mac[6],
 	return ESP_OK;
 }
 
+static esp_err_t remote_ota_send_chunks_v2_from_buffer(const uint8_t mac[6],
+                                                       const uint8_t *buf,
+                                                       size_t len,
+                                                       uint32_t total_len,
+                                                       uint32_t op_id,
+                                                       uint32_t *written,
+                                                       char *err, size_t err_sz)
+{
+	if (!buf || !written || op_id == 0) {
+		snprintf(err, err_sz, "bad remote OTA v2 chunk buffer");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	mesh_v2_ota_data_payload_t *p =
+		(mesh_v2_ota_data_payload_t *)malloc(sizeof(*p));
+	if (!p) {
+		snprintf(err, err_sz, "no memory for OTA v2 chunk");
+		return ESP_ERR_NO_MEM;
+	}
+
+	size_t pos = 0;
+	esp_err_t ret = ESP_OK;
+	while (pos < len) {
+		size_t remain = len - pos;
+		uint32_t chunk_len = (uint32_t)(remain > REMOTE_OTA_V2_CHUNK_SIZE
+		                                ? REMOTE_OTA_V2_CHUNK_SIZE
+		                                : remain);
+		if (chunk_len > total_len - *written) {
+			snprintf(err, err_sz, "remote OTA v2 chunk exceeds image size");
+			ret = ESP_ERR_INVALID_SIZE;
+			break;
+		}
+
+		memset(p, 0, sizeof(*p));
+		p->c.op = MESH_V2_OTA_OP_DATA;
+		p->c.op_id = op_id;
+		p->c.image_size = total_len;
+		p->c.offset = *written;
+		p->c.len = chunk_len;
+		memcpy(p->data, buf + pos, chunk_len);
+
+		mesh_v2_ota_status_payload_t ack;
+		ret = remote_ota_send_wait_v2(
+			mac,
+			p,
+			offsetof(mesh_v2_ota_data_payload_t, data) + chunk_len,
+			MESH_V2_OTA_OP_DATA,
+			op_id,
+			&ack,
+			err,
+			err_sz);
+		if (ret != ESP_OK) {
+			break;
+		}
+
+		uint32_t expected = *written + chunk_len;
+		if (ack.c.offset != expected) {
+			snprintf(err, err_sz, "remote OTA v2 offset mismatch %lu/%lu",
+			         (unsigned long)ack.c.offset, (unsigned long)expected);
+			ret = ESP_FAIL;
+			break;
+		}
+
+		*written = ack.c.offset;
+		remote_ota_status_progress(*written);
+		pos += chunk_len;
+	}
+
+	free(p);
+	return ret;
+}
+
 static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 {
-	enum { OTA_STATUS_JSON_MAX = 1024 };
+	enum { OTA_STATUS_JSON_MAX = 1400 };
 	char out[OTA_STATUS_JSON_MAX];
 	char target_err[96] = {0};
 	uint8_t mac[6] = {0};
@@ -4734,13 +5136,19 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	bool route_ready = target_supported && node_route_current(mac);
 	bool telemetry_ready = target_supported &&
 	                       node_has_fresh_telemetry(mac, NODEINFO_STALE_MS);
+	bool v2_supported = target_supported && remote_ota_v2_supported_for_mac(mac);
+	bool v2_ready = route_ready && v2_supported;
 	bool supported = target_supported && route_ready;
+	const char *fallback_reason = "";
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
 	} else if (target_ok && target_supported && !telemetry_ready) {
 		strncpy(target_err, "target telemetry stale, resyncing", sizeof(target_err) - 1);
 		target_err[sizeof(target_err) - 1] = '\0';
+	}
+	if (target_supported && route_ready && !v2_supported) {
+		fallback_reason = "target has no OTA v2 capability";
 	}
 
 	char mac_hex[13] = {0};
@@ -4760,6 +5168,13 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	const char *last_result = target_match ? status.last_result : "";
 	const char *last_error = target_match ? status.last_error : "";
 	const char *remote_message = target_match ? status.remote_message : "";
+	const char *mode = target_match && status.v2_active ? "v2" :
+	                   (target_match && status.state != NODE0_OTA_IDLE ? "v1" : "auto");
+	uint32_t op_id = target_match ? status.v2_op_id : 0;
+	uint32_t chunk_size = target_match && status.v2_chunk_size ?
+	                      status.v2_chunk_size : REMOTE_OTA_V2_CHUNK_SIZE;
+	long last_status_age_ms = target_match ?
+	                          timestamp_age_ms(ms_now(), status.last_status_ms) : -1;
 	char running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	char update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	uint32_t running_size = 0;
@@ -4798,6 +5213,22 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	                         target_ok ? last_error : target_err);
 	pos = append_fmt(out, sizeof(out), pos, ",\"remote_message\":");
 	pos = append_json_string(out, sizeof(out), pos, remote_message);
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"mode\":");
+	pos = append_json_string(out, sizeof(out), pos, mode);
+	pos = append_fmt(out, sizeof(out), pos,
+	                 ",\"v2_supported\":%s,\"v2_ready\":%s,"
+	                 "\"op_id\":%lu,\"chunk_size\":%lu,"
+	                 "\"offset\":%lu,\"image_size\":%lu,"
+	                 "\"last_status_age_ms\":%ld,\"fallback_reason\":",
+	                 v2_supported ? "true" : "false",
+	                 v2_ready ? "true" : "false",
+	                 (unsigned long)op_id,
+	                 (unsigned long)chunk_size,
+	                 (unsigned long)written,
+	                 (unsigned long)total,
+	                 last_status_age_ms);
+	pos = append_json_string(out, sizeof(out), pos, fallback_reason);
 	pos = append_fmt(out, sizeof(out), pos, "}");
 
 	httpd_resp_set_type(req, "application/json");
@@ -4831,9 +5262,16 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	char err_msg[96] = "remote OTA failed";
 	uint8_t *buf = NULL;
 	bool remote_started = false;
+	bool use_v2 = false;
+	uint32_t v2_op_id = 0;
 	esp_err_t result = ESP_FAIL;
 
 	do {
+		remote_ota_mode_t requested_mode = REMOTE_OTA_MODE_AUTO;
+		if (!remote_ota_mode_from_req(req, &requested_mode,
+		                              err_msg, sizeof(err_msg))) {
+			break;
+		}
 		if (!remote_ota_target_from_req(req, target_mac, target_tag, sizeof(target_tag),
 		                                err_msg, sizeof(err_msg))) {
 			break;
@@ -4851,6 +5289,12 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
+		bool v2_supported = remote_ota_v2_supported_for_mac(target_mac);
+		if (requested_mode == REMOTE_OTA_MODE_V2 && !v2_supported) {
+			snprintf(err_msg, sizeof(err_msg), "target OTA v2 not ready");
+			break;
+		}
+		use_v2 = requested_mode != REMOTE_OTA_MODE_V1 && v2_supported;
 
 		size_t total_len = req->content_len;
 		if (total_len == 0 || total_len > UINT32_MAX) {
@@ -4893,6 +5337,113 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		         new_desc.version, (unsigned long)total_len);
 
 		remote_ota_status_begin(target_mac, target_tag, (uint32_t)total_len);
+
+		if (use_v2) {
+			mbedtls_md_context_t sha_ctx;
+			bool sha_started = false;
+			uint8_t sha[MESH_V2_OTA_SHA256_LEN] = {0};
+			v2_op_id = remote_ota_next_op_id();
+			remote_ota_status_mark_v2(v2_op_id, REMOTE_OTA_V2_CHUNK_SIZE);
+
+			result = ota_sha256_start(&sha_ctx);
+			if (result != ESP_OK) {
+				snprintf(err_msg, sizeof(err_msg), "sha256 init failed");
+				break;
+			}
+			sha_started = true;
+
+			mesh_v2_ota_prepare_payload_t prepare;
+			memset(&prepare, 0, sizeof(prepare));
+			prepare.c.op = MESH_V2_OTA_OP_PREPARE;
+			prepare.c.op_id = v2_op_id;
+			prepare.c.image_size = (uint32_t)total_len;
+			prepare.c.len = REMOTE_OTA_V2_CHUNK_SIZE;
+			copy_packet_text(prepare.c.project_name, sizeof(prepare.c.project_name),
+			                 new_desc.project_name, sizeof(new_desc.project_name));
+			copy_packet_text(prepare.c.version, sizeof(prepare.c.version),
+			                 new_desc.version, sizeof(new_desc.version));
+
+			mesh_v2_ota_status_payload_t ack_v2;
+			remote_started = true;
+			result = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+			                                MESH_V2_OTA_OP_PREPARE, v2_op_id,
+			                                &ack_v2, err_msg, sizeof(err_msg));
+			if (result != ESP_OK) {
+				if (sha_started) mbedtls_md_free(&sha_ctx);
+				break;
+			}
+
+			result = ota_sha256_update(&sha_ctx, buf, first_have);
+			if (result == ESP_OK) {
+				uint32_t written = 0;
+				result = remote_ota_send_chunks_v2_from_buffer(
+					target_mac, buf, first_have, (uint32_t)total_len,
+					v2_op_id, &written, err_msg, sizeof(err_msg));
+				while (result == ESP_OK && written < total_len) {
+					size_t to_read = total_len - written;
+					if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
+
+					int r = ota_recv_retry(req, buf, to_read);
+					if (r <= 0) {
+						snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
+						result = ESP_FAIL;
+						break;
+					}
+					result = ota_sha256_update(&sha_ctx, buf, (size_t)r);
+					if (result != ESP_OK) {
+						snprintf(err_msg, sizeof(err_msg), "sha256 update failed");
+						break;
+					}
+					result = remote_ota_send_chunks_v2_from_buffer(
+						target_mac, buf, (size_t)r, (uint32_t)total_len,
+						v2_op_id, &written, err_msg, sizeof(err_msg));
+				}
+				if (result == ESP_OK && written != total_len) {
+					snprintf(err_msg, sizeof(err_msg), "remote OTA v2 incomplete");
+					result = ESP_FAIL;
+				}
+			} else {
+				snprintf(err_msg, sizeof(err_msg), "sha256 update failed");
+			}
+
+			if (result == ESP_OK) {
+				result = ota_sha256_finish(&sha_ctx, sha);
+				sha_started = false;
+				if (result != ESP_OK) {
+					snprintf(err_msg, sizeof(err_msg), "sha256 finish failed");
+				}
+			}
+			if (sha_started) {
+				mbedtls_md_free(&sha_ctx);
+			}
+			if (result != ESP_OK) {
+				break;
+			}
+
+			mesh_v2_ota_commit_payload_t commit;
+			memset(&commit, 0, sizeof(commit));
+			commit.c.op = MESH_V2_OTA_OP_COMMIT;
+			commit.c.op_id = v2_op_id;
+			commit.c.image_size = (uint32_t)total_len;
+			commit.c.offset = (uint32_t)total_len;
+			commit.c.len = (uint32_t)total_len;
+			memcpy(commit.c.sha256, sha, sizeof(sha));
+
+			result = remote_ota_send_wait_v2(target_mac, &commit, sizeof(commit),
+			                                MESH_V2_OTA_OP_COMMIT, v2_op_id,
+			                                &ack_v2, err_msg, sizeof(err_msg));
+			if (result != ESP_OK) {
+				break;
+			}
+
+			snprintf(err_msg, sizeof(err_msg), "remote OTA v2 OK, %s rebooting", target_tag);
+			remote_ota_status_finish(NODE0_OTA_REBOOTING, err_msg);
+			ESP_LOGI(TAG, "%s", err_msg);
+
+			free(buf);
+			xSemaphoreGive(s_ota_mutex);
+			return http_json_ok(req, err_msg);
+		}
 
 		mesh_ota_begin_packet_t begin;
 		memset(&begin, 0, sizeof(begin));
@@ -4967,7 +5518,11 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	} while (0);
 
 	if (remote_started) {
-		remote_ota_send_abort(target_mac, err_msg);
+		if (use_v2) {
+			remote_ota_send_abort_v2(target_mac, v2_op_id, err_msg);
+		} else {
+			remote_ota_send_abort(target_mac, err_msg);
+		}
 	}
 	if (buf) {
 		free(buf);
@@ -6073,7 +6628,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
 		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'':'PIN not set';}\n"
-		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='';}\n"
+		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');const mode=j.mode==='v2'?'OTA v2':(j.v2_supported?'OTA v2':'OTA v1 fallback');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+mode+' '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='';}\n"
 		"  updateOtaUi();\n"
 		"}\n"
 		"function applyTasks(j,mac,raw){\n"

@@ -32,6 +32,9 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 void log_http_server_remote_ota_status(const uint8_t mac[6],
                                        const mesh_ota_status_packet_t *status,
                                        size_t status_len);
+void log_http_server_remote_ota_status_v2(const uint8_t mac[6],
+                                          const mesh_v2_ota_status_payload_t *status,
+                                          size_t status_len);
 void log_http_server_remote_reboot_status(const uint8_t mac[6],
                                           const mesh_reboot_status_packet_t *status);
 

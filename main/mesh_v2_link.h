@@ -46,6 +46,7 @@ typedef struct {
 	uint32_t rtt_ms;
 	uint32_t overflow_count;
 	uint8_t lost_reason;
+	uint32_t capabilities;
 } mesh_v2_root_stats_t;
 
 esp_err_t mesh_v2_root_init(void);
@@ -54,6 +55,9 @@ bool mesh_v2_root_stats_for_mac(const uint8_t mac[6], mesh_v2_root_stats_t *out)
 bool mesh_v2_root_tunnel_ready_for_mac(const uint8_t mac[6]);
 esp_err_t mesh_v2_root_send_log_ctrl(const uint8_t mac[6], bool enable);
 esp_err_t mesh_v2_root_send_task_request(const uint8_t mac[6], uint32_t request_id);
+esp_err_t mesh_v2_root_send_ota_payload(const uint8_t mac[6],
+                                        const void *payload,
+                                        size_t payload_len);
 esp_err_t mesh_v2_root_send_command(const uint8_t mac[6], uint32_t command_id,
 				    const char *command);
 bool mesh_v2_root_command_result(uint32_t command_id,
