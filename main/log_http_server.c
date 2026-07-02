@@ -322,6 +322,21 @@ static bool selected_remote_stream_needs_rearm(const uint8_t mac[6]);
 static void selected_remote_stream_note_rearm(const uint8_t mac[6], esp_err_t err);
 static esp_err_t remote_stream_rearm_for_mac(const uint8_t mac[6], bool force);
 static bool stream_sid_matches(const char stored[STREAM_SID_MAX], const char *sid);
+static bool remote_ota_target_from_req(httpd_req_t *req, uint8_t mac[6],
+                                       char *tag, size_t tag_sz,
+                                       char *err, size_t err_sz);
+static void remote_ota_normalize_tag_for_mac(const uint8_t mac[6],
+                                             char *tag, size_t tag_sz);
+static bool node_route_current(const uint8_t mac[6]);
+static bool remote_ota_v2_supported_for_mac(const uint8_t mac[6]);
+static uint32_t remote_ota_next_op_id(void);
+static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *payload,
+                                         size_t payload_len, uint8_t op,
+                                         uint32_t op_id,
+                                         mesh_v2_ota_status_payload_t *ack,
+                                         char *err, size_t err_sz);
+static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
+                                     const char *reason);
 
 typedef enum {
 	NODE0_OTA_IDLE = 0,
@@ -4584,7 +4599,9 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		"\"replay_count\":%lu,\"retry_count\":%lu,"
 		"\"delivered_control\":%lu,\"delivered_log\":%lu,"
 		"\"delivered_task\":%lu,\"delivered_memory\":%lu,"
-		"\"stress_frames\":%lu,\"max_tx_unacked\":%lu,"
+		"\"stress_frames\":%lu,\"session_reset_root_passes\":%lu,"
+		"\"session_reset_node_passes\":%lu,"
+		"\"control_starvation_max_lag\":%lu,\"max_tx_unacked\":%lu,"
 		"\"max_reorder_depth\":%lu,\"message\":",
 		run_core ? "true" : "false",
 		(!run_core || core.pass) ? "true" : "false",
@@ -4600,6 +4617,9 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		(unsigned long)core.delivered_task,
 		(unsigned long)core.delivered_memory,
 		(unsigned long)core.stress_frames,
+		(unsigned long)core.session_reset_root_passes,
+		(unsigned long)core.session_reset_node_passes,
+		(unsigned long)core.control_starvation_max_lag,
 		(unsigned long)core.max_tx_unacked,
 		(unsigned long)core.max_reorder_depth);
 	pos = append_json_string(out, sizeof(out), pos, run_core ? core.message : "not run");
@@ -4617,6 +4637,231 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		(unsigned long)result.seen_count,
 		(unsigned)result.status, result.text_changed ? "true" : "false");
 	pos = append_json_string(out, sizeof(out), pos, result.text);
+	pos = append_fmt(out, sizeof(out), pos, "}");
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+static void ota_v2_debug_common(mesh_v2_ota_common_payload_t *c,
+                                uint8_t op, uint32_t op_id,
+                                uint32_t image_size, uint32_t offset,
+                                uint32_t len, const char *project,
+                                const char *version,
+                                const uint8_t sha[MESH_V2_OTA_SHA256_LEN])
+{
+	if (!c) return;
+	memset(c, 0, sizeof(*c));
+	c->op = op;
+	c->op_id = op_id;
+	c->image_size = image_size;
+	c->offset = offset;
+	c->len = len;
+	if (project) {
+		strncpy(c->project_name, project, sizeof(c->project_name) - 1);
+		c->project_name[sizeof(c->project_name) - 1] = '\0';
+	}
+	if (version) {
+		strncpy(c->version, version, sizeof(c->version) - 1);
+		c->version[sizeof(c->version) - 1] = '\0';
+	}
+	if (sha) {
+		memcpy(c->sha256, sha, MESH_V2_OTA_SHA256_LEN);
+	}
+}
+
+static bool ota_v2_debug_status_is_error(const mesh_v2_ota_status_payload_t *ack,
+                                         const char *needle)
+{
+	if (!ack || ack->c.status != MESH_V2_OTA_STATUS_ERROR) {
+		return false;
+	}
+	if (!needle || needle[0] == '\0') {
+		return true;
+	}
+	char msg[MESH_OTA_STATUS_MSG_MAX + 1];
+	copy_packet_text(msg, sizeof(msg), ack->c.message, sizeof(ack->c.message));
+	return strstr(msg, needle) != NULL;
+}
+
+static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
+{
+	if (!ota_enabled()) {
+		return http_json_error(req, "403 Forbidden",
+		                       "debug disabled: set CONFIG_NODE0_OTA_PIN");
+	}
+	if (!ota_check_pin(req)) {
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	}
+
+	char case_name[32] = "wrong_project";
+	char q[128] = {0};
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+		char v[32] = {0};
+		if (httpd_query_key_value(q, "case", v, sizeof(v)) == ESP_OK && v[0]) {
+			strncpy(case_name, v, sizeof(case_name) - 1);
+			case_name[sizeof(case_name) - 1] = '\0';
+		}
+	}
+
+	uint8_t target_mac[6] = {0};
+	char target_tag[16] = "node";
+	char err_msg[96] = "OTA v2 debug failed";
+	if (!remote_ota_target_from_req(req, target_mac, target_tag, sizeof(target_tag),
+	                                err_msg, sizeof(err_msg))) {
+		return http_json_error(req, "400 Bad Request", err_msg);
+	}
+	remote_ota_normalize_tag_for_mac(target_mac, target_tag, sizeof(target_tag));
+	if (!node_route_current(target_mac)) {
+		return http_json_error(req, "409 Conflict", "target route not ready");
+	}
+	if (!remote_ota_v2_supported_for_mac(target_mac)) {
+		return http_json_error(req, "409 Conflict", "target OTA v2 not ready");
+	}
+	if (!s_ota_mutex) {
+		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
+	}
+	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	}
+
+	const char *version = "debug";
+	uint32_t op_id = remote_ota_next_op_id();
+	esp_err_t err = ESP_FAIL;
+	bool pass = false;
+	bool remote_started = false;
+	mesh_v2_ota_status_payload_t ack = {0};
+	mesh_v2_ota_status_payload_t ack2 = {0};
+	mesh_v2_ota_status_payload_t ack3 = {0};
+	uint8_t bad_sha[MESH_V2_OTA_SHA256_LEN];
+	memset(bad_sha, 0xA5, sizeof(bad_sha));
+
+	if (strcmp(case_name, "wrong_project") == 0) {
+		mesh_v2_ota_prepare_payload_t prepare;
+		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
+		                    4096, 0, REMOTE_OTA_V2_CHUNK_SIZE,
+		                    "wrong_project", version, NULL);
+		err = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+		                              MESH_V2_OTA_OP_PREPARE, op_id,
+		                              &ack, err_msg, sizeof(err_msg));
+		pass = err != ESP_OK && ota_v2_debug_status_is_error(&ack, "wrong project");
+	} else if (strcmp(case_name, "oversized_prepare") == 0 ||
+	           strcmp(case_name, "oversized") == 0) {
+		mesh_v2_ota_prepare_payload_t prepare;
+		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
+		                    UINT32_MAX, 0, REMOTE_OTA_V2_CHUNK_SIZE,
+		                    target_tag, version, NULL);
+		err = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+		                              MESH_V2_OTA_OP_PREPARE, op_id,
+		                              &ack, err_msg, sizeof(err_msg));
+		pass = err != ESP_OK && ota_v2_debug_status_is_error(&ack, "image too large");
+	} else if (strcmp(case_name, "abort_after_prepare") == 0 ||
+	           strcmp(case_name, "abort") == 0) {
+		mesh_v2_ota_prepare_payload_t prepare;
+		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
+		                    1, 0, 1, target_tag, version, NULL);
+		err = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+		                              MESH_V2_OTA_OP_PREPARE, op_id,
+		                              &ack, err_msg, sizeof(err_msg));
+		if (err == ESP_OK) {
+			remote_started = true;
+			mesh_v2_ota_abort_payload_t abort_p;
+			ota_v2_debug_common(&abort_p.c, MESH_V2_OTA_OP_ABORT, op_id,
+			                    0, 0, 0, NULL, NULL, NULL);
+			err = remote_ota_send_wait_v2(target_mac, &abort_p, sizeof(abort_p),
+			                              MESH_V2_OTA_OP_ABORT, op_id,
+			                              &ack2, err_msg, sizeof(err_msg));
+			remote_started = false;
+		}
+		pass = err == ESP_OK && ack.c.status == MESH_V2_OTA_STATUS_OK &&
+		       ack2.c.status == MESH_V2_OTA_STATUS_OK;
+	} else if (strcmp(case_name, "invalid_image") == 0) {
+		mesh_v2_ota_prepare_payload_t prepare;
+		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
+		                    4, 0, 4, target_tag, version, NULL);
+		err = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+		                              MESH_V2_OTA_OP_PREPARE, op_id,
+		                              &ack, err_msg, sizeof(err_msg));
+		if (err == ESP_OK) {
+			remote_started = true;
+			mesh_v2_ota_data_payload_t *data_p =
+				(mesh_v2_ota_data_payload_t *)calloc(1, sizeof(*data_p));
+			if (!data_p) {
+				err = ESP_ERR_NO_MEM;
+				snprintf(err_msg, sizeof(err_msg), "no memory for debug OTA data");
+			} else {
+				ota_v2_debug_common(&data_p->c, MESH_V2_OTA_OP_DATA,
+				                    op_id, 4, 0, 4, NULL, NULL, NULL);
+				data_p->data[0] = 0xDE;
+				data_p->data[1] = 0xAD;
+				data_p->data[2] = 0xBE;
+				data_p->data[3] = 0xEF;
+				size_t data_len = offsetof(mesh_v2_ota_data_payload_t, data) + 4;
+				err = remote_ota_send_wait_v2(target_mac, data_p, data_len,
+				                              MESH_V2_OTA_OP_DATA, op_id,
+				                              &ack2, err_msg, sizeof(err_msg));
+				free(data_p);
+			}
+		}
+		if (err == ESP_OK) {
+			mesh_v2_ota_commit_payload_t commit;
+			ota_v2_debug_common(&commit.c, MESH_V2_OTA_OP_COMMIT, op_id,
+			                    4, 4, 4, NULL, NULL, bad_sha);
+			err = remote_ota_send_wait_v2(target_mac, &commit, sizeof(commit),
+			                              MESH_V2_OTA_OP_COMMIT, op_id,
+			                              &ack3, err_msg, sizeof(err_msg));
+			remote_started = false;
+		}
+		pass = err != ESP_OK &&
+		       ack.c.status == MESH_V2_OTA_STATUS_OK &&
+		       ota_v2_debug_status_is_error(&ack2, "OTA write/hash");
+	} else {
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_error(req, "400 Bad Request", "bad OTA v2 debug case");
+	}
+
+	if (remote_started) {
+		remote_ota_send_abort_v2(target_mac, op_id, "debug cleanup");
+	}
+
+	xSemaphoreGive(s_ota_mutex);
+
+	char mac_hex[13] = "";
+	mac_to_hex(target_mac, mac_hex);
+	char msg1[MESH_OTA_STATUS_MSG_MAX + 1] = "";
+	char msg2[MESH_OTA_STATUS_MSG_MAX + 1] = "";
+	char msg3[MESH_OTA_STATUS_MSG_MAX + 1] = "";
+	copy_packet_text(msg1, sizeof(msg1), ack.c.message, sizeof(ack.c.message));
+	copy_packet_text(msg2, sizeof(msg2), ack2.c.message, sizeof(ack2.c.message));
+	copy_packet_text(msg3, sizeof(msg3), ack3.c.message, sizeof(ack3.c.message));
+
+	char out[768];
+	size_t pos = append_fmt(out, sizeof(out), 0,
+		"{\"ok\":%s,\"pass\":%s,\"case\":",
+		pass ? "true" : "false", pass ? "true" : "false");
+	pos = append_json_string(out, sizeof(out), pos, case_name);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"target\":\"%s\",\"tag\":", mac_hex);
+	pos = append_json_string(out, sizeof(out), pos, target_tag);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"op_id\":%lu,\"err\":%d,\"err_name\":",
+		(unsigned long)op_id, (int)err);
+	pos = append_json_string(out, sizeof(out), pos, esp_err_to_name(err));
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"prepare_status\":%u,\"prepare_message\":",
+		(unsigned)ack.c.status);
+	pos = append_json_string(out, sizeof(out), pos, msg1);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"data_or_abort_status\":%u,\"data_or_abort_message\":",
+		(unsigned)ack2.c.status);
+	pos = append_json_string(out, sizeof(out), pos, msg2);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"commit_status\":%u,\"commit_message\":",
+		(unsigned)ack3.c.status);
+	pos = append_json_string(out, sizeof(out), pos, msg3);
+	pos = append_fmt(out, sizeof(out), pos, ",\"error\":");
+	pos = append_json_string(out, sizeof(out), pos, err_msg);
 	pos = append_fmt(out, sizeof(out), pos, "}");
 
 	httpd_resp_set_type(req, "application/json");
@@ -5331,6 +5576,13 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	bool use_v2 = false;
 	uint32_t v2_op_id = 0;
 	esp_err_t result = ESP_FAIL;
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	bool debug_corrupt_sha = false;
+	char debug_q[128] = {0};
+	if (httpd_req_get_url_query_str(req, debug_q, sizeof(debug_q)) == ESP_OK) {
+		debug_corrupt_sha = query_bool_value(debug_q, "debug_corrupt_sha");
+	}
+#endif
 
 	do {
 		remote_ota_mode_t requested_mode = REMOTE_OTA_MODE_AUTO;
@@ -5494,6 +5746,12 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			commit.c.offset = (uint32_t)total_len;
 			commit.c.len = (uint32_t)total_len;
 			memcpy(commit.c.sha256, sha, sizeof(sha));
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+			if (debug_corrupt_sha) {
+				commit.c.sha256[0] ^= 0x5AU;
+				ESP_LOGW(TAG, "remote OTA v2 debug: corrupting COMMIT sha256");
+			}
+#endif
 
 			result = remote_ota_send_wait_v2(target_mac, &commit, sizeof(commit),
 			                                MESH_V2_OTA_OP_COMMIT, v2_op_id,
@@ -7001,6 +7259,12 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.handler	= http_lossless_debug_post,
 		.user_ctx	= NULL
 	};
+	httpd_uri_t uri_ota_v2_debug = {
+		.uri		= "/debug/ota-v2/run",
+		.method		= HTTP_POST,
+		.handler	= http_ota_v2_debug_post,
+		.user_ctx	= NULL
+	};
 #endif
 	httpd_uri_t uri_admin_check = {
 		.uri		= "/admin/check",
@@ -7094,6 +7358,8 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 	err = httpd_register_uri_handler(server, &uri_lossless_debug);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_v2_debug);
 	if (err != ESP_OK) return err;
 #endif
 	err = httpd_register_uri_handler(server, &uri_admin_check);
@@ -7204,9 +7470,9 @@ esp_err_t log_http_server_start(void)
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-	config.httpd.max_uri_handlers = 19;
+	config.httpd.max_uri_handlers = 24;
 #else
-	config.httpd.max_uri_handlers = 18;
+	config.httpd.max_uri_handlers = 22;
 #endif
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
