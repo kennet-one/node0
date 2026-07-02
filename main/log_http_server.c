@@ -309,6 +309,18 @@ static void remote_ota_slot_snapshot(const uint8_t mac[6],
                                      uint32_t *running_size,
                                      uint32_t *update_size);
 static bool query_bool_value(const char *q, const char *key);
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static uint32_t query_u32_value(const char *q, const char *key);
+static void remote_ota_v2_debug_clear_faults(void);
+static void remote_ota_v2_debug_set_route_loss_after_sends(uint32_t after_sends);
+static bool remote_ota_v2_debug_should_force_route_loss(uint8_t op,
+                                                        char *err,
+                                                        size_t err_sz);
+static bool remote_ota_v2_debug_should_interrupt_upload(uint32_t written,
+                                                        uint32_t threshold,
+                                                        char *err,
+                                                        size_t err_sz);
+#endif
 static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz);
 static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
                                             const uint8_t mac[6],
@@ -405,6 +417,10 @@ static remote_ota_wait_t s_remote_ota_wait = {0};
 static remote_ota_status_t s_remote_ota_status = {
 	.state = NODE0_OTA_IDLE,
 };
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static uint32_t s_debug_ota_v2_route_loss_after_sends = 0;
+static uint32_t s_debug_ota_v2_send_count = 0;
+#endif
 
 typedef struct {
 	bool waiting;
@@ -4227,6 +4243,68 @@ static bool remote_ota_v2_wait_ready_for_retry(const uint8_t mac[6])
 	}
 }
 
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static void remote_ota_v2_debug_clear_faults(void)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_debug_ota_v2_route_loss_after_sends = 0;
+	s_debug_ota_v2_send_count = 0;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static void remote_ota_v2_debug_set_route_loss_after_sends(uint32_t after_sends)
+{
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	s_debug_ota_v2_route_loss_after_sends = after_sends;
+	s_debug_ota_v2_send_count = 0;
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+}
+
+static bool remote_ota_v2_debug_should_force_route_loss(uint8_t op,
+                                                        char *err,
+                                                        size_t err_sz)
+{
+	uint32_t send_count = 0;
+	bool force = false;
+
+	portENTER_CRITICAL(&s_remote_ota_lock);
+	if (s_debug_ota_v2_route_loss_after_sends > 0) {
+		s_debug_ota_v2_send_count++;
+		send_count = s_debug_ota_v2_send_count;
+		if (send_count > s_debug_ota_v2_route_loss_after_sends) {
+			force = true;
+			s_debug_ota_v2_route_loss_after_sends = 0;
+		}
+	}
+	portEXIT_CRITICAL(&s_remote_ota_lock);
+
+	if (!force) {
+		return false;
+	}
+
+	snprintf(err, err_sz, "debug route/session loss mid-upload");
+	ESP_LOGW(TAG, "remote OTA v2 debug: forcing route/session loss op=%u send=%lu",
+	         (unsigned)op, (unsigned long)send_count);
+	return true;
+}
+
+static bool remote_ota_v2_debug_should_interrupt_upload(uint32_t written,
+                                                        uint32_t threshold,
+                                                        char *err,
+                                                        size_t err_sz)
+{
+	if (threshold == 0 || written < threshold) {
+		return false;
+	}
+
+	snprintf(err, err_sz, "OTA upload interrupted (debug after %lu bytes)",
+	         (unsigned long)threshold);
+	ESP_LOGW(TAG, "remote OTA v2 debug: interrupting browser upload at %lu/%lu bytes",
+	         (unsigned long)written, (unsigned long)threshold);
+	return true;
+}
+#endif
+
 static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *payload,
                                          size_t payload_len, uint8_t op,
                                          uint32_t op_id,
@@ -4256,6 +4334,13 @@ static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *paylo
 		s_remote_ota_wait.op = op;
 		s_remote_ota_wait.op_id = op_id;
 		portEXIT_CRITICAL(&s_remote_ota_lock);
+
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+		if (remote_ota_v2_debug_should_force_route_loss(op, err, err_sz)) {
+			remote_ota_clear_wait();
+			return ESP_ERR_INVALID_STATE;
+		}
+#endif
 
 		esp_err_t send_err = mesh_v2_root_send_ota_payload(mac, payload, payload_len);
 		if (send_err != ESP_OK) {
@@ -5578,9 +5663,15 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	esp_err_t result = ESP_FAIL;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 	bool debug_corrupt_sha = false;
-	char debug_q[128] = {0};
+	uint32_t debug_interrupt_after = 0;
+	uint32_t debug_route_loss_after_sends = 0;
+	char debug_q[192] = {0};
+	remote_ota_v2_debug_clear_faults();
 	if (httpd_req_get_url_query_str(req, debug_q, sizeof(debug_q)) == ESP_OK) {
 		debug_corrupt_sha = query_bool_value(debug_q, "debug_corrupt_sha");
+		debug_interrupt_after = query_u32_value(debug_q, "debug_interrupt_after");
+		debug_route_loss_after_sends =
+			query_u32_value(debug_q, "debug_route_loss_after_sends");
 	}
 #endif
 
@@ -5657,6 +5748,14 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		remote_ota_status_begin(target_mac, target_tag, (uint32_t)total_len);
 
 		if (use_v2) {
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+			if (debug_route_loss_after_sends > 0) {
+				remote_ota_v2_debug_set_route_loss_after_sends(
+					debug_route_loss_after_sends);
+				ESP_LOGW(TAG, "remote OTA v2 debug: route/session loss after %lu sends",
+				         (unsigned long)debug_route_loss_after_sends);
+			}
+#endif
 			mbedtls_md_context_t sha_ctx;
 			bool sha_started = false;
 			uint8_t sha[MESH_V2_OTA_SHA256_LEN] = {0};
@@ -5697,6 +5796,13 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 				result = remote_ota_send_chunks_v2_from_buffer(
 					target_mac, buf, first_have, (uint32_t)total_len,
 					v2_op_id, &written, err_msg, sizeof(err_msg));
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+				if (result == ESP_OK &&
+				    remote_ota_v2_debug_should_interrupt_upload(
+					    written, debug_interrupt_after, err_msg, sizeof(err_msg))) {
+					result = ESP_FAIL;
+				}
+#endif
 				while (result == ESP_OK && written < total_len) {
 					size_t to_read = total_len - written;
 					if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
@@ -5715,6 +5821,13 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 					result = remote_ota_send_chunks_v2_from_buffer(
 						target_mac, buf, (size_t)r, (uint32_t)total_len,
 						v2_op_id, &written, err_msg, sizeof(err_msg));
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+					if (result == ESP_OK &&
+					    remote_ota_v2_debug_should_interrupt_upload(
+						    written, debug_interrupt_after, err_msg, sizeof(err_msg))) {
+						result = ESP_FAIL;
+					}
+#endif
 				}
 				if (result == ESP_OK && written != total_len) {
 					snprintf(err_msg, sizeof(err_msg), "remote OTA v2 incomplete");
@@ -5765,6 +5878,9 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			ESP_LOGI(TAG, "%s", err_msg);
 
 			free(buf);
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+			remote_ota_v2_debug_clear_faults();
+#endif
 			xSemaphoreGive(s_ota_mutex);
 			return http_json_ok(req, err_msg);
 		}
@@ -5841,6 +5957,9 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		return http_json_ok(req, err_msg);
 	} while (0);
 
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	remote_ota_v2_debug_clear_faults();
+#endif
 	if (remote_started) {
 		if (use_v2) {
 			remote_ota_send_abort_v2(target_mac, v2_op_id, err_msg);
@@ -6020,6 +6139,16 @@ static bool query_bool_value(const char *q, const char *key)
 	       strcmp(v, "yes") == 0 ||
 	       strcmp(v, "on") == 0;
 }
+
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static uint32_t query_u32_value(const char *q, const char *key)
+{
+	char v[16] = {0};
+	if (!q || !key) return 0;
+	if (httpd_query_key_value(q, key, v, sizeof(v)) != ESP_OK) return 0;
+	return (uint32_t)strtoul(v, NULL, 10);
+}
+#endif
 
 static void stream_sid_from_req(httpd_req_t *req, char *sid, size_t sid_sz)
 {
