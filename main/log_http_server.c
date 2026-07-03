@@ -347,6 +347,11 @@ static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *paylo
                                          uint32_t op_id,
                                          mesh_v2_ota_status_payload_t *ack,
                                          char *err, size_t err_sz);
+static esp_err_t remote_ota_send_abort_wait_v2(const uint8_t mac[6],
+                                               uint32_t op_id,
+                                               const char *reason,
+                                               mesh_v2_ota_status_payload_t *ack,
+                                               char *err, size_t err_sz);
 static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
                                      const char *reason);
 
@@ -4505,10 +4510,18 @@ static void remote_ota_send_abort(const uint8_t mac[6], const char *reason)
 	mesh_ota_send_to(mac, &p, sizeof(p));
 }
 
-static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
-                                     const char *reason)
+static esp_err_t remote_ota_send_abort_wait_v2(const uint8_t mac[6],
+                                               uint32_t op_id,
+                                               const char *reason,
+                                               mesh_v2_ota_status_payload_t *ack,
+                                               char *err, size_t err_sz)
 {
-	if (!mac || op_id == 0) return;
+	if (!mac || op_id == 0) {
+		if (err && err_sz) {
+			snprintf(err, err_sz, "bad remote OTA v2 abort request");
+		}
+		return ESP_ERR_INVALID_ARG;
+	}
 	mesh_v2_ota_abort_payload_t p;
 	memset(&p, 0, sizeof(p));
 	p.c.op = MESH_V2_OTA_OP_ABORT;
@@ -4517,9 +4530,17 @@ static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
 		strncpy(p.c.message, reason, sizeof(p.c.message) - 1);
 		p.c.message[sizeof(p.c.message) - 1] = '\0';
 	}
-	(void)remote_ota_send_wait_v2(mac, &p, sizeof(p),
-	                              MESH_V2_OTA_OP_ABORT, op_id,
-	                              NULL, (char [32]){0}, 32);
+	return remote_ota_send_wait_v2(mac, &p, sizeof(p),
+	                               MESH_V2_OTA_OP_ABORT, op_id,
+	                               ack, err, err_sz);
+}
+
+static void remote_ota_send_abort_v2(const uint8_t mac[6], uint32_t op_id,
+                                     const char *reason)
+{
+	char abort_err[64] = "";
+	(void)remote_ota_send_abort_wait_v2(mac, op_id, reason, NULL,
+	                                    abort_err, sizeof(abort_err));
 }
 
 static esp_err_t http_json_error(httpd_req_t *req, const char *status, const char *msg)
@@ -4834,6 +4855,7 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 	mesh_v2_ota_status_payload_t ack = {0};
 	mesh_v2_ota_status_payload_t ack2 = {0};
 	mesh_v2_ota_status_payload_t ack3 = {0};
+	mesh_v2_ota_status_payload_t ack4 = {0};
 	uint8_t bad_sha[MESH_V2_OTA_SHA256_LEN];
 	memset(bad_sha, 0xA5, sizeof(bad_sha));
 
@@ -4917,7 +4939,12 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 			}
 		}
 		if (remote_started) {
-			remote_ota_send_abort_v2(target_mac, op_id, "debug duplicate cleanup");
+			esp_err_t abort_err = remote_ota_send_abort_wait_v2(
+				target_mac, op_id, "debug duplicate cleanup",
+				&ack4, err_msg, sizeof(err_msg));
+			if (abort_err != ESP_OK) {
+				err = abort_err;
+			}
 			remote_started = false;
 		}
 		char dup_msg[MESH_OTA_STATUS_MSG_MAX + 1];
@@ -4929,7 +4956,8 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 		       ack2.c.offset == image_size &&
 		       ack3.c.status == MESH_V2_OTA_STATUS_OK &&
 		       ack3.c.offset == image_size &&
-		       strstr(dup_msg, "duplicate chunk OK") != NULL;
+		       strstr(dup_msg, "duplicate chunk OK") != NULL &&
+		       ack4.c.status == MESH_V2_OTA_STATUS_OK;
 	} else if (strcmp(case_name, "invalid_image") == 0) {
 		mesh_v2_ota_prepare_payload_t prepare;
 		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
@@ -4986,11 +5014,13 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 	char msg1[MESH_OTA_STATUS_MSG_MAX + 1] = "";
 	char msg2[MESH_OTA_STATUS_MSG_MAX + 1] = "";
 	char msg3[MESH_OTA_STATUS_MSG_MAX + 1] = "";
+	char msg4[MESH_OTA_STATUS_MSG_MAX + 1] = "";
 	copy_packet_text(msg1, sizeof(msg1), ack.c.message, sizeof(ack.c.message));
 	copy_packet_text(msg2, sizeof(msg2), ack2.c.message, sizeof(ack2.c.message));
 	copy_packet_text(msg3, sizeof(msg3), ack3.c.message, sizeof(ack3.c.message));
+	copy_packet_text(msg4, sizeof(msg4), ack4.c.message, sizeof(ack4.c.message));
 
-	char out[768];
+	char out[960];
 	size_t pos = append_fmt(out, sizeof(out), 0,
 		"{\"ok\":%s,\"pass\":%s,\"case\":",
 		pass ? "true" : "false", pass ? "true" : "false");
@@ -5014,8 +5044,13 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 		",\"commit_status\":%u,\"commit_message\":",
 		(unsigned)ack3.c.status);
 	pos = append_json_string(out, sizeof(out), pos, msg3);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"abort_status\":%u,\"abort_message\":",
+		(unsigned)ack4.c.status);
+	pos = append_json_string(out, sizeof(out), pos, msg4);
+	const char *debug_error = pass ? "" : err_msg;
 	pos = append_fmt(out, sizeof(out), pos, ",\"error\":");
-	pos = append_json_string(out, sizeof(out), pos, err_msg);
+	pos = append_json_string(out, sizeof(out), pos, debug_error);
 	pos = append_fmt(out, sizeof(out), pos, "}");
 
 	httpd_resp_set_type(req, "application/json");
