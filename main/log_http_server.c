@@ -4619,7 +4619,11 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	                strcmp(case_name, "retry_exhausted") == 0 ||
 	                strcmp(case_name, "log_stress") == 0 ||
 	                strcmp(case_name, "parallel") == 0 ||
-	                strcmp(case_name, "parallel_channels") == 0;
+	                strcmp(case_name, "parallel_channels") == 0 ||
+	                strcmp(case_name, "final_data") == 0 ||
+	                strcmp(case_name, "lost_final_data") == 0 ||
+	                strcmp(case_name, "final_ack") == 0 ||
+	                strcmp(case_name, "lost_final_ack") == 0;
 	uint32_t mask = 0;
 	if (strcmp(case_name, "seq_wrap") == 0) mask = KEEMASH_REL_DEBUG_CASE_SEQ_WRAP;
 	else if (strcmp(case_name, "session_reset") == 0) mask = KEEMASH_REL_DEBUG_CASE_SESSION_RESET;
@@ -4629,6 +4633,14 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	else if (strcmp(case_name, "parallel") == 0 ||
 	         strcmp(case_name, "parallel_channels") == 0) {
 		mask = KEEMASH_REL_DEBUG_CASE_PARALLEL_CHANNELS;
+	}
+	else if (strcmp(case_name, "final_data") == 0 ||
+	         strcmp(case_name, "lost_final_data") == 0) {
+		mask = KEEMASH_REL_DEBUG_CASE_FINAL_DATA;
+	}
+	else if (strcmp(case_name, "final_ack") == 0 ||
+	         strcmp(case_name, "lost_final_ack") == 0) {
+		mask = KEEMASH_REL_DEBUG_CASE_FINAL_ACK;
 	}
 	else mask = KEEMASH_REL_DEBUG_CASE_ALL;
 
@@ -4671,7 +4683,7 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	char mac_hex[13] = "";
 	if (have_mac) mac_to_hex(mac, mac_hex);
 	bool overall_pass = (!run_core || core.pass) && (!run_dedupe || dedupe_pass);
-	char out[1024];
+	char out[1152];
 	size_t pos = append_fmt(out, sizeof(out), 0,
 		"{\"ok\":%s,\"pass\":%s,\"case\":",
 		overall_pass ? "true" : "false",
@@ -4686,6 +4698,7 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		"\"delivered_task\":%lu,\"delivered_memory\":%lu,"
 		"\"stress_frames\":%lu,\"session_reset_root_passes\":%lu,"
 		"\"session_reset_node_passes\":%lu,"
+		"\"final_data_passes\":%lu,\"final_ack_passes\":%lu,"
 		"\"control_starvation_max_lag\":%lu,\"max_tx_unacked\":%lu,"
 		"\"max_reorder_depth\":%lu,\"message\":",
 		run_core ? "true" : "false",
@@ -4704,6 +4717,8 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		(unsigned long)core.stress_frames,
 		(unsigned long)core.session_reset_root_passes,
 		(unsigned long)core.session_reset_node_passes,
+		(unsigned long)core.final_data_passes,
+		(unsigned long)core.final_ack_passes,
 		(unsigned long)core.control_starvation_max_lag,
 		(unsigned long)core.max_tx_unacked,
 		(unsigned long)core.max_reorder_depth);
@@ -4861,6 +4876,60 @@ static esp_err_t http_ota_v2_debug_post(httpd_req_t *req)
 		}
 		pass = err == ESP_OK && ack.c.status == MESH_V2_OTA_STATUS_OK &&
 		       ack2.c.status == MESH_V2_OTA_STATUS_OK;
+	} else if (strcmp(case_name, "duplicate_data") == 0 ||
+	           strcmp(case_name, "duplicate_chunk") == 0) {
+		const uint32_t image_size = 32;
+		mesh_v2_ota_prepare_payload_t prepare;
+		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
+		                    image_size, 0, image_size, target_tag, version, NULL);
+		err = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
+		                              MESH_V2_OTA_OP_PREPARE, op_id,
+		                              &ack, err_msg, sizeof(err_msg));
+		if (err == ESP_OK) {
+			remote_started = true;
+			mesh_v2_ota_data_payload_t *data_p =
+				(mesh_v2_ota_data_payload_t *)calloc(1, sizeof(*data_p));
+			if (!data_p) {
+				err = ESP_ERR_NO_MEM;
+				snprintf(err_msg, sizeof(err_msg), "no memory for debug OTA data");
+			} else {
+				ota_v2_debug_common(&data_p->c, MESH_V2_OTA_OP_DATA,
+				                    op_id, image_size, 0, image_size,
+				                    NULL, NULL, NULL);
+				data_p->data[0] = ESP_IMAGE_HEADER_MAGIC;
+				data_p->data[1] = 1;
+				data_p->data[2] = 0;
+				data_p->data[3] = 0;
+				for (uint32_t i = 4; i < image_size; i++) {
+					data_p->data[i] = (uint8_t)(0xC0U + i);
+				}
+				size_t data_len = offsetof(mesh_v2_ota_data_payload_t, data) +
+				                  image_size;
+				err = remote_ota_send_wait_v2(target_mac, data_p, data_len,
+				                              MESH_V2_OTA_OP_DATA, op_id,
+				                              &ack2, err_msg, sizeof(err_msg));
+				if (err == ESP_OK) {
+					err = remote_ota_send_wait_v2(target_mac, data_p, data_len,
+					                              MESH_V2_OTA_OP_DATA, op_id,
+					                              &ack3, err_msg, sizeof(err_msg));
+				}
+				free(data_p);
+			}
+		}
+		if (remote_started) {
+			remote_ota_send_abort_v2(target_mac, op_id, "debug duplicate cleanup");
+			remote_started = false;
+		}
+		char dup_msg[MESH_OTA_STATUS_MSG_MAX + 1];
+		copy_packet_text(dup_msg, sizeof(dup_msg), ack3.c.message,
+		                 sizeof(ack3.c.message));
+		pass = err == ESP_OK &&
+		       ack.c.status == MESH_V2_OTA_STATUS_OK &&
+		       ack2.c.status == MESH_V2_OTA_STATUS_OK &&
+		       ack2.c.offset == image_size &&
+		       ack3.c.status == MESH_V2_OTA_STATUS_OK &&
+		       ack3.c.offset == image_size &&
+		       strstr(dup_msg, "duplicate chunk OK") != NULL;
 	} else if (strcmp(case_name, "invalid_image") == 0) {
 		mesh_v2_ota_prepare_payload_t prepare;
 		ota_v2_debug_common(&prepare.c, MESH_V2_OTA_OP_PREPARE, op_id,
