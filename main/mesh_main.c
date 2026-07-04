@@ -492,7 +492,7 @@ static void mesh_rx_task(void *arg)
 		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
 
 		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION_V2) {
-			mesh_v2_root_handle_rx(&from, rx_buf, data.size);
+			mesh_v2_root_handle_rx(from.addr, rx_buf, data.size);
 			continue;
 		}
 

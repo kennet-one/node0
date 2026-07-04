@@ -3,26 +3,11 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_mesh.h"
-#include "sdkconfig.h"     // щоб мати CONFIG_MESH_ROUTE_TABLE_SIZE
+#include "sdkconfig.h"
 
 #include "mesh_root_bcast.h"
 #include "mesh_v2_link.h"
 
-// ВАЖЛИВО: структура й константи повинні збігатись з тим,
-// що вже є в mesh_main.c
-typedef struct __attribute__((packed)) {
-	uint8_t  magic;
-	uint8_t  version;
-	uint8_t  type;
-	uint8_t  reserved;
-	uint32_t counter;
-	uint8_t  src_mac[6];
-	char     payload[32];
-} mesh_packet_t;
-
-#define MESH_PKT_MAGIC       0xA5
-#define MESH_PKT_VERSION     1
-#define MESH_PKT_TYPE_TEXT   1
 
 static const char *TAG = "root_bcast";
 static uint32_t s_command_id = 1;
@@ -45,7 +30,7 @@ static const char *command_owner(const char *payload)
 	if (strcmp(payload, "readtds") == 0) return "Keetds";
 	return NULL;
 }
-static uint32_t s_root_cnt = 1000000;     // окремий лічильник для root
+static uint32_t s_root_cnt = 1000000;
 
 void mesh_root_broadcast_text(const char *payload)
 {
@@ -83,10 +68,10 @@ void mesh_root_broadcast_text(const char *payload)
 	pkt.type    = MESH_PKT_TYPE_TEXT;
 	pkt.counter = s_root_cnt++;
 
-	// MAC root-ноди
+	// Fill root STA MAC for legacy packet routing.
 	esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
 
-	// Копіюємо рядок у payload
+	// Copy the legacy text command into the fixed packet payload.
 	strncpy(pkt.payload, payload, sizeof(pkt.payload) - 1);
 	pkt.payload[sizeof(pkt.payload) - 1] = '\0';
 
@@ -97,7 +82,7 @@ void mesh_root_broadcast_text(const char *payload)
 		.tos   = MESH_TOS_P2P,
 	};
 
-	// Забираємо routing table
+	// Collect current ESP-MESH routes.
 	mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
 	int route_table_size = 0;
 
