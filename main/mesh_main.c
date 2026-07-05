@@ -874,7 +874,9 @@ void app_main(void)
 
 	log_http_server_init();
 	ESP_ERROR_CHECK(esp_mesh_start());
-	ESP_ERROR_CHECK(mesh_v2_root_init());
+	mesh_v2_link_require();
+	esp_err_t v2_init_err = mesh_v2_root_init();
+	ESP_ERROR_CHECK(v2_init_err);
 
 	ESP_LOGI(MESH_TAG,
 	         "mesh started, heap:%" PRId32 ", root_fixed:%d, topo:%d %s, ps:%d",

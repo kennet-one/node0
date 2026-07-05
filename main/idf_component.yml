@@ -2,4 +2,4 @@ dependencies:
   keemash_mesh_core:
     git: https://github.com/kennet-one/keemash_core.git
     path: .
-    version: v0.3.1
+    version: v0.3.2
