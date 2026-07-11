@@ -4595,6 +4595,44 @@ static esp_err_t http_admin_check_post(httpd_req_t *req)
 }
 
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+static bool parse_status_exec_count(const char *text, uint32_t *out)
+{
+	const char *p = text ? strstr(text, "exec=") : NULL;
+	if (!p || !out) return false;
+	p += 5;
+	if (!isdigit((unsigned char)*p)) return false;
+	*out = (uint32_t)strtoul(p, NULL, 10);
+	return true;
+}
+
+static esp_err_t wait_command_result(uint32_t command_id,
+                                     mesh_v2_command_result_t *result,
+                                     uint32_t timeout_ms,
+                                     uint32_t *latency_ms)
+{
+	uint32_t start = ms_now();
+	for (;;) {
+		if (mesh_v2_root_command_result(command_id, result) &&
+		    result && result->seen) {
+			if (latency_ms) *latency_ms = (uint32_t)(ms_now() - start);
+			return ESP_OK;
+		}
+		if ((uint32_t)(ms_now() - start) >= timeout_ms) {
+			if (latency_ms) *latency_ms = (uint32_t)(ms_now() - start);
+			return ESP_ERR_TIMEOUT;
+		}
+		vTaskDelay(pdMS_TO_TICKS(20));
+	}
+}
+
+static uint32_t next_debug_command_id(void)
+{
+	static uint32_t s_id = 0xC3300000UL;
+	s_id++;
+	if (s_id == 0) s_id = 0xC3300000UL;
+	return s_id;
+}
+
 static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 {
 	if (!ota_enabled()) {
@@ -4701,10 +4739,141 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		}
 	}
 
+	bool run_status = strcmp(case_name, "choinka_status") == 0 ||
+	                  strcmp(case_name, "status") == 0 ||
+	                  strcmp(case_name, "real_command") == 0 ||
+	                  strcmp(case_name, "control_stress") == 0;
+	uint32_t status_count = run_status ? query_u32_value(q, "count") : 0;
+	if (run_status && status_count == 0) {
+		status_count = strcmp(case_name, "control_stress") == 0 ? 1000 : 1;
+	}
+	if (status_count > 1000) status_count = 1000;
+
+	esp_err_t status_err = ESP_OK;
+	bool status_pass = !run_status;
+	bool status_duplicate_pass = false;
+	uint32_t status_sent = 0;
+	uint32_t status_ok = 0;
+	uint32_t status_timeout = 0;
+	uint32_t status_unsupported = 0;
+	uint32_t status_mismatch = 0;
+	uint32_t status_max_latency_ms = 0;
+	uint32_t status_first_exec = 0;
+	uint32_t status_last_exec = 0;
+	char status_first_text[MESH_V2_CONTROL_TEXT_MAX + 1] = "";
+	char status_last_text[MESH_V2_CONTROL_TEXT_MAX + 1] = "";
+	mesh_v2_root_stats_t status_stats = {0};
+	bool status_has_stats = false;
+
+	if (run_status) {
+		if (!have_mac || mac_eq(mac, s_local_mac)) {
+			status_err = ESP_ERR_INVALID_STATE;
+		} else if (!node_route_current(mac) || !mesh_v2_root_tunnel_ready_for_mac(mac)) {
+			status_err = ESP_ERR_MESH_NO_ROUTE_FOUND;
+		} else {
+			uint32_t dup_id = next_debug_command_id();
+			mesh_v2_command_result_t dup_result = {0};
+			uint32_t dup_latency = 0;
+			status_err = mesh_v2_root_send_command(mac, dup_id, "choinka.status");
+			if (status_err == ESP_OK) {
+				status_err = wait_command_result(dup_id, &dup_result, 2000, &dup_latency);
+			}
+			if (status_err == ESP_OK) {
+				status_err = mesh_v2_root_send_command(mac, dup_id, "choinka.status");
+			}
+			uint32_t dup_wait_start = ms_now();
+			while (status_err == ESP_OK) {
+				if (mesh_v2_root_command_result(dup_id, &dup_result) &&
+				    dup_result.seen_count >= 2) {
+					break;
+				}
+				if ((uint32_t)(ms_now() - dup_wait_start) >= 2000) {
+					status_err = ESP_ERR_TIMEOUT;
+					break;
+				}
+				vTaskDelay(pdMS_TO_TICKS(20));
+			}
+			uint32_t dup_exec = 0;
+			status_duplicate_pass = status_err == ESP_OK &&
+			                        dup_result.status == MESH_V2_CONTROL_STATUS_OK &&
+			                        dup_result.seen_count >= 2 &&
+			                        !dup_result.text_changed &&
+			                        parse_status_exec_count(dup_result.text, &dup_exec);
+			if (!status_duplicate_pass && status_err == ESP_OK) {
+				status_err = ESP_FAIL;
+			}
+			if (status_err == ESP_OK) {
+				uint32_t expected_exec = dup_exec + 1;
+				for (uint32_t i = 0; i < status_count; i++) {
+					uint32_t id = next_debug_command_id();
+					mesh_v2_command_result_t got = {0};
+					uint32_t latency = 0;
+					esp_err_t err = mesh_v2_root_send_command(mac, id, "choinka.status");
+					if (err != ESP_OK) {
+						status_err = err;
+						break;
+					}
+					status_sent++;
+					err = wait_command_result(id, &got, 2000, &latency);
+					if (latency > status_max_latency_ms) {
+						status_max_latency_ms = latency;
+					}
+					if (err == ESP_ERR_TIMEOUT) {
+						status_timeout++;
+						status_err = err;
+						break;
+					}
+					if (err != ESP_OK) {
+						status_err = err;
+						break;
+					}
+					if (got.status == MESH_V2_CONTROL_STATUS_UNSUPPORTED) {
+						status_unsupported++;
+						status_err = ESP_ERR_NOT_SUPPORTED;
+						break;
+					}
+					uint32_t exec = 0;
+					if (got.status != MESH_V2_CONTROL_STATUS_OK ||
+					    !parse_status_exec_count(got.text, &exec) ||
+					    exec != expected_exec) {
+						status_mismatch++;
+						status_err = ESP_FAIL;
+						break;
+					}
+					if (status_ok == 0) {
+						status_first_exec = exec;
+						strncpy(status_first_text, got.text, sizeof(status_first_text) - 1);
+						status_first_text[sizeof(status_first_text) - 1] = '\0';
+					}
+					status_last_exec = exec;
+					strncpy(status_last_text, got.text, sizeof(status_last_text) - 1);
+					status_last_text[sizeof(status_last_text) - 1] = '\0';
+					status_ok++;
+					expected_exec++;
+				}
+			}
+			status_has_stats = mesh_v2_root_stats_for_mac(mac, &status_stats);
+			status_pass = status_err == ESP_OK &&
+			              status_duplicate_pass &&
+			              status_sent == status_count &&
+			              status_ok == status_count &&
+			              status_timeout == 0 &&
+			              status_unsupported == 0 &&
+			              status_mismatch == 0 &&
+			              status_has_stats &&
+			              status_stats.lost_count == 0 &&
+			              status_stats.overflow_count == 0 &&
+			              status_stats.tx_unacked == 0 &&
+			              status_stats.reorder_depth == 0;
+		}
+	}
+
 	char mac_hex[13] = "";
 	if (have_mac) mac_to_hex(mac, mac_hex);
-	bool overall_pass = (!run_core || core.pass) && (!run_dedupe || dedupe_pass);
-	char out[1152];
+	bool overall_pass = (!run_core || core.pass) &&
+	                    (!run_dedupe || dedupe_pass) &&
+	                    (!run_status || status_pass);
+	char out[3072];
 	size_t pos = append_fmt(out, sizeof(out), 0,
 		"{\"ok\":%s,\"pass\":%s,\"case\":",
 		overall_pass ? "true" : "false",
@@ -4758,6 +4927,37 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 		(unsigned long)result.seen_count,
 		(unsigned)result.status, result.text_changed ? "true" : "false");
 	pos = append_json_string(out, sizeof(out), pos, result.text);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"status_run\":%s,\"status_pass\":%s,\"status_duplicate_pass\":%s,"
+		"\"status_err\":%d,\"status_count\":%lu,\"status_sent\":%lu,"
+		"\"status_ok\":%lu,\"status_timeout\":%lu,"
+		"\"status_unsupported\":%lu,\"status_mismatch\":%lu,"
+		"\"status_max_latency_ms\":%lu,\"status_first_exec\":%lu,"
+		"\"status_last_exec\":%lu,\"status_has_stats\":%s,"
+		"\"status_lost\":%lu,\"status_overflow\":%lu,"
+		"\"status_tx_unacked\":%lu,\"status_reorder_depth\":%lu,"
+		"\"status_first_text\":",
+		run_status ? "true" : "false",
+		(!run_status || status_pass) ? "true" : "false",
+		status_duplicate_pass ? "true" : "false",
+		(int)status_err,
+		(unsigned long)status_count,
+		(unsigned long)status_sent,
+		(unsigned long)status_ok,
+		(unsigned long)status_timeout,
+		(unsigned long)status_unsupported,
+		(unsigned long)status_mismatch,
+		(unsigned long)status_max_latency_ms,
+		(unsigned long)status_first_exec,
+		(unsigned long)status_last_exec,
+		status_has_stats ? "true" : "false",
+		(unsigned long)status_stats.lost_count,
+		(unsigned long)status_stats.overflow_count,
+		(unsigned long)status_stats.tx_unacked,
+		(unsigned long)status_stats.reorder_depth);
+	pos = append_json_string(out, sizeof(out), pos, status_first_text);
+	pos = append_fmt(out, sizeof(out), pos, ",\"status_last_text\":");
+	pos = append_json_string(out, sizeof(out), pos, status_last_text);
 	pos = append_fmt(out, sizeof(out), pos, "}");
 
 	httpd_resp_set_type(req, "application/json");

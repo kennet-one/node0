@@ -28,6 +28,7 @@ static const char *command_owner(const char *payload)
 	    starts_with(payload, "14") || starts_with(payload, "18") ||
 	    starts_with(payload, "19")) return "humidifier";
 	if (strcmp(payload, "readtds") == 0) return "Keetds";
+	if (strcmp(payload, "choinka.status") == 0) return "choinka";
 	return NULL;
 }
 static uint32_t s_root_cnt = 1000000;
