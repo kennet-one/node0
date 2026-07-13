@@ -10,7 +10,6 @@
 
 
 static const char *TAG = "root_bcast";
-static uint32_t s_command_id = 1;
 
 static bool starts_with(const char *text, const char *prefix)
 {
@@ -47,9 +46,22 @@ void mesh_root_broadcast_text(const char *payload)
 	const char *owner = command_owner(payload);
 	if (owner) {
 		uint8_t owner_mac[6] = {0};
+		if (mesh_v2_root_find_lossless_by_tag(owner, owner_mac,
+						      MESH_V2_CAP_TYPED_CONTROL)) {
+			uint32_t command_id = mesh_v2_root_next_command_id();
+			esp_err_t rel_err = mesh_v2_root_send_command(owner_mac, command_id,
+							 payload);
+			if (rel_err == ESP_OK) {
+				ESP_LOGI(TAG, "reliable command id=%lu owner=%s payload=\"%s\"",
+				         (unsigned long)command_id, owner, payload);
+			} else {
+				ESP_LOGW(TAG, "reliable command rejected owner=%s err=%s",
+				         owner, esp_err_to_name(rel_err));
+			}
+			return;
+		}
 		if (mesh_v2_root_find_ready_by_tag(owner, owner_mac)) {
-			uint32_t command_id = s_command_id++;
-			if (s_command_id == 0) s_command_id = 1;
+			uint32_t command_id = mesh_v2_root_next_command_id();
 			esp_err_t rel_err = mesh_v2_root_send_command(owner_mac, command_id, payload);
 			if (rel_err == ESP_OK) {
 				ESP_LOGI(TAG, "reliable command id=%lu owner=%s payload=\"%s\"",
@@ -123,7 +135,8 @@ void mesh_root_broadcast_text(const char *payload)
 		if (memcmp(route_table[i].addr, pkt.src_mac, 6) == 0) {
 			continue;
 		}
-		err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+		err = mesh_v2_link_send(route_table[i].addr, data.data, data.size,
+					KEEMASH_REL_PRIORITY_CONTROL);
 		if (err != ESP_OK) {
 			ESP_LOGE(TAG,
 			         "send[%d] failed: 0x%x (%s)",

@@ -241,7 +241,8 @@ static esp_err_t mesh_send_single(const uint8_t to_mac[6],
     data.tos   = MESH_TOS_P2P;
 
     // Normal P2P send; ESP-MESH resolves the route.
-    return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+    return mesh_v2_link_send(dest.addr, data.data, data.size,
+                             KEEMASH_REL_PRIORITY_NORMAL);
 }
 #endif
 
@@ -446,7 +447,8 @@ static void mesh_tx_task(void *arg)
 		// 00:00:00:00:00:00 means "send to root".
 		memset(&dest, 0, sizeof(dest));
 
-		err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+		err = mesh_v2_link_send(dest.addr, data.data, data.size,
+					KEEMASH_REL_PRIORITY_NORMAL);
 		if (err == ESP_OK) {
 			ESP_LOGI(MESH_TAG,
 			         "TX -> ROOT: cnt=%lu, payload=\"%s\"",
@@ -649,6 +651,7 @@ static void mesh_event_handler(void *arg,
 		         "<MESH_EVENT_ROUTING_TABLE_ADD> add %d, new:%d, layer:%d",
 		         rt->rt_size_change, rt->rt_size_new, mesh_layer);
 		log_http_server_refresh_routes();
+		mesh_v2_link_refresh_routes();
 	}
 	break;
 
@@ -659,6 +662,7 @@ static void mesh_event_handler(void *arg,
 		         "<MESH_EVENT_ROUTING_TABLE_REMOVE> remove %d, new:%d, layer:%d",
 		         rt->rt_size_change, rt->rt_size_new, mesh_layer);
 		log_http_server_refresh_routes();
+		mesh_v2_link_refresh_routes();
 		log_http_server_mesh_state_changed();
 	}
 	break;
@@ -877,6 +881,7 @@ void app_main(void)
 	mesh_v2_link_require();
 	esp_err_t v2_init_err = mesh_v2_root_init();
 	ESP_ERROR_CHECK(v2_init_err);
+	mesh_v2_link_refresh_routes();
 
 	ESP_LOGI(MESH_TAG,
 	         "mesh started, heap:%" PRId32 ", root_fixed:%d, topo:%d %s, ps:%d",

@@ -6,18 +6,33 @@
 #include "esp_err.h"
 #include "esp_mesh.h"
 #include "esp_wifi.h"
+#include "sdkconfig.h"
 
 #include "keemash_mesh_hooks.h"
+#include "keemash_mesh_tx_broker.h"
 #include "legacy_proto.h"
 #include "log_http_server.h"
 
-void mesh_v2_link_require(void)
+static keemash_mesh_tx_broker_t *s_tx_broker;
+
+static uint8_t tx_priority(const void *packet, size_t packet_len)
 {
+	if (packet_len < sizeof(mesh_v2_hdr_t)) return KEEMASH_REL_PRIORITY_NORMAL;
+	const mesh_v2_hdr_t *h = packet;
+	if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION_V2)
+		return KEEMASH_REL_PRIORITY_NORMAL;
+	if (h->type != MESH_V2_TYPE_RELIABLE_DATA ||
+	    h->payload_len < sizeof(mesh_v2_reliable_hdr_t))
+		return KEEMASH_REL_PRIORITY_CONTROL;
+	const mesh_v2_reliable_hdr_t *rh =
+		(const mesh_v2_reliable_hdr_t *)((const uint8_t *)packet + sizeof(*h));
+	return rh->priority;
 }
 
-esp_err_t keemash_mesh_transport_send(const uint8_t dst[6], const void *packet, size_t packet_len)
+static esp_err_t raw_mesh_send(void *user, const uint8_t dst[6],
+			       const void *packet, size_t packet_len)
 {
-	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
+	(void)user;
 	mesh_addr_t dest = {0};
 	if (dst) memcpy(dest.addr, dst, 6);
 	mesh_data_t data = {
@@ -27,6 +42,58 @@ esp_err_t keemash_mesh_transport_send(const uint8_t dst[6], const void *packet, 
 		.tos = MESH_TOS_P2P,
 	};
 	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+}
+
+void mesh_v2_link_require(void)
+{
+	if (s_tx_broker) return;
+	keemash_mesh_tx_broker_config_t cfg = {
+		.slots = 32,
+		.max_packet_size = 512,
+		.task_stack_words = 4096,
+		.task_priority = 7,
+		.task_name = "mesh_tx",
+		.raw_send = raw_mesh_send,
+	};
+	ESP_ERROR_CHECK(keemash_mesh_tx_broker_init(&s_tx_broker, &cfg));
+}
+
+void mesh_v2_link_refresh_routes(void)
+{
+	mesh_addr_t routes[CONFIG_MESH_ROUTE_TABLE_SIZE];
+	int count = 0;
+	if (esp_mesh_get_routing_table(routes, sizeof(routes), &count) != ESP_OK) return;
+	uint8_t local[6] = {0};
+	esp_wifi_get_mac(WIFI_IF_STA, local);
+	uint8_t macs[CONFIG_MESH_ROUTE_TABLE_SIZE][6];
+	size_t remote_count = 0;
+	for (int i = 0; i < count && remote_count < CONFIG_MESH_ROUTE_TABLE_SIZE; i++) {
+		if (memcmp(routes[i].addr, local, 6) == 0) continue;
+		memcpy(macs[remote_count++], routes[i].addr, 6);
+	}
+	mesh_v2_root_sync_routes(remote_count ? &macs[0][0] : NULL, remote_count);
+}
+
+esp_err_t keemash_mesh_transport_send(const uint8_t dst[6], const void *packet, size_t packet_len)
+{
+	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
+	if (!s_tx_broker) return ESP_ERR_INVALID_STATE;
+	return keemash_mesh_tx_broker_submit(s_tx_broker, dst, packet, packet_len,
+					     tx_priority(packet, packet_len));
+}
+
+esp_err_t mesh_v2_link_send(const uint8_t dst[6], const void *packet,
+			    size_t packet_len, uint8_t priority)
+{
+	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
+	if (!s_tx_broker) return ESP_ERR_INVALID_STATE;
+	return keemash_mesh_tx_broker_submit(s_tx_broker, dst, packet, packet_len,
+					     priority);
+}
+
+void mesh_v2_link_tx_stats(keemash_mesh_tx_broker_stats_t *out)
+{
+	keemash_mesh_tx_broker_stats(s_tx_broker, out);
 }
 
 void keemash_mesh_get_local_mac(uint8_t mac[6])

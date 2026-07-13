@@ -1705,6 +1705,9 @@ static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 	}
 
 	esp_err_t v2_err = mesh_v2_root_send_log_ctrl(to_mac, enable);
+	if (mesh_v2_root_peer_advertises_lossless(to_mac, 0)) {
+		return v2_err;
+	}
 
 	mesh_log_ctrl_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -1728,7 +1731,8 @@ static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 	memset(&dest, 0, sizeof(dest));
 	memcpy(dest.addr, to_mac, 6);
 
-	esp_err_t v1_err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	esp_err_t v1_err = mesh_v2_link_send(dest.addr, data.data, data.size,
+					    KEEMASH_REL_PRIORITY_CONTROL);
 	if (v2_err == ESP_OK || v1_err == ESP_OK) {
 		return ESP_OK;
 	}
@@ -3260,7 +3264,10 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  "\"reliable_ready\":false,\"root_session\":0,"
 		                  "\"node_session\":0,\"tx_unacked\":0,\"reorder_depth\":0,"
 		                  "\"rto_ms\":0,\"retry_count\":0,\"ack_age_ms\":-1,"
-		                  "\"rtt_ms\":0,\"overflow_count\":0,\"lost_reason\":0");
+		                  "\"rtt_ms\":0,\"overflow_count\":0,\"lost_reason\":0,"
+		                  "\"capabilities\":0,\"route_up\":false,"
+		                  "\"route_down_age_ms\":0,\"duplicate_tag_count\":0,"
+		                  "\"time_superseded_count\":0");
 	}
 
 	if (st.last_v2_ms != 0) {
@@ -3296,7 +3303,9 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  "\"reorder_depth\":%lu,\"rto_ms\":%lu,"
 	                  "\"retry_count\":%lu,\"ack_age_ms\":%ld,"
 	                  "\"rtt_ms\":%lu,\"overflow_count\":%lu,"
-	                  "\"lost_reason\":%u",
+	                  "\"lost_reason\":%u,\"capabilities\":%lu,"
+	                  "\"route_up\":%s,\"route_down_age_ms\":%lu,"
+	                  "\"duplicate_tag_count\":%lu,\"time_superseded_count\":%lu",
 	                  tunnel_age_ms,
 	                  rel_log_age_ms,
 	                  st.has_gap ? "true" : "false",
@@ -3310,7 +3319,12 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  st.ack_age_ms == UINT32_MAX ? -1L : (long)st.ack_age_ms,
 	                  (unsigned long)st.rtt_ms,
 	                  (unsigned long)st.overflow_count,
-	                  (unsigned)st.lost_reason);
+	                  (unsigned)st.lost_reason,
+	                  (unsigned long)st.capabilities,
+	                  st.route_up ? "true" : "false",
+	                  (unsigned long)st.route_down_age_ms,
+	                  (unsigned long)st.duplicate_tag_count,
+	                  (unsigned long)st.time_superseded_count);
 }
 
 static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
@@ -3434,7 +3448,7 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 		                  ",\"topology_valid\":false,\"topology_age_ms\":-1,"
 		                  "\"parent_mac\":\"\",\"root_mac\":\"\","
 		                  "\"layer\":0,\"max_layer\":0,\"parent_rssi\":-127,"
-		                  "\"child_count\":0,\"capabilities\":0,"
+		                  "\"child_count\":0,\"topology_capabilities\":0,"
 		                  "\"v1_ok_age_ms\":-1,\"v2_ack_age_ms\":-1,"
 		                  "\"last_remote_send_err\":0,\"last_remote_send_err_name\":\"\","
 		                  "\"remote_recovery_phase\":0,"
@@ -3463,7 +3477,7 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	                 "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
-	                 "\"child_count\":%u,\"capabilities\":%lu,"
+	                 "\"child_count\":%u,\"topology_capabilities\":%lu,"
 	                 "\"v1_ok_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
 	                 "\"last_remote_send_err\":%ld,\"last_remote_send_err_name\":",
 	                 age_ms,
@@ -4154,7 +4168,8 @@ static esp_err_t mesh_ota_send_to(const uint8_t to_mac[6], const void *pkt, size
 	memset(&dest, 0, sizeof(dest));
 	memcpy(dest.addr, to_mac, 6);
 
-	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	return mesh_v2_link_send(dest.addr, data.data, data.size,
+				 KEEMASH_REL_PRIORITY_HIGH);
 }
 
 static void remote_ota_clear_wait(void)
@@ -4594,6 +4609,21 @@ static esp_err_t http_admin_check_post(httpd_req_t *req)
 	return http_json_ok(req, "admin unlocked");
 }
 
+static esp_err_t wait_peer_command_result(const uint8_t peer[6], uint32_t command_id,
+					  mesh_v2_command_result_t *result,
+					  uint32_t timeout_ms)
+{
+	uint32_t start = ms_now();
+	for (;;) {
+		if (mesh_v2_root_command_result_for_peer(peer, command_id, result) &&
+		    result && result->seen)
+			return ESP_OK;
+		if ((uint32_t)(ms_now() - start) >= timeout_ms)
+			return ESP_ERR_TIMEOUT;
+		vTaskDelay(pdMS_TO_TICKS(20));
+	}
+}
+
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 static bool parse_status_exec_count(const char *text, uint32_t *out)
 {
@@ -4605,14 +4635,14 @@ static bool parse_status_exec_count(const char *text, uint32_t *out)
 	return true;
 }
 
-static esp_err_t wait_command_result(uint32_t command_id,
+static esp_err_t wait_command_result(const uint8_t peer[6], uint32_t command_id,
                                      mesh_v2_command_result_t *result,
                                      uint32_t timeout_ms,
                                      uint32_t *latency_ms)
 {
 	uint32_t start = ms_now();
 	for (;;) {
-		if (mesh_v2_root_command_result(command_id, result) &&
+		if (mesh_v2_root_command_result_for_peer(peer, command_id, result) &&
 		    result && result->seen) {
 			if (latency_ms) *latency_ms = (uint32_t)(ms_now() - start);
 			return ESP_OK;
@@ -4682,7 +4712,11 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	                strcmp(case_name, "final_data") == 0 ||
 	                strcmp(case_name, "lost_final_data") == 0 ||
 	                strcmp(case_name, "final_ack") == 0 ||
-	                strcmp(case_name, "lost_final_ack") == 0;
+	                strcmp(case_name, "lost_final_ack") == 0 ||
+	                strcmp(case_name, "route_resume") == 0 ||
+	                strcmp(case_name, "source_auth") == 0 ||
+	                strcmp(case_name, "route_timeout") == 0 ||
+	                strcmp(case_name, "time_latest") == 0;
 	uint32_t mask = 0;
 	if (strcmp(case_name, "seq_wrap") == 0) mask = KEEMASH_REL_DEBUG_CASE_SEQ_WRAP;
 	else if (strcmp(case_name, "session_reset") == 0) mask = KEEMASH_REL_DEBUG_CASE_SESSION_RESET;
@@ -4701,6 +4735,10 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 	         strcmp(case_name, "lost_final_ack") == 0) {
 		mask = KEEMASH_REL_DEBUG_CASE_FINAL_ACK;
 	}
+	else if (strcmp(case_name, "route_resume") == 0) mask = KEEMASH_REL_DEBUG_CASE_ROUTE_RESUME;
+	else if (strcmp(case_name, "source_auth") == 0) mask = KEEMASH_REL_DEBUG_CASE_SOURCE_AUTH;
+	else if (strcmp(case_name, "route_timeout") == 0) mask = KEEMASH_REL_DEBUG_CASE_ROUTE_TIMEOUT;
+	else if (strcmp(case_name, "time_latest") == 0) mask = KEEMASH_REL_DEBUG_CASE_TIME_LATEST;
 	else mask = KEEMASH_REL_DEBUG_CASE_ALL;
 
 	if (run_core) {
@@ -4727,7 +4765,7 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 			}
 			for (uint8_t i = 0; dedupe_err == ESP_OK && i < 50; i++) {
 				vTaskDelay(pdMS_TO_TICKS(100));
-				if (mesh_v2_root_command_result(command_id, &result) &&
+				if (mesh_v2_root_command_result_for_peer(mac, command_id, &result) &&
 				    result.seen_count >= 2) {
 					break;
 				}
@@ -4776,14 +4814,14 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 			uint32_t dup_latency = 0;
 			status_err = mesh_v2_root_send_command(mac, dup_id, "choinka.status");
 			if (status_err == ESP_OK) {
-				status_err = wait_command_result(dup_id, &dup_result, 2000, &dup_latency);
+				status_err = wait_command_result(mac, dup_id, &dup_result, 2000, &dup_latency);
 			}
 			if (status_err == ESP_OK) {
 				status_err = mesh_v2_root_send_command(mac, dup_id, "choinka.status");
 			}
 			uint32_t dup_wait_start = ms_now();
 			while (status_err == ESP_OK) {
-				if (mesh_v2_root_command_result(dup_id, &dup_result) &&
+				if (mesh_v2_root_command_result_for_peer(mac, dup_id, &dup_result) &&
 				    dup_result.seen_count >= 2) {
 					break;
 				}
@@ -4814,7 +4852,7 @@ static esp_err_t http_lossless_debug_post(httpd_req_t *req)
 						break;
 					}
 					status_sent++;
-					err = wait_command_result(id, &got, 2000, &latency);
+				err = wait_command_result(mac, id, &got, 2000, &latency);
 					if (latency > status_max_latency_ms) {
 						status_max_latency_ms = latency;
 					}
@@ -5436,6 +5474,34 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
+		if (mesh_v2_root_peer_advertises_lossless(target_mac,
+						      MESH_V2_CAP_TYPED_CONTROL)) {
+			uint32_t command_id = mesh_v2_root_next_command_id();
+			mesh_v2_command_result_t command_result = {0};
+			result = mesh_v2_root_send_command(target_mac, command_id,
+							"system.reboot");
+			if (result == ESP_OK)
+				result = wait_peer_command_result(target_mac, command_id,
+							  &command_result, 1000);
+			if (result != ESP_OK) {
+				snprintf(err_msg, sizeof(err_msg),
+					 "reliable reboot result timeout: %s",
+					 esp_err_to_name(result));
+				break;
+			}
+			if (command_result.status != MESH_V2_CONTROL_STATUS_OK) {
+				snprintf(err_msg, sizeof(err_msg), "reliable reboot rejected: %.48s",
+					 command_result.text);
+				result = ESP_FAIL;
+				break;
+			}
+			snprintf(err_msg, sizeof(err_msg), "remote reboot accepted, %s rebooting",
+			         target_tag);
+			ESP_LOGI(TAG, "%s via reliable CONTROL id=%lu", err_msg,
+			         (unsigned long)command_id);
+			xSemaphoreGive(s_ota_mutex);
+			return http_json_ok(req, err_msg);
+		}
 
 		mesh_reboot_request_packet_t p;
 		memset(&p, 0, sizeof(p));
@@ -6003,6 +6069,18 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
 		bool v2_supported = remote_ota_v2_supported_for_mac(target_mac);
+		bool v2_advertised = mesh_v2_root_peer_advertises_lossless(
+			target_mac, MESH_V2_CAP_OTA);
+		if (v2_advertised && requested_mode == REMOTE_OTA_MODE_V1) {
+			snprintf(err_msg, sizeof(err_msg),
+			         "OTA v1 disabled for lossless target");
+			break;
+		}
+		if (v2_advertised && !v2_supported) {
+			snprintf(err_msg, sizeof(err_msg),
+			         "target OTA v2 session not ready");
+			break;
+		}
 		if (requested_mode == REMOTE_OTA_MODE_V2 && !v2_supported) {
 			snprintf(err_msg, sizeof(err_msg), "target OTA v2 not ready");
 			break;
@@ -6549,6 +6627,8 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	size_t internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	keemash_mesh_tx_broker_stats_t tx = {0};
+	mesh_v2_link_tx_stats(&tx);
 
 	pos = append_fmt(out, cap, pos,
 	                 "{\"log_sse\":%s,\"ui_sse\":%s,\"mesh_sse\":%s,"
@@ -6570,12 +6650,21 @@ static size_t append_health_json(char *out, size_t cap, size_t pos)
 	pos = append_fmt(out, cap, pos,
 	                 ",\"remote_app_age_ms\":%ld,"
 	                 "\"heap_internal_free\":%lu,\"heap_internal_min\":%lu,"
-	                 "\"heap_psram_free\":%lu,\"heap_psram_min\":%lu}",
+	                 "\"heap_psram_free\":%lu,\"heap_psram_min\":%lu,"
+	                 "\"mesh_tx_pending\":%lu,\"mesh_tx_accepted\":%lu,"
+	                 "\"mesh_tx_completed\":%lu,\"mesh_tx_rejected_full\":%lu,"
+	                 "\"mesh_tx_transport_errors\":%lu,\"mesh_tx_last_err\":%ld}",
 	                 app_age,
 	                 (unsigned long)internal_free,
 	                 (unsigned long)internal_min,
 	                 (unsigned long)psram_free,
-	                 (unsigned long)psram_min);
+	                 (unsigned long)psram_min,
+	                 (unsigned long)tx.pending,
+	                 (unsigned long)tx.accepted,
+	                 (unsigned long)tx.completed,
+	                 (unsigned long)tx.rejected_full,
+	                 (unsigned long)tx.transport_errors,
+	                 (long)tx.last_transport_err);
 	return pos;
 }
 

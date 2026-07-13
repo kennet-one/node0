@@ -8,10 +8,13 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_mesh.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "keemash_mesh_hooks.h"
+#include "keemash_mesh_root.h"
 
 static const char *TAG = "mesh_time";
 
@@ -72,6 +75,10 @@ static void mesh_time_sync_root_set_period_ms(uint32_t period_ms)
 
 static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 {
+	uint32_t source_uptime_s =
+		(uint32_t)(esp_timer_get_time() / 1000000ULL);
+	(void)mesh_v2_root_queue_time_all(seq, epoch_sec, source_uptime_s);
+
 	mesh_packet_wire_t pkt;
 	memset(&pkt, 0, sizeof(pkt));
 
@@ -86,13 +93,6 @@ static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 	tp.epoch_sec = epoch_sec;
 	tp.seq = seq;
 	memcpy(pkt.payload, &tp, sizeof(tp));
-
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)&pkt;
-	data.size = sizeof(pkt);
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
 
 	mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
 	int route_table_size = 0;
@@ -126,7 +126,13 @@ static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 		if (memcmp(route_table[i].addr, local_mac, 6) == 0) {
 			continue;
 		}
-		esp_err_t e = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+		esp_err_t e;
+		if (mesh_v2_root_peer_advertises_lossless(route_table[i].addr,
+							  MESH_V2_CAP_TYPED_TIME)) {
+			e = ESP_OK;
+		} else {
+			e = keemash_mesh_transport_send(route_table[i].addr, &pkt, sizeof(pkt));
+		}
 		if (e != ESP_OK) last_err = e;
 	}
 	return last_err;
