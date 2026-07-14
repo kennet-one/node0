@@ -15,20 +15,6 @@
 
 static keemash_mesh_tx_broker_t *s_tx_broker;
 
-static uint8_t tx_priority(const void *packet, size_t packet_len)
-{
-	if (packet_len < sizeof(mesh_v2_hdr_t)) return KEEMASH_REL_PRIORITY_NORMAL;
-	const mesh_v2_hdr_t *h = packet;
-	if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION_V2)
-		return KEEMASH_REL_PRIORITY_NORMAL;
-	if (h->type != MESH_V2_TYPE_RELIABLE_DATA ||
-	    h->payload_len < sizeof(mesh_v2_reliable_hdr_t))
-		return KEEMASH_REL_PRIORITY_CONTROL;
-	const mesh_v2_reliable_hdr_t *rh =
-		(const mesh_v2_reliable_hdr_t *)((const uint8_t *)packet + sizeof(*h));
-	return rh->priority;
-}
-
 static esp_err_t raw_mesh_send(void *user, const uint8_t dst[6],
 			       const void *packet, size_t packet_len)
 {
@@ -78,8 +64,7 @@ esp_err_t keemash_mesh_transport_send(const uint8_t dst[6], const void *packet, 
 {
 	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
 	if (!s_tx_broker) return ESP_ERR_INVALID_STATE;
-	return keemash_mesh_tx_broker_submit(s_tx_broker, dst, packet, packet_len,
-					     tx_priority(packet, packet_len));
+	return keemash_mesh_tx_broker_submit_auto(s_tx_broker, dst, packet, packet_len);
 }
 
 esp_err_t mesh_v2_link_send(const uint8_t dst[6], const void *packet,

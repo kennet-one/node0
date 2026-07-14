@@ -4,7 +4,7 @@ dependencies:
       type: idf
     version: 6.0.1
   keemash_mesh_core:
-    component_hash: ff3ac57aca0cc366f2fb4408d80bd10f7af8712ee6f68f156d705fda95a8cdb3
+    component_hash: c9d223130a8d89b584146315b9a04a7dc5385df995596fcb6d84e8a087dd3b6d
     dependencies:
     - name: idf
       version: '>=6.0.1,<6.1'
@@ -12,9 +12,9 @@ dependencies:
       git: https://github.com/kennet-one/keemash_core.git
       path: .
       type: git
-    version: c67789096b201990f0873c72203605236855c904
+    version: 54153432b7b0515498e975c7662f1a9835ede6f6
 direct_dependencies:
 - keemash_mesh_core
-manifest_hash: c0f80d430ec0058c9ad693e0b1ce8d4c44fd5cfb0a53f9edd889fb145ad5240a
+manifest_hash: 1bed57fdcd2d3215fb0feef639ce6c59451f97fd42e1811974d0faa46788fcc4
 target: esp32s3
 version: 3.0.0

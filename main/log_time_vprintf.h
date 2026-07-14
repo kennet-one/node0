@@ -1,15 +1,6 @@
 #pragma once
 
-#include <stdbool.h>
-#include "esp_err.h"
+#include "keemash_log_time_vprintf.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-esp_err_t log_time_vprintf_start(void);
-void log_time_vprintf_enable(bool en);
-
-#ifdef __cplusplus
-}
-#endif
+#define log_time_vprintf_start keemash_log_time_vprintf_start
+#define log_time_vprintf_enable keemash_log_time_vprintf_enable
