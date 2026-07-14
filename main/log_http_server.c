@@ -99,6 +99,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
 #define MESH_STATUS_JSON_MAX		12288U
+#define HTTP_TLS_WRITE_CHUNK		1024U
 #define UI_CONTROL_POLL_MS		15000
 #define TASKS_FAST_POLL_MS		2000
 #define REMOTE_LOG_RETRY_MS		5000U
@@ -2561,9 +2562,33 @@ void log_http_server_remote_reboot_status(const uint8_t mac[6],
 
 /* ----------------- HTTP handlers ----------------- */
 
+static esp_err_t http_send_buffer_parts(httpd_req_t *req, const char *data,
+					 size_t len)
+{
+	if (!req || (!data && len != 0)) return ESP_ERR_INVALID_ARG;
+
+	size_t offset = 0;
+	while (offset < len) {
+		size_t part = len - offset;
+		if (part > HTTP_TLS_WRITE_CHUNK) part = HTTP_TLS_WRITE_CHUNK;
+		esp_err_t err = httpd_resp_send_chunk(req, data + offset, part);
+		if (err != ESP_OK) return err;
+		offset += part;
+	}
+	return ESP_OK;
+}
+
+static esp_err_t http_send_buffer_chunked(httpd_req_t *req, const char *data,
+					   size_t len)
+{
+	esp_err_t err = http_send_buffer_parts(req, data, len);
+	if (err != ESP_OK) return err;
+	return httpd_resp_send_chunk(req, NULL, 0);
+}
+
 static esp_err_t http_nodes_get(httpd_req_t *req)
 {
-	enum { NODES_JSON_MAX = 8192 };
+	enum { NODES_JSON_MAX = MESH_STATUS_JSON_MAX };
 	char *out = (char *)malloc(NODES_JSON_MAX);
 	if (!out) {
 		return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -2580,7 +2605,7 @@ static esp_err_t http_nodes_get(httpd_req_t *req)
 
 	httpd_resp_set_type(req, "application/json");
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	esp_err_t err = http_send_buffer_chunked(req, out, pos);
 	free(out);
 	return err;
 }
@@ -6745,7 +6770,7 @@ static esp_err_t http_ui_status_get(httpd_req_t *req)
 
 	httpd_resp_set_type(req, "application/json");
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	esp_err_t err = http_send_buffer_chunked(req, out, pos);
 	free(out);
 	return err;
 }
@@ -6777,7 +6802,7 @@ static esp_err_t http_mesh_status_get(httpd_req_t *req)
 
 	httpd_resp_set_type(req, "application/json");
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-	esp_err_t err = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+	esp_err_t err = http_send_buffer_chunked(req, out, pos);
 	free(out);
 	return err;
 }
@@ -6816,7 +6841,7 @@ static esp_err_t mesh_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
 
 	esp_err_t err = httpd_resp_send_chunk(req, header, (size_t)n);
 	if (err == ESP_OK) {
-		err = httpd_resp_send_chunk(req, json, pos);
+		err = http_send_buffer_parts(req, json, pos);
 	}
 	if (err == ESP_OK) {
 		err = httpd_resp_send_chunk(req, "\n\n", 2);
@@ -7044,7 +7069,7 @@ static esp_err_t ui_stream_send_snapshot(httpd_req_t *req, uint32_t seq)
 
 	esp_err_t err = httpd_resp_send_chunk(req, header, (size_t)n);
 	if (err == ESP_OK) {
-		err = httpd_resp_send_chunk(req, json, pos);
+		err = http_send_buffer_parts(req, json, pos);
 	}
 	if (err == ESP_OK) {
 		static const char tail[] = "\n\n";
