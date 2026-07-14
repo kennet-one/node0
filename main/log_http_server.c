@@ -95,6 +95,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define MESH_STREAM_HEARTBEAT_MS	15000U
 #define UI_STREAM_TASK_STACK		4096U
 #define UI_STREAM_HEARTBEAT_MS		5000U
+#define UI_TASK_REFRESH_MS		5000U
 #define LOG_LEASE_TASK_STACK		3572U
 #define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
@@ -154,8 +155,10 @@ static uint32_t s_mesh_stream_seq = 1;
 typedef struct {
 	httpd_req_t *req;
 	uint32_t seq;
+	uint32_t last_task_request_ms;
 	bool headers_sent;
 	bool client_close;
+	bool include_tasks;
 	char sid[STREAM_SID_MAX];
 } ui_stream_state_t;
 
@@ -475,12 +478,17 @@ static void ui_stream_notify(void)
 	}
 }
 
+static void ui_stream_mark_changed(void)
+{
+	s_ui_stream_seq++;
+	ui_stream_notify();
+}
+
 static void mesh_stream_mark_changed(void)
 {
 	s_mesh_stream_seq++;
-	s_ui_stream_seq++;
 	mesh_stream_notify();
-	ui_stream_notify();
+	ui_stream_mark_changed();
 }
 
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
@@ -2306,7 +2314,7 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 		}
 	}
 	portEXIT_CRITICAL(&s_taskmon_lock);
-	ui_stream_notify();
+	ui_stream_mark_changed();
 }
 
 void log_http_server_memory_snapshot_v2(const uint8_t mac[6],
@@ -2351,7 +2359,7 @@ void log_http_server_memory_snapshot_v2(const uint8_t mac[6],
 		}
 	}
 	portEXIT_CRITICAL(&s_taskmon_lock);
-	ui_stream_notify();
+	ui_stream_mark_changed();
 }
 
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -3290,6 +3298,7 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  "\"node_session\":0,\"tx_unacked\":0,\"reorder_depth\":0,"
 		                  "\"rto_ms\":0,\"retry_count\":0,\"ack_age_ms\":-1,"
 		                  "\"rtt_ms\":0,\"overflow_count\":0,\"lost_reason\":0,"
+		                  "\"loss_active\":false,"
 		                  "\"capabilities\":0,\"route_up\":false,"
 		                  "\"route_down_age_ms\":0,\"duplicate_tag_count\":0,"
 		                  "\"time_superseded_count\":0");
@@ -3328,7 +3337,7 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  "\"reorder_depth\":%lu,\"rto_ms\":%lu,"
 	                  "\"retry_count\":%lu,\"ack_age_ms\":%ld,"
 	                  "\"rtt_ms\":%lu,\"overflow_count\":%lu,"
-	                  "\"lost_reason\":%u,\"capabilities\":%lu,"
+	                  "\"lost_reason\":%u,\"loss_active\":%s,\"capabilities\":%lu,"
 	                  "\"route_up\":%s,\"route_down_age_ms\":%lu,"
 	                  "\"duplicate_tag_count\":%lu,\"time_superseded_count\":%lu",
 	                  tunnel_age_ms,
@@ -3345,6 +3354,8 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  (unsigned long)st.rtt_ms,
 	                  (unsigned long)st.overflow_count,
 	                  (unsigned)st.lost_reason,
+	                  (st.has_gap || (st.lost_reason != 0 && st.tx_unacked > 0))
+	                      ? "true" : "false",
 	                  (unsigned long)st.capabilities,
 	                  st.route_up ? "true" : "false",
 	                  (unsigned long)st.route_down_age_ms,
@@ -7145,7 +7156,9 @@ static void ui_stream_task(void *arg)
 		httpd_req_t *req = NULL;
 		bool headers_sent = false;
 		bool client_close = false;
+		bool include_tasks = false;
 		uint32_t last_sent_seq = 0;
+		uint32_t last_task_request_ms = 0;
 		uint32_t current_seq = s_ui_stream_seq;
 
 		if (!s_ui_stream_mutex ||
@@ -7156,7 +7169,9 @@ static void ui_stream_task(void *arg)
 		req = s_ui_stream.req;
 		headers_sent = s_ui_stream.headers_sent;
 		client_close = s_ui_stream.client_close;
+		include_tasks = s_ui_stream.include_tasks;
 		last_sent_seq = s_ui_stream.seq;
+		last_task_request_ms = s_ui_stream.last_task_request_ms;
 		current_seq = s_ui_stream_seq;
 		xSemaphoreGive(s_ui_stream_mutex);
 
@@ -7174,6 +7189,23 @@ static void ui_stream_task(void *arg)
 			}
 			ui_stream_complete(req);
 			continue;
+		}
+
+		uint32_t now = ms_now();
+		if (include_tasks &&
+		    (last_task_request_ms == 0 ||
+		     (uint32_t)(now - last_task_request_ms) >= UI_TASK_REFRESH_MS)) {
+			uint8_t task_mac[6];
+			selection_snapshot(task_mac, NULL, 0);
+			(void)request_fresh_tasks_for_mac(task_mac);
+			if (xSemaphoreTake(s_ui_stream_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+				if (s_ui_stream.req == req) {
+					s_ui_stream.last_task_request_ms = now;
+				}
+				xSemaphoreGive(s_ui_stream_mutex);
+			}
+			ui_stream_mark_changed();
+			current_seq = s_ui_stream_seq;
 		}
 
 		esp_err_t err = ESP_OK;
@@ -7236,6 +7268,11 @@ static esp_err_t http_ui_stream_get(httpd_req_t *req)
 
 	char sid[STREAM_SID_MAX];
 	stream_sid_from_req(req, sid, sizeof(sid));
+	bool include_tasks = false;
+	char query[96] = {0};
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+		include_tasks = query_bool_value(query, "tasks");
+	}
 
 	if (!ui_stream_wait_idle(1400)) {
 		return http_ui_stream_busy(req);
@@ -7262,8 +7299,10 @@ static esp_err_t http_ui_stream_get(httpd_req_t *req)
 	}
 	s_ui_stream.req = async_req;
 	s_ui_stream.seq = 0;
+	s_ui_stream.last_task_request_ms = 0;
 	s_ui_stream.headers_sent = false;
 	s_ui_stream.client_close = false;
+	s_ui_stream.include_tasks = include_tasks;
 	copy_packet_text(s_ui_stream.sid, sizeof(s_ui_stream.sid), sid, sizeof(sid));
 	xSemaphoreGive(s_ui_stream_mutex);
 
@@ -7424,7 +7463,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let selectionBusy=false;\n"
 		"function setTopActive(id,on){const b=document.getElementById(id);if(b)b.className=on?'topActive':''}\n"
 		"function toggleFreeze(){freeze=!freeze;document.getElementById('fz').textContent=freeze?'ON':'OFF';setTopActive('freezeBtn',freeze)}\n"
-		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';setTopActive('tasksBtn',tasksVisible);if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true);startUiStream()}}\n"
+		"function toggleTasks(){tasksVisible=!tasksVisible;document.body.classList.toggle('showTasks',tasksVisible);document.getElementById('tm').textContent=tasksVisible?'ON':'OFF';setTopActive('tasksBtn',tasksVisible);if(tasksVisible){clearTasksPanel();loadTasks(true);loadOtaStatus();loadUiStatus(true)}restartUiStream()}\n"
 		"function updateAdminUi(){const b=document.getElementById('adminBtn');if(!b)return;b.textContent=adminUnlocked?'admin: ON':'admin';b.className=adminUnlocked?'topActive':''}\n"
 		"function clearAdmin(){adminPin='';adminUnlocked=false;updateAdminUi();updateOtaUi()}\n"
 		"async function toggleAdmin(){\n"
@@ -7460,6 +7499,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function stopLogStream(notify){if(notify)notifyStreamClose('log');if(logStream){logStream.close();logStream=null;}logStreamReady=false;}\n"
 		"function stopMeshStream(notify){if(notify)notifyStreamClose('mesh');if(meshStream){meshStream.close();meshStream=null;}document.getElementById('meshState').textContent='off'}\n"
 		"function stopUiStream(notify){if(notify)notifyStreamClose('ui');if(uiStream){uiStream.close();uiStream=null;}}\n"
+		"function restartUiStream(){stopUiStream(true);setTimeout(()=>{if(!otaBusy)startUiStream()},120)}\n"
 		"function otaSlotName(label){if(label==='ota_0')return 'A';if(label==='ota_1')return 'B';return '?'}\n"
 		"function otaSlotClassFor(label){if(label==='ota_0')return 'otaSlotA';if(label==='ota_1')return 'otaSlotB';return 'otaSlotUnknown'}\n"
 		"function setOtaSlot(text,cls){otaSlotText=text||'A/B ?';otaSlotClass=cls||'otaSlotUnknown';const el=document.getElementById('otaSlot');if(el){el.textContent=otaSlotText;el.className='otaSlot '+otaSlotClass}}\n"
@@ -7469,7 +7509,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function rememberNode(mac,tag){try{if(mac)localStorage.setItem('logSelectedMac',mac);if(tag)localStorage.setItem('logSelectedTag',tag)}catch(e){}}\n"
 		"function nodeInList(nodes,mac){return !!(mac&&(nodes||[]).some(n=>n.mac===mac))}\n"
 		"async function reselectNode(mac){if(!mac||reselectBusy)return;reselectBusy=true;try{await controlFetch('/select?mac='+encodeURIComponent(mac),6000);lastNodes='';await loadUiStatus();}catch(e){}finally{reselectBusy=false}}\n"
-		"function nodeStateLabel(n){return n.lost_reason&&n.lost_count?'lost':(n.has_gap?'gap':(n.offline?'offline':(n.app_stale?'app stale':(n.stale?'stale':(n.route_table_seen&&!n.telemetry_fresh?'route':(n.proto==='lossless'?'lossless':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))))))))}\n"
+		"function nodeStateLabel(n){return n.loss_active?'lost':(n.has_gap?'gap':(n.offline?'offline':(n.app_stale?'app stale':(n.stale?'stale':(n.route_table_seen&&!n.telemetry_fresh?'route':(n.proto==='lossless'?'lossless':(n.proto==='tunnel'?'tunnel':(n.proto==='v2'?'v2':(n.proto==='v1'?'v1':'')))))))))}\n"
 		"function nodeListKey(nodes,cur,waiting){return (cur||'')+'|'+(waiting?'1':'0')+'|'+(nodes||[]).map(n=>(n.mac||'')+'\\t'+(n.tag||'node')+'\\t'+nodeStateLabel(n)).join('\\n')}\n"
 		"function applyNodes(j,raw){\n"
 		"  if(!j)return;\n"
@@ -7487,13 +7527,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"}\n"
 		"function errName(e){e=Number(e)||0;if(e===16399)return 'NO_ROUTE';if(e===259)return 'INVALID_STATE';return e?String(e):''}\n"
 		"function recReasonName(r){r=Number(r)||0;const m=['','ack stale','tx/noack','rootless','no parent','parent disc','soft reconnect','mesh restart'];return m[r]||String(r)}\n"
-		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.reliable_ready){parts.push('rtt '+(n.rtt_ms||'?')+'ms');parts.push('rto '+(n.rto_ms||'?')+'ms');parts.push('tx '+(n.tx_unacked||0));if(typeof n.rel_log_age_ms==='number'&&n.rel_log_age_ms>=0&&n.rel_log_age_ms<15000)parts.push('log v2');if(n.reorder_depth)parts.push('reorder '+n.reorder_depth);if(n.retry_count)parts.push('retry '+n.retry_count);if(n.overflow_count)parts.push('overflow '+n.overflow_count)}if(n.lost_reason&&n.lost_count)parts.push('explicit lost '+n.lost_reason);else if(n.has_gap)parts.push('gap');else if(n.replay_count)parts.push('replayed');parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.reliable_ready){parts.push('rtt '+(n.rtt_ms||'?')+'ms');parts.push('rto '+(n.rto_ms||'?')+'ms');parts.push('tx '+(n.tx_unacked||0));if(typeof n.rel_log_age_ms==='number'&&n.rel_log_age_ms>=0&&n.rel_log_age_ms<15000)parts.push('log v2');if(n.reorder_depth)parts.push('reorder '+n.reorder_depth);if(n.retry_count)parts.push('retry '+n.retry_count);if(n.overflow_count)parts.push('overflow '+n.overflow_count)}if(n.loss_active)parts.push('explicit lost '+n.lost_reason);else if(n.has_gap)parts.push('gap');else if(n.replay_count)parts.push('replayed');if(!n.loss_active&&n.lost_count)parts.push('lost history '+n.lost_count);parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':(n.app_stale||n.stale)?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
-		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.lost_reason&&n.lost_count))return 'explicit lost';if(rem.some(n=>n.has_gap))return 'recovering';if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';if(rem.some(n=>(n.replay_count||0)>0))return 'replayed';if(rem.length&&rem.every(n=>n.reliable_ready))return 'healthy';return mode||'live'}\n"
+		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.loss_active))return 'explicit lost';if(rem.some(n=>n.has_gap))return 'recovering';if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';if(rem.some(n=>(n.replay_count||0)>0))return 'replayed';if(rem.length&&rem.every(n=>n.reliable_ready))return 'healthy';return mode||'live'}\n"
 		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
 		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
 		"function applyUiStatus(j,mode){if(!j)return;applyNodes(j.nodes,JSON.stringify(j.nodes));if(tasksVisible&&j.tasks)applyTasks(j.tasks,selectedMac||'',JSON.stringify(j.tasks));if(tasksVisible&&j.ota)applyOta(j.ota);if(meshVisible&&j.nodes)applyMeshStatus(j.nodes,mode||'live')}\n"
-		"function startUiStream(){if(uiStream||otaBusy)return;if(!window.EventSource){loadUiStatus();return;}try{uiStream=new EventSource('/ui/stream?sid='+encodeURIComponent(pageSid))}catch(e){uiStream=null;loadUiStatus();return;}uiStream.addEventListener('ui',e=>{try{uiStreamErrors=0;applyUiStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});uiStream.onopen=()=>{uiStreamErrors=0;if(meshVisible)document.getElementById('meshState').textContent='live'};uiStream.onerror=()=>{uiStreamErrors++;stopUiStream(false);if(meshVisible)document.getElementById('meshState').textContent='retry';const d=Math.min(30000,2000*uiStreamErrors);setTimeout(()=>{loadUiStatus();if(!otaBusy)startUiStream()},d)}}\n"
+		"function startUiStream(){if(uiStream||otaBusy)return;if(!window.EventSource){loadUiStatus();return;}try{uiStream=new EventSource('/ui/stream?sid='+encodeURIComponent(pageSid)+'&tasks='+(tasksVisible?'1':'0'))}catch(e){uiStream=null;loadUiStatus();return;}uiStream.addEventListener('ui',e=>{try{uiStreamErrors=0;applyUiStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});uiStream.onopen=()=>{uiStreamErrors=0;if(meshVisible)document.getElementById('meshState').textContent='live'};uiStream.onerror=()=>{uiStreamErrors++;stopUiStream(false);if(meshVisible)document.getElementById('meshState').textContent='retry';const d=Math.min(30000,2000*uiStreamErrors);setTimeout(()=>{loadUiStatus();if(!otaBusy)startUiStream()},d)}}\n"
 		"function startMeshStream(){startUiStream();if(meshVisible)loadMeshStatus('poll')}\n"
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
