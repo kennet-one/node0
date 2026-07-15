@@ -3132,7 +3132,8 @@ static void ota_status_finish(node0_ota_state_t state, const char *msg)
 
 static bool remote_ota_supported_tag(const char *tag)
 {
-	return tag && strcmp(tag, "choinka") == 0;
+	return tag && (strcmp(tag, "choinka") == 0 ||
+	               strcmp(tag, "kPowerLed") == 0);
 }
 
 static bool remote_ota_is_choinka_mac(const uint8_t mac[6])
