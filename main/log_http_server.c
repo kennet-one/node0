@@ -95,7 +95,7 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define MESH_STREAM_HEARTBEAT_MS	15000U
 #define UI_STREAM_TASK_STACK		4096U
 #define UI_STREAM_HEARTBEAT_MS		5000U
-#define UI_TASK_REFRESH_MS		5000U
+#define UI_TASK_REFRESH_MS		2000U
 #define LOG_LEASE_TASK_STACK		3572U
 #define HTTPS_MAX_OPEN_SOCKETS		4
 #define UI_STATUS_JSON_MAX		12288U
@@ -7206,6 +7206,7 @@ static void ui_stream_task(void *arg)
 				}
 				xSemaphoreGive(s_ui_stream_mutex);
 			}
+			last_task_request_ms = now;
 			ui_stream_mark_changed();
 			current_seq = s_ui_stream_seq;
 		}
@@ -7237,7 +7238,21 @@ static void ui_stream_task(void *arg)
 				}
 				xSemaphoreGive(s_ui_stream_mutex);
 			}
-			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UI_STREAM_HEARTBEAT_MS));
+			uint32_t wait_ms = UI_STREAM_HEARTBEAT_MS;
+			if (include_tasks && last_task_request_ms != 0) {
+				uint32_t elapsed =
+					(uint32_t)(ms_now() - last_task_request_ms);
+				if (elapsed >= UI_TASK_REFRESH_MS) {
+					wait_ms = 1;
+				} else {
+					uint32_t until_refresh =
+						UI_TASK_REFRESH_MS - elapsed;
+					if (until_refresh < wait_ms) {
+						wait_ms = until_refresh;
+					}
+				}
+			}
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
 			continue;
 		}
 
