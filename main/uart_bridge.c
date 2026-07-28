@@ -9,17 +9,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "mesh_root_bcast.h"   // тут оголошено mesh_root_broadcast_text()
+#include "mesh_root_bcast.h"
 
 static const char *TAG = "uart_bridge";
 
 /* -------------------------------------------------------------------------- */
-/*  Налаштування UART                                                         */
+/*  UART configuration                                                        */
 /* -------------------------------------------------------------------------- */
 
 /*
- * Підлаштуй під свої пін-а, якщо потрібно.
- * Зараз: UART1, TX=17, RX=16, 115200.
+ * KeeMASH bridge: UART1, TX=17, RX=16, 115200.
  */
 #define UART_BRIDGE_PORT   UART_NUM_1
 #define UART_BRIDGE_TX_PIN GPIO_NUM_17
@@ -31,7 +30,7 @@ static const char *TAG = "uart_bridge";
 static TaskHandle_t s_uart_task = NULL;
 
 /* -------------------------------------------------------------------------- */
-/*  Таска: читаємо UART построчно, шлемо в mesh root-broadcast                */
+/*  Read complete UART lines and route them through the mesh root.             */
 /* -------------------------------------------------------------------------- */
 
 static void uart_bridge_task(void *arg)
@@ -49,25 +48,25 @@ static void uart_bridge_task(void *arg)
 		if (n > 0) {
 			len += n;
 
-			// Парсимо по '\n' / '\r'
+			// Parse CR/LF-delimited lines.
 			for (size_t i = 0; i < len; ++i) {
 				uint8_t ch = buf[i];
 
 				if (ch == '\r') {
-					// ігноруємо CR
+					// Ignore CR; LF terminates the line.
 					continue;
 				}
 
 				if (ch == '\n') {
-					// є ціла строка [0..i-1]
+					// Complete line in [0..i-1].
 					buf[i] = 0;
 					char *line = (char *)buf;
 
-					// обрізаємо пробіли з початку
+					// Trim leading whitespace.
 					while (*line == ' ' || *line == '\t') {
 						++line;
 					}
-					// і з кінця
+					// Trim trailing whitespace.
 					size_t L = strlen(line);
 					while (L > 0 &&
 					       (line[L - 1] == ' ' ||
@@ -77,19 +76,19 @@ static void uart_bridge_task(void *arg)
 
 					if (L > 0) {
 						ESP_LOGI(TAG, "RX UART: '%s'", line);
-						// розкидуємо по всій mesh-мережі
+						// Route through the owner map or legacy broadcast.
 						mesh_root_broadcast_text(line);
 					}
 
-					// зсуваємо хвіст буфера в початок
+					// Move the remaining bytes to the start of the buffer.
 					size_t remain = len - (i + 1);
 					memmove(buf, buf + i + 1, remain);
 					len = remain;
-					i   = (size_t)-1;   // стартуємо цикл заново
+					i   = (size_t)-1;   // Restart parsing from the buffer head.
 				}
 			}
 
-			// якщо буфер забитий без '\n' – просто обнуляємо
+			// Drop an unterminated line that fills the fixed buffer.
 			if (len >= UART_BRIDGE_RX_BUF - 1) {
 				len = 0;
 			}
@@ -98,7 +97,7 @@ static void uart_bridge_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Публічні функції                                                          */
+/*  Public API                                                                */
 /* -------------------------------------------------------------------------- */
 
 void uart_bridge_init(void)
@@ -158,8 +157,8 @@ void uart_bridge_start(void)
 }
 
 /*
- * Відправити строку в UART (одна команда для Windows-моста / Bluetooth-ESP).
- * Ніяких FreeRTOS-черг тут немає – просто uart_write_bytes().
+ * Send one line to the Windows/Bluetooth bridge. The UART driver owns
+ * serialization; this module does not add another FreeRTOS queue.
  */
 void uart_bridge_send_line(const char *text)
 {
@@ -174,7 +173,7 @@ void uart_bridge_send_line(const char *text)
 
 	uart_write_bytes(UART_BRIDGE_PORT, text, len);
 
-	// додаємо '\n', щоб з того боку приймалося як окрема строка
+	// Add LF so the peer receives one complete line.
 	const char nl = '\n';
 	uart_write_bytes(UART_BRIDGE_PORT, &nl, 1);
 

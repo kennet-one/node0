@@ -12,6 +12,7 @@
 #include "keemash_mesh_tx_broker.h"
 #include "legacy_proto.h"
 #include "log_http_server.h"
+#include "mesh_root_bcast.h"
 
 static keemash_mesh_tx_broker_t *s_tx_broker;
 
@@ -35,6 +36,7 @@ void mesh_v2_link_require(void)
 	if (s_tx_broker) return;
 	keemash_mesh_tx_broker_config_t cfg = {
 		.slots = 32,
+		.control_reserved_slots = 4,
 		.max_packet_size = 512,
 		.task_stack_words = 4096,
 		.task_priority = 7,
@@ -130,6 +132,17 @@ void keemash_mesh_root_on_topology(const uint8_t mac[6], const void *payload, si
 void keemash_mesh_root_on_control_event(const char *text)
 {
 	legacy_handle_text(text);
+}
+
+void keemash_mesh_root_on_control(const uint8_t peer[6], uint32_t root_session,
+				  uint32_t node_session, uint8_t kind,
+				  uint32_t command_id, uint8_t status,
+				  const char *text)
+{
+	(void)node_session;
+	if (kind == MESH_V2_CONTROL_RESULT) {
+		mesh_root_command_result(peer, root_session, command_id, status, text);
+	}
 }
 
 void keemash_mesh_root_on_state_changed(void)

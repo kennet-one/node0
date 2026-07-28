@@ -41,6 +41,9 @@ void log_http_server_remote_reboot_status(const uint8_t mac[6],
 // Called by mesh events when the routing table changes.
 void log_http_server_refresh_routes(void);
 void log_http_server_mesh_state_changed(void);
+bool log_http_server_find_routable_by_tag(const char *tag, uint8_t mac[6]);
+void log_http_server_command_status(const char *state, const char *owner,
+                                    uint32_t command_id, const char *detail);
 
 #ifdef __cplusplus
 }

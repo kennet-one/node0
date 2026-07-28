@@ -121,6 +121,17 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 
 static httpd_handle_t s_http_server = NULL;
 
+typedef struct {
+	uint32_t updated_ms;
+	uint32_t command_id;
+	char state[16];
+	char owner[16];
+	char detail[48];
+} command_diag_t;
+
+static portMUX_TYPE s_command_diag_lock = portMUX_INITIALIZER_UNLOCKED;
+static command_diag_t s_command_diag;
+
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_lines[LOG_HTTP_LINES][LOG_HTTP_LINE_MAX];
 static uint32_t s_write_idx = 0;	// absolute line cursor
@@ -595,6 +606,41 @@ void log_http_server_refresh_routes(void)
 
 void log_http_server_mesh_state_changed(void)
 {
+	mesh_stream_mark_changed();
+}
+
+bool log_http_server_find_routable_by_tag(const char *tag, uint8_t mac[6])
+{
+	if (!tag || !tag[0] || !mac) return false;
+	uint8_t found[6] = {0};
+	uint32_t matches = 0;
+	portENTER_CRITICAL(&s_nodes_lock);
+	for (uint32_t i = 0; i < s_nodes_count; i++) {
+		if (strncmp(s_nodes[i].tag, tag, sizeof(s_nodes[i].tag)) == 0) {
+			mac_copy(found, s_nodes[i].mac);
+			matches++;
+		}
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+	if (matches != 1 || !node_route_current(found)) return false;
+	mac_copy(mac, found);
+	return true;
+}
+
+void log_http_server_command_status(const char *state, const char *owner,
+                                    uint32_t command_id, const char *detail)
+{
+	portENTER_CRITICAL(&s_command_diag_lock);
+	memset(&s_command_diag, 0, sizeof(s_command_diag));
+	s_command_diag.updated_ms = ms_now();
+	s_command_diag.command_id = command_id;
+	copy_tag(s_command_diag.state, sizeof(s_command_diag.state),
+	         state ? state : "unknown");
+	copy_tag(s_command_diag.owner, sizeof(s_command_diag.owner),
+	         owner ? owner : "unknown");
+	snprintf(s_command_diag.detail, sizeof(s_command_diag.detail), "%s",
+	         detail ? detail : "");
+	portEXIT_CRITICAL(&s_command_diag_lock);
 	mesh_stream_mark_changed();
 }
 
@@ -3134,7 +3180,8 @@ static bool remote_ota_supported_tag(const char *tag)
 {
 	return tag && (strcmp(tag, "choinka") == 0 ||
 	               strcmp(tag, "kPowerLed") == 0 ||
-	               strcmp(tag, "humidifier") == 0);
+	               strcmp(tag, "humidifier") == 0 ||
+	               strcmp(tag, "Kheater") == 0);
 }
 
 static bool remote_ota_is_choinka_mac(const uint8_t mac[6])
@@ -6733,6 +6780,19 @@ static size_t append_ui_status_json_for_mac(char *out, size_t cap, size_t pos,
 
 	pos = append_fmt(out, cap, pos, ",\"health\":");
 	pos = append_health_json(out, cap, pos);
+	command_diag_t command;
+	portENTER_CRITICAL(&s_command_diag_lock);
+	command = s_command_diag;
+	portEXIT_CRITICAL(&s_command_diag_lock);
+	pos = append_fmt(out, cap, pos, ",\"last_command\":{\"state\":");
+	pos = append_json_string(out, cap, pos, command.state);
+	pos = append_fmt(out, cap, pos, ",\"owner\":");
+	pos = append_json_string(out, cap, pos, command.owner);
+	pos = append_fmt(out, cap, pos, ",\"command_id\":%lu,\"detail\":",
+	                 (unsigned long)command.command_id);
+	pos = append_json_string(out, cap, pos, command.detail);
+	pos = append_fmt(out, cap, pos, ",\"age_ms\":%ld}",
+	                 timestamp_age_ms(ms_now(), command.updated_ms));
 	return append_fmt(out, cap, pos, "}");
 }
 
