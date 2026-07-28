@@ -131,14 +131,16 @@ static void pending_task(void *arg)
 	}
 }
 
-static void ensure_pending_task(void)
+static bool ensure_pending_task(void)
 {
-	if (s_pending_task) return;
+	if (s_pending_task) return true;
 	if (xTaskCreate(pending_task, "cmd_pending", 3072, NULL, 4,
 			&s_pending_task) != pdPASS) {
 		s_pending_task = NULL;
 		ESP_LOGE(TAG, "failed to start command result tracker");
+		return false;
 	}
+	return true;
 }
 
 static bool pending_add(const uint8_t peer[6], uint32_t root_session,
@@ -218,7 +220,11 @@ void mesh_root_broadcast_text(const char *payload)
 
 	const char *owner = command_owner(payload);
 	if (owner) {
-		ensure_pending_task();
+		if (!ensure_pending_task()) {
+			command_feedback("REJECTED", owner, 0,
+					 "command result tracker unavailable");
+			return;
+		}
 		uint8_t owner_mac[6] = {0};
 		if (mesh_v2_root_find_lossless_by_tag(owner, owner_mac,
 						      MESH_V2_CAP_TYPED_CONTROL)) {
