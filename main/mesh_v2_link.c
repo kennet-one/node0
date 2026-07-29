@@ -142,6 +142,8 @@ void keemash_mesh_root_on_control(const uint8_t peer[6], uint32_t root_session,
 	(void)node_session;
 	if (kind == MESH_V2_CONTROL_RESULT) {
 		mesh_root_command_result(peer, root_session, command_id, status, text);
+	} else if (kind == MESH_V2_CONTROL_EVENT) {
+		keemash_mesh_root_on_control_event(text);
 	}
 }
 
