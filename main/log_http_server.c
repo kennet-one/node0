@@ -3181,7 +3181,8 @@ static bool remote_ota_supported_tag(const char *tag)
 	return tag && (strcmp(tag, "choinka") == 0 ||
 	               strcmp(tag, "kPowerLed") == 0 ||
 	               strcmp(tag, "humidifier") == 0 ||
-	               strcmp(tag, "Kheater") == 0);
+	               strcmp(tag, "Kheater") == 0 ||
+	               strcmp(tag, "esp_mixer") == 0);
 }
 
 static bool remote_ota_is_choinka_mac(const uint8_t mac[6])

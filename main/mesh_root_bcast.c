@@ -83,6 +83,11 @@ static const char *command_owner(const char *payload)
 	    starts_with(payload, "19")) return "humidifier";
 	if (strcmp(payload, "readtds") == 0) return "Keetds";
 	if (strcmp(payload, "choinka.status") == 0) return "choinka";
+	if (strcmp(payload, "ppm_echo") == 0 ||
+	    strcmp(payload, "temp_echo") == 0 ||
+	    strcmp(payload, "humi_echo") == 0 ||
+	    strcmp(payload, "lux_echo") == 0 ||
+	    strcmp(payload, "sens_echo") == 0) return "esp_mixer";
 	return NULL;
 }
 static uint32_t s_root_cnt = 1000000;
@@ -197,6 +202,22 @@ static esp_err_t send_v1_text(const uint8_t dst[6], const char *payload)
 	strncpy(pkt.payload, payload, sizeof(pkt.payload) - 1);
 	return mesh_v2_link_send(dst, &pkt, sizeof(pkt),
 				 KEEMASH_REL_PRIORITY_CONTROL);
+}
+
+esp_err_t mesh_root_send_state_to_mixer(const char *legacy_token)
+{
+	if (!legacy_token || !legacy_token[0]) return ESP_ERR_INVALID_ARG;
+	uint8_t mixer_mac[6] = {0};
+	if (!mesh_v2_root_find_lossless_by_tag(
+		    "esp_mixer", mixer_mac, MESH_V2_CAP_TYPED_CONTROL)) {
+		return ESP_ERR_NOT_FOUND;
+	}
+
+	char command[MESH_V2_CONTROL_TEXT_MAX];
+	int n = snprintf(command, sizeof(command), "state:%s", legacy_token);
+	if (n <= 0 || (size_t)n >= sizeof(command)) return ESP_ERR_INVALID_SIZE;
+	return mesh_v2_root_send_command(
+		mixer_mac, mesh_v2_root_next_command_id(), command);
 }
 
 void mesh_root_broadcast_text(const char *payload)

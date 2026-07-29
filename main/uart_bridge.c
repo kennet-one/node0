@@ -76,7 +76,7 @@ static void uart_bridge_task(void *arg)
 
 					if (L > 0) {
 						ESP_LOGI(TAG, "RX UART: '%s'", line);
-						// Route through the owner map or legacy broadcast.
+						// Route HMI lines through the owner map.
 						mesh_root_broadcast_text(line);
 					}
 
