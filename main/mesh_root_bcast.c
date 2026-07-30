@@ -87,7 +87,8 @@ static const char *command_owner(const char *payload)
 	    strcmp(payload, "temp_echo") == 0 ||
 	    strcmp(payload, "humi_echo") == 0 ||
 	    strcmp(payload, "lux_echo") == 0 ||
-	    strcmp(payload, "sens_echo") == 0) return "esp_mixer";
+	    strcmp(payload, "sens_echo") == 0 ||
+	    starts_with(payload, "mixer.weather:")) return "esp_mixer";
 	return NULL;
 }
 static uint32_t s_root_cnt = 1000000;
