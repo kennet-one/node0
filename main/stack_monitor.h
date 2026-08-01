@@ -5,7 +5,8 @@
 
 #include "freertos/FreeRTOS.h"
 
-#define STACK_MONITOR_MAX_TASKS		25
+#define STACK_MONITOR_MAX_TASKS		64
+#define STACK_MONITOR_CAPTURE_MAX_TASKS	96
 #define STACK_MONITOR_TASK_NAME_MAX	16
 
 #ifdef __cplusplus
@@ -23,8 +24,10 @@ typedef struct {
 typedef struct {
 	uint32_t	updated_ms;
 	uint32_t	count;
+	uint32_t	task_total;
 	uint32_t	cpu_load_x10;
 	bool		cpu_valid;
+	bool		truncated;
 	stack_monitor_task_info_t tasks[STACK_MONITOR_MAX_TASKS];
 } stack_monitor_snapshot_t;
 
@@ -34,7 +37,7 @@ void stack_monitor_start(UBaseType_t priority);
 // Copies the latest task snapshot. Returns false before the first sample exists.
 bool stack_monitor_get_snapshot(stack_monitor_snapshot_t *out);
 
-// Takes a fresh sample immediately and returns it.
+// Takes a fresh sample immediately. The output may be NULL when only refresh is needed.
 bool stack_monitor_sample_now(stack_monitor_snapshot_t *out);
 
 #ifdef __cplusplus

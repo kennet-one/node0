@@ -19,6 +19,7 @@
 #include "esp_heap_caps.h"
 #include "esp_image_format.h"
 #include "esp_mac.h"
+#include "esp_memory_utils.h"
 #include "esp_mesh.h"
 #include "esp_ota_ops.h"
 #include "esp_random.h"
@@ -98,9 +99,9 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define UI_TASK_REFRESH_MS		2000U
 #define LOG_LEASE_TASK_STACK		3572U
 #define HTTPS_MAX_OPEN_SOCKETS		4
-#define UI_STATUS_JSON_MAX		12288U
-#define MESH_STATUS_JSON_MAX		12288U
-#define NODE_LIST_JSON_MAX		8192U
+#define UI_STATUS_JSON_MAX		16384U
+#define MESH_STATUS_JSON_MAX		16384U
+#define NODE_LIST_JSON_MAX		12288U
 #define HTTP_TLS_WRITE_CHUNK		1024U
 #define UI_CONTROL_POLL_MS		15000
 #define NODE_LIST_POLL_MS		5000
@@ -186,6 +187,7 @@ static vprintf_like_t s_orig_vprintf = NULL;
 
 // Local node.
 static uint8_t s_local_mac[6] = {0};
+static uint8_t s_local_ap_mac[6] = {0};
 static char s_local_tag[16] = "node0";
 
 // Selected stream, local by default.
@@ -213,6 +215,7 @@ typedef struct {
 	uint32_t topology_seen_ms;
 	uint8_t parent_mac[6];
 	uint8_t root_mac[6];
+	uint8_t self_ap_mac[6];
 	uint16_t layer;
 	uint16_t max_layer;
 	int8_t parent_rssi;
@@ -296,7 +299,7 @@ typedef struct {
 	stack_monitor_snapshot_t staging;
 } taskmon_ent_t;
 
-static taskmon_ent_t s_taskmon[LOG_HTTP_MAX_NODES];
+static taskmon_ent_t *s_taskmon = NULL;
 static portMUX_TYPE s_taskmon_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create);
@@ -993,8 +996,7 @@ static uint32_t request_fresh_tasks_for_mac(const uint8_t mac[6])
 	}
 
 	if (mac_eq(mac, s_local_mac)) {
-		stack_monitor_snapshot_t snapshot;
-		(void)stack_monitor_sample_now(&snapshot);
+		(void)stack_monitor_sample_now(NULL);
 		return 0;
 	}
 
@@ -1052,6 +1054,10 @@ static void wait_for_task_request(const uint8_t mac[6], uint32_t request_id,
 
 static taskmon_ent_t *taskmon_find_locked(const uint8_t mac[6], bool create)
 {
+	if (!s_taskmon) {
+		return NULL;
+	}
+
 	taskmon_ent_t *empty = NULL;
 
 	for (uint32_t i = 0; i < LOG_HTTP_MAX_NODES; i++) {
@@ -1118,7 +1124,9 @@ static void taskmon_add_task_locked(taskmon_ent_t *ent, const uint8_t mac[6],
 		taskmon_start_locked(ent, mac, tag);
 	}
 
+	ent->staging.task_total++;
 	if (ent->staging.count >= STACK_MONITOR_MAX_TASKS) {
+		ent->staging.truncated = true;
 		return;
 	}
 
@@ -2139,6 +2147,8 @@ void log_http_server_node_topology(const uint8_t mac[6],
 	                                                ack_stale_count);
 	bool has_diag_counts = topology_len >= offsetof(mesh_v2_topology_v3_payload_t,
 	                                                rsv);
+	bool has_self_ap = topology_len >= sizeof(mesh_v2_topology_v4_payload_t);
+	uint8_t self_ap_mac[6] = {0};
 	char ota_running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	char ota_update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
 	uint32_t ota_running_size = 0;
@@ -2190,6 +2200,11 @@ void log_http_server_node_topology(const uint8_t mac[6],
 			tx_without_ack_count = v3->tx_without_ack_count;
 		}
 	}
+	if (has_self_ap) {
+		const mesh_v2_topology_v4_payload_t *v4 =
+			(const mesh_v2_topology_v4_payload_t *)topology;
+		mac_copy(self_ap_mac, v4->self_ap_mac);
+	}
 
 	portENTER_CRITICAL(&s_nodes_lock);
 	{
@@ -2202,6 +2217,7 @@ void log_http_server_node_topology(const uint8_t mac[6],
 				s_nodes[i].topology_seen_ms = now;
 				mac_copy(s_nodes[i].parent_mac, topology->parent_mac);
 				mac_copy(s_nodes[i].root_mac, topology->root_mac);
+				mac_copy(s_nodes[i].self_ap_mac, self_ap_mac);
 				s_nodes[i].layer = topology->layer;
 				s_nodes[i].max_layer = topology->max_layer;
 				s_nodes[i].parent_rssi = topology->parent_rssi;
@@ -2259,6 +2275,7 @@ void log_http_server_node_topology(const uint8_t mac[6],
 			ent->topology_seen_ms = now;
 			mac_copy(ent->parent_mac, topology->parent_mac);
 			mac_copy(ent->root_mac, topology->root_mac);
+			mac_copy(ent->self_ap_mac, self_ap_mac);
 			ent->layer = topology->layer;
 			ent->max_layer = topology->max_layer;
 			ent->parent_rssi = topology->parent_rssi;
@@ -2318,9 +2335,10 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 	copy_packet_text(tag, sizeof(tag), snapshot->tag, sizeof(snapshot->tag));
 	log_http_server_node_seen_uptime(mac, tag, true, snapshot->uptime_s);
 
-	uint16_t total = snapshot->task_total;
-	if (total > STACK_MONITOR_MAX_TASKS) {
-		total = STACK_MONITOR_MAX_TASKS;
+	uint16_t reported_total = snapshot->task_total;
+	uint16_t stored_total = reported_total;
+	if (stored_total > STACK_MONITOR_MAX_TASKS) {
+		stored_total = STACK_MONITOR_MAX_TASKS;
 	}
 
 	portENTER_CRITICAL(&s_taskmon_lock);
@@ -2335,13 +2353,15 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 				ent->staging.updated_ms = now;
 				ent->staging.cpu_valid = snapshot->cpu_valid != 0;
 				ent->staging.cpu_load_x10 = snapshot->cpu_load_x10;
-				ent->staging.count = total;
+				ent->staging.count = stored_total;
+				ent->staging.task_total = reported_total;
+				ent->staging.truncated = reported_total > stored_total;
 				ent->staging_active = true;
 			}
 
 			for (uint8_t i = 0; i < snapshot->task_count; i++) {
 				uint16_t idx = (uint16_t)(snapshot->task_index + i);
-				if (idx >= STACK_MONITOR_MAX_TASKS || idx >= total) {
+				if (idx >= STACK_MONITOR_MAX_TASKS || idx >= stored_total) {
 					continue;
 				}
 				const mesh_v2_task_entry_t *src = &snapshot->tasks[i];
@@ -2354,7 +2374,7 @@ void log_http_server_task_snapshot_v2(const uint8_t mac[6],
 			}
 
 			if ((snapshot->flags & MESH_V2_TASK_SNAPSHOT_FLAG_LAST) ||
-			    snapshot->task_index + snapshot->task_count >= total) {
+			    snapshot->task_index + snapshot->task_count >= reported_total) {
 				ent->current = ent->staging;
 				ent->valid = true;
 				ent->staging_active = false;
@@ -3373,7 +3393,9 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 		                  "\"reliable_ready\":false,\"root_session\":0,"
 		                  "\"node_session\":0,\"tx_unacked\":0,\"reorder_depth\":0,"
 		                  "\"rto_ms\":0,\"retry_count\":0,\"ack_age_ms\":-1,"
-		                  "\"rtt_ms\":0,\"overflow_count\":0,\"lost_reason\":0,"
+		                  "\"rtt_ms\":0,\"ping_valid\":false,\"ping_ms\":0,"
+		                  "\"ping_age_ms\":-1,\"ping_timeout_count\":0,"
+		                  "\"overflow_count\":0,\"lost_reason\":0,"
 		                  "\"loss_active\":false,"
 		                  "\"capabilities\":0,\"route_up\":false,"
 		                  "\"route_down_age_ms\":0,\"duplicate_tag_count\":0,"
@@ -3412,7 +3434,9 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  "\"node_session\":%lu,\"tx_unacked\":%lu,"
 	                  "\"reorder_depth\":%lu,\"rto_ms\":%lu,"
 	                  "\"retry_count\":%lu,\"ack_age_ms\":%ld,"
-	                  "\"rtt_ms\":%lu,\"overflow_count\":%lu,"
+	                  "\"rtt_ms\":%lu,\"ping_valid\":%s,\"ping_ms\":%lu,"
+	                  "\"ping_age_ms\":%ld,\"ping_timeout_count\":%lu,"
+	                  "\"overflow_count\":%lu,"
 	                  "\"lost_reason\":%u,\"loss_active\":%s,\"capabilities\":%lu,"
 	                  "\"route_up\":%s,\"route_down_age_ms\":%lu,"
 	                  "\"duplicate_tag_count\":%lu,\"time_superseded_count\":%lu",
@@ -3428,6 +3452,10 @@ static size_t append_node_v2_json_fields(char *out, size_t cap, size_t pos,
 	                  (unsigned long)st.retry_count,
 	                  st.ack_age_ms == UINT32_MAX ? -1L : (long)st.ack_age_ms,
 	                  (unsigned long)st.rtt_ms,
+	                  st.ping_valid ? "true" : "false",
+	                  (unsigned long)st.ping_ms,
+	                  st.ping_age_ms == UINT32_MAX ? -1L : (long)st.ping_age_ms,
+	                  (unsigned long)st.ping_timeout_count,
 	                  (unsigned long)st.overflow_count,
 	                  (unsigned)st.lost_reason,
 	                  (st.has_gap || (st.lost_reason != 0 && st.tx_unacked > 0))
@@ -3558,7 +3586,7 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	if (!node || node->topology_seen_ms == 0) {
 		return append_fmt(out, cap, pos,
 		                  ",\"topology_valid\":false,\"topology_age_ms\":-1,"
-		                  "\"parent_mac\":\"\",\"root_mac\":\"\","
+		                  "\"parent_mac\":\"\",\"root_mac\":\"\",\"self_ap_mac\":\"\","
 		                  "\"layer\":0,\"max_layer\":0,\"parent_rssi\":-127,"
 		                  "\"child_count\":0,\"topology_capabilities\":0,"
 		                  "\"v1_ok_age_ms\":-1,\"v2_ack_age_ms\":-1,"
@@ -3588,6 +3616,7 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	                 ",\"topology_valid\":true,\"topology_age_ms\":%ld,"
 	                 "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"root_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"self_ap_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"layer\":%u,\"max_layer\":%u,\"parent_rssi\":%d,"
 	                 "\"child_count\":%u,\"topology_capabilities\":%lu,"
 	                 "\"v1_ok_age_ms\":%ld,\"v2_ack_age_ms\":%ld,"
@@ -3597,6 +3626,9 @@ static size_t append_node_topology_json_fields(char *out, size_t cap, size_t pos
 	                 node->parent_mac[3], node->parent_mac[4], node->parent_mac[5],
 	                 node->root_mac[0], node->root_mac[1], node->root_mac[2],
 	                 node->root_mac[3], node->root_mac[4], node->root_mac[5],
+	                 node->self_ap_mac[0], node->self_ap_mac[1],
+	                 node->self_ap_mac[2], node->self_ap_mac[3],
+	                 node->self_ap_mac[4], node->self_ap_mac[5],
 	                 (unsigned)node->layer,
 	                 (unsigned)node->max_layer,
 	                 (int)node->parent_rssi,
@@ -3682,9 +3714,12 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	pos = append_json_string(out, cap, pos, selected_tag);
 	pos = append_fmt(out, cap, pos,
 	                 ",\"local_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"local_ap_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"route_table_count\":%d,\"nodes\":[",
 	                 s_local_mac[0], s_local_mac[1], s_local_mac[2],
 	                 s_local_mac[3], s_local_mac[4], s_local_mac[5],
+	                 s_local_ap_mac[0], s_local_ap_mac[1], s_local_ap_mac[2],
+	                 s_local_ap_mac[3], s_local_ap_mac[4], s_local_ap_mac[5],
 	                 route_count);
 
 	pos = append_fmt(out, cap, pos,
@@ -3699,6 +3734,7 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	node_ent_t local_node;
 	memset(&local_node, 0, sizeof(local_node));
 	mac_copy(local_node.mac, s_local_mac);
+	mac_copy(local_node.self_ap_mac, s_local_ap_mac);
 	copy_tag(local_node.tag, sizeof(local_node.tag), s_local_tag);
 	local_node.topology_seen_ms = now;
 	local_node.layer = 1;
@@ -3781,6 +3817,7 @@ typedef struct {
 	uint32_t last_seen_ms;
 	uint32_t topology_seen_ms;
 	uint8_t parent_mac[6];
+	uint8_t self_ap_mac[6];
 	uint16_t layer;
 	int8_t parent_rssi;
 } node_list_snapshot_t;
@@ -3822,7 +3859,15 @@ static size_t append_node_list_entry(char *out, size_t cap, size_t pos,
 	                 "\"app_stale\":%s,\"stale\":%s,\"offline\":%s,"
 	                 "\"has_gap\":%s,\"loss_active\":%s,"
 	                 "\"reliable_ready\":%s,"
+	                 "\"gap_count\":%lu,\"replay_count\":%lu,"
+	                 "\"lost_count\":%lu,\"tx_unacked\":%lu,"
+	                 "\"reorder_depth\":%lu,\"retry_count\":%lu,"
+	                 "\"overflow_count\":%lu,\"rtt_ms\":%lu,\"rto_ms\":%lu,"
+	                 "\"ack_age_ms\":%ld,\"ping_valid\":%s,"
+	                 "\"ping_ms\":%lu,\"ping_age_ms\":%ld,"
+	                 "\"ping_timeout_count\":%lu,"
 	                 "\"parent_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"self_ap_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"layer\":%u,\"parent_rssi\":%d}",
 	                 route_seen ? "true" : "false",
 	                 telemetry_fresh ? "true" : "false",
@@ -3832,9 +3877,28 @@ static size_t append_node_list_entry(char *out, size_t cap, size_t pos,
 	                 (has_v2 && st.has_gap) ? "true" : "false",
 	                 loss_active ? "true" : "false",
 	                 (has_v2 && st.reliable_ready) ? "true" : "false",
+	                 (unsigned long)(has_v2 ? st.gap_count : 0),
+	                 (unsigned long)(has_v2 ? st.replay_count : 0),
+	                 (unsigned long)(has_v2 ? st.lost_count : 0),
+	                 (unsigned long)(has_v2 ? st.tx_unacked : 0),
+	                 (unsigned long)(has_v2 ? st.reorder_depth : 0),
+	                 (unsigned long)(has_v2 ? st.retry_count : 0),
+	                 (unsigned long)(has_v2 ? st.overflow_count : 0),
+	                 (unsigned long)(has_v2 ? st.rtt_ms : 0),
+	                 (unsigned long)(has_v2 ? st.rto_ms : 0),
+	                 (has_v2 && st.ack_age_ms != UINT32_MAX) ?
+	                     (long)st.ack_age_ms : -1L,
+	                 (has_v2 && st.ping_valid) ? "true" : "false",
+	                 (unsigned long)(has_v2 ? st.ping_ms : 0),
+	                 (has_v2 && st.ping_age_ms != UINT32_MAX) ?
+	                     (long)st.ping_age_ms : -1L,
+	                 (unsigned long)(has_v2 ? st.ping_timeout_count : 0),
 	                 node->parent_mac[0], node->parent_mac[1],
 	                 node->parent_mac[2], node->parent_mac[3],
 	                 node->parent_mac[4], node->parent_mac[5],
+	                 node->self_ap_mac[0], node->self_ap_mac[1],
+	                 node->self_ap_mac[2], node->self_ap_mac[3],
+	                 node->self_ap_mac[4], node->self_ap_mac[5],
 	                 (unsigned)node->layer,
 	                 (int)node->parent_rssi);
 	return pos;
@@ -3842,7 +3906,7 @@ static size_t append_node_list_entry(char *out, size_t cap, size_t pos,
 
 static size_t append_node_list_json(char *out, size_t cap, size_t pos)
 {
-	enum { NODE_LIST_MARGIN = 320 };
+	enum { NODE_LIST_MARGIN = 640 };
 	static const uint8_t zero_mac[6] = {0};
 	uint8_t selected_mac[6];
 	char selected_tag[16];
@@ -3871,6 +3935,7 @@ static size_t append_node_list_json(char *out, size_t cap, size_t pos)
 			nodes[i].last_seen_ms = s_nodes[i].last_seen_ms;
 			nodes[i].topology_seen_ms = s_nodes[i].topology_seen_ms;
 			mac_copy(nodes[i].parent_mac, s_nodes[i].parent_mac);
+			mac_copy(nodes[i].self_ap_mac, s_nodes[i].self_ap_mac);
 			nodes[i].layer = s_nodes[i].layer;
 			nodes[i].parent_rssi = s_nodes[i].parent_rssi;
 		}
@@ -3885,13 +3950,17 @@ static size_t append_node_list_json(char *out, size_t cap, size_t pos)
 	pos = append_json_string(out, cap, pos, selected_tag);
 	pos = append_fmt(out, cap, pos,
 	                 ",\"local_mac\":\"%02x%02x%02x%02x%02x%02x\","
+	                 "\"local_ap_mac\":\"%02x%02x%02x%02x%02x%02x\","
 	                 "\"route_table_count\":%d,\"nodes\":[",
 	                 s_local_mac[0], s_local_mac[1], s_local_mac[2],
 	                 s_local_mac[3], s_local_mac[4], s_local_mac[5],
+	                 s_local_ap_mac[0], s_local_ap_mac[1], s_local_ap_mac[2],
+	                 s_local_ap_mac[3], s_local_ap_mac[4], s_local_ap_mac[5],
 	                 route_count);
 
 	node_list_snapshot_t local_node = {0};
 	mac_copy(local_node.mac, s_local_mac);
+	mac_copy(local_node.self_ap_mac, s_local_ap_mac);
 	copy_tag(local_node.tag, sizeof(local_node.tag), s_local_tag);
 	local_node.layer = 1;
 	local_node.parent_rssi = 0;
@@ -4194,7 +4263,8 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 		pos = append_fmt(out, cap, pos,
 		                 ",\"updated_ms\":0,\"age_ms\":0,"
 		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
-		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"slot_count\":%d,\"task_total\":0,"
+		                 "\"task_truncated\":false,\"uptime_valid\":%s,"
 		                 "\"uptime_s\":%lu,",
 		                 slot_count,
 		                 uptime_valid ? "true" : "false",
@@ -4228,13 +4298,16 @@ static size_t append_tasks_json_for_mac(char *out, size_t cap, size_t pos,
 	pos = append_fmt(out, cap, pos,
 	                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
 	                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
-	                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+	                 "\"slot_count\":%d,\"task_total\":%lu,"
+	                 "\"task_truncated\":%s,\"uptime_valid\":%s,"
 	                 "\"uptime_s\":%lu,",
 	                 (unsigned long)snap.updated_ms,
 	                 (unsigned long)age_ms,
 	                 snap.cpu_valid ? "true" : "false",
 	                 (unsigned long)snap.cpu_load_x10,
 	                 slot_count,
+	                 (unsigned long)(snap.task_total ? snap.task_total : snap.count),
+	                 snap.truncated ? "true" : "false",
 	                 uptime_valid ? "true" : "false",
 	                 (unsigned long)uptime_s);
 	pos = append_ram_json_fields(out, cap, pos, &ram);
@@ -6692,7 +6765,8 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		pos = append_fmt(out, TASKS_JSON_MAX, pos,
 		                 ",\"updated_ms\":0,\"age_ms\":0,"
 		                 "\"cpu_valid\":false,\"cpu_load_x10\":0,"
-		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"slot_count\":%d,\"task_total\":0,"
+		                 "\"task_truncated\":false,\"uptime_valid\":%s,"
 		                 "\"uptime_s\":%lu,",
 		                 slot_count,
 		                 uptime_valid ? "true" : "false",
@@ -6725,13 +6799,16 @@ static esp_err_t http_tasks_get(httpd_req_t *req)
 		pos = append_fmt(out, TASKS_JSON_MAX, pos,
 		                 ",\"updated_ms\":%lu,\"age_ms\":%lu,"
 		                 "\"cpu_valid\":%s,\"cpu_load_x10\":%lu,"
-		                 "\"slot_count\":%d,\"uptime_valid\":%s,"
+		                 "\"slot_count\":%d,\"task_total\":%lu,"
+		                 "\"task_truncated\":%s,\"uptime_valid\":%s,"
 		                 "\"uptime_s\":%lu,",
 		                 (unsigned long)snap.updated_ms,
 		                 (unsigned long)age_ms,
 		                 snap.cpu_valid ? "true" : "false",
 		                 (unsigned long)snap.cpu_load_x10,
 		                 slot_count,
+		                 (unsigned long)(snap.task_total ? snap.task_total : snap.count),
+		                 snap.truncated ? "true" : "false",
 		                 uptime_valid ? "true" : "false",
 		                 (unsigned long)uptime_s);
 		pos = append_ram_json_fields(out, TASKS_JSON_MAX, pos, &ram);
@@ -7622,14 +7699,14 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		".topActive{color:#caffdf;background:#103724;border-color:#1d6e44}\n"
 		".topActive:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
 		"select{padding:3px 8px;min-width:130px;background:#191d21;color:#dfe6ee}\n"
-		".taskTop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;color:#eee}\n"
-		".taskLeft{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'title uptime' 'node node';column-gap:8px;row-gap:2px;align-items:baseline;min-width:0;flex:1}\n"
-		".taskLeft b{grid-area:title;min-width:0}\n"
-		".taskNode{grid-area:node;color:#00ff7f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;display:block}\n"
-		".taskUptime{grid-area:uptime;color:#aaa;white-space:nowrap}\n"
-		".taskMeta{text-align:right;color:#aaa;font-size:11px;line-height:1.25;white-space:nowrap;flex:0 0 auto}\n"
-		".taskMac{color:#ddd}\n"
-		".otaBox{margin-top:7px;text-align:right}\n"
+		".taskTop{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'title mac' 'identity age' 'ota ota';gap:4px 10px;align-items:center;margin-bottom:10px;color:#eee}\n"
+		".taskTitle{grid-area:title;white-space:nowrap}\n"
+		".taskIdentity{grid-area:identity;display:flex;align-items:baseline;gap:8px;min-width:0}\n"
+		".taskNode{color:#00ff7f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}\n"
+		".taskUptime{color:#aaa;white-space:nowrap;flex:0 0 auto}\n"
+		".taskAge{grid-area:age;text-align:right;color:#aaa;font-size:11px;white-space:nowrap}\n"
+		".taskMac{grid-area:mac;text-align:right;color:#ddd;font-size:11px;white-space:nowrap}\n"
+		".otaBox{grid-area:ota;margin-top:3px;text-align:right}\n"
 		".otaAction{display:flex;justify-content:flex-end;align-items:center;gap:6px}\n"
 		".otaBtn{font-size:12px;min-height:25px;padding:3px 9px;text-transform:uppercase;color:#caffdf;background:#103724;border-color:#1d6e44}\n"
 		".otaBtn:hover:not(:disabled){background:#145236;border-color:#25a765;color:#fff}\n"
@@ -7675,7 +7752,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"<div id='main'>\n"
 		"<div id='logPane'><div id='log'></div></div>\n"
 		"<div id='mesh'><div class='meshTop'><b>Mesh tree</b><span id='meshState'>...</span></div><div id='meshTree' class='meshTree'>waiting for mesh</div></div>\n"
-		"<div id='tasks'><div class='taskTop'><div class='taskLeft'><b>Task manager</b><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div class='taskMeta'><div id='taskMac' class='taskMac'>...</div><div id='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app slot ? / NVS ?</div><div id='taskTable'></div></div>\n"
+		"<div id='tasks'><div class='taskTop'><b class='taskTitle'>Task manager</b><div id='taskMac' class='taskMac'>...</div><div class='taskIdentity'><span id='taskNode' class='taskNode'></span><span id='taskUp' class='taskUptime'>up ?</span></div><div id='taskAge' class='taskAge'>...</div><div class='otaBox'><div class='otaAction'><button id='otaBtn' class='otaBtn' onclick='startOta()' disabled>update</button><button id='rebootBtn' class='rebootBtn' onclick='startReboot()' disabled>reboot</button><span id='otaSlot' class='otaSlot otaSlotUnknown'>A/B ?</span></div><div id='otaStatus'></div><progress id='otaProg' max='100' value='0'></progress></div></div><div id='taskCpu' class='cpu'>CPU ? / tasks ?/?</div><div id='taskRam' class='ram'>RAM int ? / PSRAM ?</div><div id='taskFlash' class='flash'>FLASH ? / app slot ? / NVS ?</div><div id='taskTable'></div></div>\n"
 		"</div>\n"
 		"<script>\n"
 		"const pageSid=(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)).replace(/[^a-zA-Z0-9_-]/g,'');\n"
@@ -7691,6 +7768,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"let lastTasks='';\n"
 		"let selectedMac='';\n"
 		"let localMac='';\n"
+		"let localApMac='';\n"
 		"let otaEnabled=false;\n"
 		"let otaSupported=false;\n"
 		"let otaBusy=false;\n"
@@ -7731,7 +7809,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function esc(s){s=String(s||'');return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}\n"
 		"function pct(x){return x<0?'?':(x/10).toFixed(1)+'%'}\n"
 		"function stackCls(w){if(w<128)return 'bad';if(w<256)return 'warn';return ''}\n"
-		"function taskSlotsText(count,slots){return count+'/'+(slots>=0?slots:'?')}\n"
+		"function taskCountText(displayed,total,slots){let known=Number(total);if(!Number.isFinite(known)||known<displayed)known=(slots>=displayed?slots:displayed);return displayed+'/'+known}\n"
 		"function pad2(n){return String(n).padStart(2,'0')}\n"
 		"function fmtUptime(valid,sec){if(!valid)return 'up ?';sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;return 'up '+(d>0?d+'d ':'')+pad2(h)+':'+pad2(m)+':'+pad2(s)}\n"
 		"function fmtKbNum(bytes){return Math.round((Number(bytes)||0)/1024)}\n"
@@ -7789,7 +7867,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function applyNodes(j,raw,force){\n"
 		"  if(!j)return;\n"
 		"  const s=document.getElementById('nodeSel');\n"
-		"  localMac=j.local_mac||localMac;let incoming=j.nodes||[];ensureNodeDirectory();let nodes=incoming.length?mergeNodeSnapshot(incoming):Array.from(nodeDirectory.values());if(!nodes.length)nodes=lastGoodNodes;if(nodes.length)lastGoodNodes=nodes.slice(0);const serverCur=j.selected_mac;const prev=s.value;let cur=(selectionBusy?(selectedMac||prev):serverCur)||prev||selectedMac;const remembered=rememberedNode();const rememberedTag=rememberedNodeTag();\n"
+		"  localMac=j.local_mac||localMac;localApMac=j.local_ap_mac||localApMac;let incoming=j.nodes||[];ensureNodeDirectory();let nodes=incoming.length?mergeNodeSnapshot(incoming):Array.from(nodeDirectory.values());if(!nodes.length)nodes=lastGoodNodes;if(nodes.length)lastGoodNodes=nodes.slice(0);const serverCur=j.selected_mac;const prev=s.value;let cur=(selectionBusy?(selectedMac||prev):serverCur)||prev||selectedMac;const remembered=rememberedNode();const rememberedTag=rememberedNodeTag();\n"
 		"  const rememberedMissing=remembered&&remembered!==serverCur&&!nodeInList(nodes,remembered);\n"
 		"  if(!selectionBusy&&remembered&&remembered!==serverCur&&nodeInList(nodes,remembered)&&!reselectBusy){cur=remembered;setTimeout(()=>reselectNode(remembered),0)}\n"
 		"  else if(!selectionBusy&&rememberedMissing){cur=remembered}\n"
@@ -7801,13 +7879,13 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"function flushNodeOptions(){if(!pendingNodeSync)return;const p=pendingNodeSync;pendingNodeSync=null;pendingNodeKey='';lastNodes='';applyNodes(p.j,p.raw,true)}\n"
 		"function errName(e){e=Number(e)||0;if(e===16399)return 'NO_ROUTE';if(e===259)return 'INVALID_STATE';return e?String(e):''}\n"
 		"function recReasonName(r){r=Number(r)||0;const m=['','ack stale','tx/noack','rootless','no parent','parent disc','soft reconnect','mesh restart'];return m[r]||String(r)}\n"
-		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.reliable_ready){parts.push('rtt '+(n.rtt_ms||'?')+'ms');parts.push('rto '+(n.rto_ms||'?')+'ms');parts.push('tx '+(n.tx_unacked||0));if(typeof n.rel_log_age_ms==='number'&&n.rel_log_age_ms>=0&&n.rel_log_age_ms<15000)parts.push('log v2');if(n.reorder_depth)parts.push('reorder '+n.reorder_depth);if(n.retry_count)parts.push('retry '+n.retry_count);if(n.overflow_count)parts.push('overflow '+n.overflow_count)}if(n.loss_active)parts.push('explicit lost '+n.lost_reason);else if(n.has_gap)parts.push('gap');else if(n.replay_count)parts.push('replayed');if(!n.loss_active&&n.lost_count)parts.push('lost history '+n.lost_count);parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
+		"function meshNodeMeta(n){const parts=[];parts.push(n.proto||'v1');if(n.layer)parts.push('L'+n.layer);if(typeof n.parent_rssi==='number'&&n.parent_rssi>-120)parts.push(n.parent_rssi+' dBm');if(n.mac!==localMac){const pingFresh=!!n.ping_valid&&!n.offline;parts.push(pingFresh?'ping '+Number(n.ping_ms)+' ms':'ping ?')}if(n.reliable_ready){parts.push(Number(n.rtt_ms)>0?'rtt '+Number(n.rtt_ms)+' ms':'rtt ?');parts.push(Number(n.rto_ms)>0?'rto '+Number(n.rto_ms)+' ms':'rto ?');parts.push('tx '+(n.tx_unacked||0));if(typeof n.rel_log_age_ms==='number'&&n.rel_log_age_ms>=0&&n.rel_log_age_ms<15000)parts.push('log v2');if(n.reorder_depth)parts.push('reorder '+n.reorder_depth);if(n.retry_count)parts.push('retry '+n.retry_count);if(n.overflow_count)parts.push('overflow '+n.overflow_count)}if(n.loss_active)parts.push('explicit lost '+n.lost_reason);else if(n.has_gap)parts.push('gap');else if(n.replay_count)parts.push('replayed');if(!n.loss_active&&n.lost_count)parts.push('lost history '+n.lost_count);parts.push('g/l/r '+(n.gap_count||0)+'/'+(n.lost_count||0)+'/'+(n.replay_count||0));if(n.diag_valid){if(n.boot_seq)parts.push('boot '+n.boot_seq);if(n.reset_reason)parts.push('rst '+n.reset_reason);const rc=(n.soft_reconnect_count||0)+(n.mesh_restart_count||0);if(rc)parts.push('reconnects '+rc);if(n.rootless_count)parts.push('rootless '+n.rootless_count);if(n.ack_stale_count)parts.push('ack stale '+n.ack_stale_count);if(n.tx_without_ack_count)parts.push('tx/noack '+n.tx_without_ack_count);const reason=recReasonName(n.last_recovery_reason);if(reason)parts.push(reason);const err=errName(n.last_mesh_send_err||n.last_remote_send_err||n.v2_ack_err||0);if(err)parts.push('err '+err)}if(n.recent_reboot)parts.push('recent reboot');if(n.app_stale)parts.push('app stale');else if(n.route_table_seen&&!n.telemetry_fresh)parts.push('route');if(n.stale&&!n.app_stale)parts.push('stale');if(n.offline)parts.push('offline');return parts.join(' · ')}\n"
 		"function renderMeshNode(n,byParent){let cls='meshItem '+(n.mac===localMac?'meshLocal ':'')+(n.offline?'meshBad ':(n.app_stale||n.stale)?'meshWarn ':'');let html='<div class=\"'+cls+'\"><div><span class=\"meshName\">'+esc(n.tag||'node')+'</span> <span class=\"meshMeta\">'+esc(n.mac||'')+'</span></div><div class=\"meshMeta\">'+esc(meshNodeMeta(n))+'</div>';const kids=byParent[n.mac]||[];for(const k of kids){html+=renderMeshNode(k,byParent)}return html+'</div>'}\n"
-		"function meshStatusLabel(nodes,mode){const rem=(nodes||[]).filter(n=>n.mac!==localMac);if(rem.some(n=>n.loss_active))return 'explicit lost';if(rem.some(n=>n.has_gap))return 'recovering';if(rem.some(n=>n.offline))return 'offline';if(rem.some(n=>n.app_stale))return 'app stale';if(rem.some(n=>n.stale))return 'stale';if(rem.some(n=>(n.replay_count||0)>0))return 'replayed';if(rem.length&&rem.every(n=>n.reliable_ready))return 'healthy';return mode||'live'}\n"
-		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));const nodes=m.nodes||[];const byParent={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){const p=(n.parent_mac&&n.parent_mac!==n.mac)?n.parent_mac:'';if(p){(byParent[p]=byParent[p]||[]).push(n)}}if(root){for(const n of nodes){if(n!==root&&(!n.parent_mac||!nodes.some(x=>x.mac===n.parent_mac))){(byParent[root.mac]=byParent[root.mac]||[]).push(n)}}}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes,mode)}\n"
-		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){st.textContent='retry'}}\n"
+		"function meshStatusLabel(nodes){let online=0,stale=0,offline=0;for(const n of (nodes||[])){if(n.offline)offline++;else if(n.app_stale||n.stale||!n.telemetry_fresh)stale++;else online++}return online+' online · '+stale+' stale · '+offline+' offline'}\n"
+		"function applyMeshStatus(j,mode){const tree=document.getElementById('meshTree');const st=document.getElementById('meshState');const m=j&&j.mesh?j.mesh:j;if(!m||!m.nodes){tree.textContent='waiting for mesh';st.textContent='waiting for telemetry';return;}applyNodes(m,JSON.stringify(m));localApMac=m.local_ap_mac||localApMac;const nodes=(m.nodes||[]).map(raw=>nodeDirectory.get(String(raw.mac||'').toLowerCase())||raw);const byParent={},aliases={};let root=nodes.find(n=>n.mac===m.local_mac)||nodes[0];for(const n of nodes){if(n.mac)aliases[n.mac]=n;if(n.self_ap_mac)aliases[n.self_ap_mac]=n}if(root&&localApMac)aliases[localApMac]=root;for(const n of nodes){if(n===root)continue;const parent=n.parent_mac?aliases[n.parent_mac]:null;const owner=parent&&parent!==n?parent:root;if(owner)(byParent[owner.mac]=byParent[owner.mac]||[]).push(n)}tree.innerHTML=root?renderMeshNode(root,byParent):'waiting for route';st.textContent=meshStatusLabel(nodes)}\n"
+		"async function loadMeshStatus(mode){const st=document.getElementById('meshState');try{if(!st.textContent||st.textContent==='...')st.textContent=mode||'poll';const r=await controlFetch('/mesh/status',6000);applyMeshStatus(await r.json(),mode||'poll')}catch(e){if(!st.textContent.includes('online'))st.textContent='retry'}}\n"
 		"function applyUiStatus(j,mode){if(!j)return;applyNodes(j.nodes,JSON.stringify(j.nodes));if(tasksVisible&&j.tasks)applyTasks(j.tasks,selectedMac||'',JSON.stringify(j.tasks));if(tasksVisible&&j.ota)applyOta(j.ota);if(meshVisible&&j.nodes)applyMeshStatus(j.nodes,mode||'live')}\n"
-		"function startUiStream(){if(uiStream||otaBusy)return;if(!window.EventSource){loadUiStatus();return;}try{uiStream=new EventSource('/ui/stream?sid='+encodeURIComponent(pageSid)+'&tasks='+(tasksVisible?'1':'0'))}catch(e){uiStream=null;loadUiStatus();return;}uiStream.addEventListener('ui',e=>{try{uiStreamErrors=0;applyUiStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});uiStream.onopen=()=>{uiStreamErrors=0;if(meshVisible)document.getElementById('meshState').textContent='live'};uiStream.onerror=()=>{uiStreamErrors++;stopUiStream(false);if(meshVisible)document.getElementById('meshState').textContent='retry';const d=Math.min(30000,2000*uiStreamErrors);setTimeout(()=>{loadUiStatus();if(!otaBusy)startUiStream()},d)}}\n"
+		"function startUiStream(){if(uiStream||otaBusy)return;if(!window.EventSource){loadUiStatus();return;}try{uiStream=new EventSource('/ui/stream?sid='+encodeURIComponent(pageSid)+'&tasks='+(tasksVisible?'1':'0'))}catch(e){uiStream=null;loadUiStatus();return;}uiStream.addEventListener('ui',e=>{try{uiStreamErrors=0;applyUiStatus(JSON.parse(e.data||'{}'),'live')}catch(x){}});uiStream.onopen=()=>{uiStreamErrors=0};uiStream.onerror=()=>{uiStreamErrors++;stopUiStream(false);const st=document.getElementById('meshState');if(meshVisible&&!st.textContent.includes('online'))st.textContent='retry';const d=Math.min(30000,2000*uiStreamErrors);setTimeout(()=>{loadUiStatus();if(!otaBusy)startUiStream()},d)}}\n"
 		"function startMeshStream(){startUiStream();if(meshVisible)loadMeshStatus('poll')}\n"
 		"function applyOta(j){\n"
 		"  if(!j)return;\n"
@@ -7822,9 +7900,9 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  const box=document.getElementById('taskTable');const up=fmtUptime(j.uptime_valid,j.uptime_s);\n"
 		"  setTaskHeader(j.tag||'node',j.mac||mac,'no data',up);document.getElementById('taskRam').textContent=fmtRam(j);document.getElementById('taskFlash').textContent=fmtFlash(j);\n"
 		"  if(!j.valid){box.textContent='waiting for STACKMON';document.getElementById('taskCpu').textContent='CPU ? / tasks ?/?';return;}\n"
-		"  const tasks=j.tasks||[];const slots=typeof j.slot_count==='number'?j.slot_count:-1;tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
+		"  const tasks=j.tasks||[];const slots=typeof j.slot_count==='number'?j.slot_count:-1;const total=typeof j.task_total==='number'?j.task_total:-1;tasks.sort((a,b)=>(b.cpu_x10-a.cpu_x10)||(a.free_words-b.free_words));\n"
 		"  let rows='';for(const t of tasks){const cls=stackCls(t.free_words);rows+='<tr'+(cls?' class='+cls:'')+'><td>'+esc(t.name)+'</td><td>'+t.prio+'</td><td>'+pct(t.cpu_x10)+'</td><td>'+t.free_words+'</td></tr>';}\n"
-		"  document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskSlotsText(tasks.length,slots);setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
+		"  document.getElementById('taskCpu').textContent='CPU '+(j.cpu_valid?pct(j.cpu_load_x10):'?')+' / tasks '+taskCountText(tasks.length,total,slots);setTaskHeader(j.tag||'node',j.mac||mac,Math.floor((j.age_ms||0)/1000)+'s ago',up);\n"
 		"  box.innerHTML='<table><thead><tr><th>task</th><th>prio</th><th>cpu</th><th>free words</th></tr></thead><tbody>'+rows+'</tbody></table>';\n"
 		"}\n"
 		"function startLogStream(){\n"
@@ -8259,6 +8337,25 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 esp_err_t log_http_server_init(void)
 {
 	esp_wifi_get_mac(WIFI_IF_STA, s_local_mac);
+	esp_wifi_get_mac(WIFI_IF_AP, s_local_ap_mac);
+
+	if (!s_taskmon) {
+		s_taskmon = heap_caps_calloc(LOG_HTTP_MAX_NODES,
+		                              sizeof(*s_taskmon),
+		                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!s_taskmon) {
+			s_taskmon = heap_caps_calloc(LOG_HTTP_MAX_NODES,
+			                              sizeof(*s_taskmon),
+			                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		}
+		if (!s_taskmon) {
+			ESP_LOGE(TAG, "task snapshot storage allocation failed; Task Manager disabled");
+		} else {
+			ESP_LOGI(TAG, "task snapshot storage: %u bytes in %s RAM",
+			         (unsigned)(LOG_HTTP_MAX_NODES * sizeof(*s_taskmon)),
+			         esp_ptr_external_ram(s_taskmon) ? "external" : "internal");
+		}
+	}
 
 	strncpy(s_local_tag, "node0", sizeof(s_local_tag) - 1);
 	s_local_tag[sizeof(s_local_tag) - 1] = '\0';
