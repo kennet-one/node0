@@ -76,6 +76,8 @@ static const char *command_owner(const char *payload)
 	if (is_heater_command(payload)) return "Kheater";
 	if (starts_with(payload, "garland") || starts_with(payload, "garl")) return "garland";
 	if (starts_with(payload, "powled") || strcmp(payload, "pwech") == 0) return "kPowerLed";
+	if (strcmp(payload, "lam") == 0 || strcmp(payload, "lamech") == 0 ||
+	    strcmp(payload, "lampk.status") == 0) return "lampk";
 	if (strcmp(payload, "pomp") == 0 || strcmp(payload, "flow") == 0 ||
 	    strcmp(payload, "ion") == 0 || strcmp(payload, "huOn") == 0 ||
 	    strcmp(payload, "echo_turb") == 0 || strcmp(payload, "pm1") == 0 ||

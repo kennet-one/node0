@@ -25,6 +25,7 @@
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
 #include "mesh_v2_link.h"
+#include "keemash_mesh_network.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Constants / globals                                                       */
@@ -832,8 +833,8 @@ void app_main(void)
     // --- node type / fixed root setup ---
 
         // This firmware always acts as root when it can reach the router.
-    ESP_ERROR_CHECK(esp_mesh_fix_root(true));       // do not give up root role
-    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));  // this node is root
+    ESP_ERROR_CHECK(keemash_mesh_apply_single_root_policy(
+        KEEMASH_MESH_ROLE_ROOT));
 
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
