@@ -66,7 +66,7 @@ static void https_session_event(esp_https_server_user_cb_arg_t *event)
 /* ----------------- Configuration ----------------- */
 
 #ifndef LOG_HTTP_LINES
-	#define LOG_HTTP_LINES			200
+	#define LOG_HTTP_LINES			176
 #endif
 
 #ifndef LOG_HTTP_LINE_MAX

@@ -570,7 +570,7 @@ esp_err_t keelink_ble_start_host(void)
 		host_task, "nimble_host", CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
 		NULL, configMAX_PRIORITIES - 4, &s_host_task,
 		CONFIG_BT_NIMBLE_PINNED_TO_CORE,
-		MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	if (created != pdPASS) {
 		s_host_started = false;
 		s_host_task = NULL;
