@@ -12,6 +12,8 @@
 
 #include "keemash_mesh_hooks.h"
 #include "keemash_mesh_tx_broker.h"
+#include "keemash_keelink.h"
+#include "keelink_server.h"
 #include "legacy_proto.h"
 #include "log_http_server.h"
 #include "mesh_root_bcast.h"
@@ -113,12 +115,52 @@ void keemash_mesh_root_on_task_snapshot(const uint8_t mac[6],
                                         const mesh_v2_task_snapshot_payload_t *snapshot)
 {
 	log_http_server_task_snapshot_v2(mac, snapshot);
+	char tag[MESH_V2_TAG_MAX + 1] = {0};
+	char event[192];
+	memcpy(tag, snapshot->tag, MESH_V2_TAG_MAX);
+	snprintf(event, sizeof(event),
+		 "{\"requestId\":%lu,\"updatedMs\":%lu,\"uptimeS\":%lu,"
+		 "\"cpuX10\":%lu,\"cpuValid\":%s,\"total\":%u,"
+		 "\"index\":%u,\"count\":%u,\"last\":%s}",
+		 (unsigned long)snapshot->request_id,
+		 (unsigned long)snapshot->updated_ms,
+		 (unsigned long)snapshot->uptime_s,
+		 (unsigned long)snapshot->cpu_load_x10,
+		 snapshot->cpu_valid ? "true" : "false",
+		 (unsigned)snapshot->task_total, (unsigned)snapshot->task_index,
+		 (unsigned)snapshot->task_count,
+		 (snapshot->flags & MESH_V2_TASK_SNAPSHOT_FLAG_LAST) ? "true" : "false");
+	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_TASK, mac, tag, event);
 }
 
 void keemash_mesh_root_on_memory_snapshot(const uint8_t mac[6],
                                           const mesh_v2_memory_payload_t *snapshot)
 {
 	log_http_server_memory_snapshot_v2(mac, snapshot);
+	char tag[MESH_V2_TAG_MAX + 1] = {0};
+	char event[384];
+	memcpy(tag, snapshot->tag, MESH_V2_TAG_MAX);
+	snprintf(event, sizeof(event),
+		 "{\"uptimeS\":%lu,\"heapFree\":%lu,\"heapMin\":%lu,"
+		 "\"heapTotal\":%lu,\"internalFree\":%lu,\"internalTotal\":%lu,"
+		 "\"psramEnabled\":%s,\"psramFree\":%lu,\"psramTotal\":%lu,"
+		 "\"flashChip\":%lu,\"appUsed\":%lu,\"appSlot\":%lu,"
+		 "\"nvsUsed\":%lu,\"nvsTotal\":%lu}",
+		 (unsigned long)snapshot->uptime_s,
+		 (unsigned long)snapshot->heap_free,
+		 (unsigned long)snapshot->heap_min_free,
+		 (unsigned long)snapshot->heap_total,
+		 (unsigned long)snapshot->internal_free,
+		 (unsigned long)snapshot->internal_total,
+		 snapshot->psram_enabled ? "true" : "false",
+		 (unsigned long)snapshot->psram_free,
+		 (unsigned long)snapshot->psram_total,
+		 (unsigned long)snapshot->flash_chip,
+		 (unsigned long)snapshot->app_used,
+		 (unsigned long)snapshot->app_slot,
+		 (unsigned long)snapshot->nvs_used,
+		 (unsigned long)snapshot->nvs_total);
+	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_MEMORY, mac, tag, event);
 }
 
 static double sensor_value(const mesh_v2_sensor_entry_t *entry)
@@ -165,6 +207,24 @@ void keemash_mesh_root_on_sensor_snapshot(
 	const uint8_t mac[6],
 	const mesh_v2_sensor_snapshot_payload_t *snapshot)
 {
+	if (mac && snapshot) {
+		for (uint8_t i = 0; i < snapshot->count; i++) {
+			const mesh_v2_sensor_entry_t *entry = &snapshot->entries[i];
+			char event[192];
+			snprintf(event, sizeof(event),
+				"{\"generation\":%lu,\"sampleUptimeMs\":%lu,\"requestId\":%lu,"
+				"\"id\":%u,\"status\":%u,\"scale10\":%d,\"value\":%ld}",
+				(unsigned long)snapshot->generation,
+				(unsigned long)snapshot->sample_uptime_ms,
+				(unsigned long)snapshot->request_id,
+				(unsigned)entry->metric_id,
+				(unsigned)entry->status, (int)entry->scale10,
+				(long)entry->value);
+			keelink_server_publish_text_event(KEEMASH_KEELINK_CH_SENSOR,
+				mac, NULL, event);
+		}
+	}
+
 	uint8_t mixer_mac[6] = {0};
 	if (!mac || !snapshot ||
 	    !mesh_v2_root_find_lossless_by_tag(
@@ -198,16 +258,31 @@ void keemash_mesh_root_on_ota_status(const uint8_t mac[6],
                                      size_t status_len)
 {
 	log_http_server_remote_ota_status_v2(mac, status, status_len);
+	char event[256];
+	snprintf(event, sizeof(event),
+		 "{\"op\":%u,\"status\":%u,\"opId\":%lu,\"imageSize\":%lu,"
+		 "\"offset\":%lu,\"length\":%lu}",
+		 (unsigned)status->c.op, (unsigned)status->c.status,
+		 (unsigned long)status->c.op_id,
+		 (unsigned long)status->c.image_size,
+		 (unsigned long)status->c.offset,
+		 (unsigned long)status->c.len);
+	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_OTA_STATUS,
+		mac, NULL, event);
 }
 
 void keemash_mesh_root_on_topology(const uint8_t mac[6], const void *payload, size_t payload_len)
 {
 	log_http_server_node_topology(mac, payload, payload_len);
+	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_TOPOLOGY,
+		mac, NULL, "{\"changed\":true}");
 }
 
 void keemash_mesh_root_on_control_event(const char *text)
 {
 	legacy_handle_text(text);
+	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_STATE,
+		NULL, NULL, text);
 	if (text && (strcmp(text, "garland_on") == 0 ||
 		     strcmp(text, "garland_off") == 0)) {
 		(void)mesh_root_send_state_to_mixer(text);

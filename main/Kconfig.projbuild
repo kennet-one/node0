@@ -226,4 +226,18 @@ menu "Example Configuration"
             Registers /debug/lossless/run for deterministic reliable-mesh
             diagnostics. Keep disabled in normal firmware builds; when enabled,
             the endpoint still requires the OTA/admin PIN.
+
+    config NODE0_KEELINK_ENABLE
+        bool "Enable KeeLink realtime app interface"
+        default y
+        help
+            Enables authenticated KeeLink pairing and binary WSS endpoints.
+
+    config NODE0_KEELINK_BLE_ENABLE
+        bool "Enable KeeLink NimBLE fallback"
+        depends on NODE0_KEELINK_ENABLE
+        default y
+        help
+            Advertises one low-duty BLE GATT fallback for compact state and
+            commands. Authentication uses the token provisioned over HTTPS.
 endmenu

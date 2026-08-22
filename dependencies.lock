@@ -1,10 +1,20 @@
 dependencies:
+  espressif/mdns:
+    component_hash: e81ca7a7f53ea34e78274df054da692c272e1315572876b237b1748e267c013b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.3
   idf:
     source:
       type: idf
     version: 6.0.1
   keemash_mesh_core:
-    component_hash: 8d87d0e730498571bc03ed8fc5fddb8a5fbc2ab988ecaeae4ec0d51feec28c73
+    component_hash: fec82a83fd909c8bb8864e3053ba352ba067e9ba3e91d1ce44be1ee0d91eec1d
     dependencies:
     - name: idf
       version: '>=6.0.1,<6.1'
@@ -12,9 +22,10 @@ dependencies:
       git: https://github.com/kennet-one/keemash_core.git
       path: .
       type: git
-    version: 887ac6c2830914af7c2abe4bf8125dd4e203379d
+    version: edeb3e59e14bdb0148f33217b0fc9ac692700d92
 direct_dependencies:
+- espressif/mdns
 - keemash_mesh_core
-manifest_hash: c39c59a8c4bc44de136748d3205fe62ce38a0e41c4109ca0eaa360a36d1c5fce
+manifest_hash: 47a3e23bfa4a45bd469b2a85957af436248f1ba34a73c6c2b3e87e66ab88bd4e
 target: esp32s3
 version: 3.0.0

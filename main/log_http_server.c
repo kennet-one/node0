@@ -26,9 +26,11 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
+#include "esp_tls.h"
 #include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "freertos/semphr.h"
@@ -37,6 +39,8 @@
 
 #include "mesh_proto.h"
 #include "keemash_mesh_core.h"
+#include "keelink_server.h"
+#include "keelink_ble.h"
 #include "mesh_v2_link.h"
 #include "stack_monitor.h"
 
@@ -47,10 +51,22 @@ extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_h
 extern const unsigned char node0_https_prvtkey_pem_start[] asm("_binary_node0_https_prvtkey_pem_start");
 extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_https_prvtkey_pem_end");
 
+#if CONFIG_NODE0_KEELINK_ENABLE
+static void https_session_event(esp_https_server_user_cb_arg_t *event)
+{
+	if (!event || event->user_cb_state != HTTPD_SSL_USER_CB_SESS_CLOSE || !event->tls) return;
+
+	int fd = -1;
+	if (esp_tls_get_conn_sockfd(event->tls, &fd) == ESP_OK && fd >= 0) {
+		keelink_server_session_closed(fd);
+	}
+}
+#endif
+
 /* ----------------- Configuration ----------------- */
 
 #ifndef LOG_HTTP_LINES
-	#define LOG_HTTP_LINES			220
+	#define LOG_HTTP_LINES			200
 #endif
 
 #ifndef LOG_HTTP_LINE_MAX
@@ -90,15 +106,15 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 #define REMOTE_REBOOT_SEND_RETRIES	3
 #define REMOTE_REBOOT_RETRY_DELAY_MS	150U
 #define REMOTE_REBOOT_DELAY_MS		1200U
-#define LOG_STREAM_TASK_STACK		4096U
+#define LOG_STREAM_TASK_STACK		3072U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
 #define MESH_STREAM_HEARTBEAT_MS	15000U
-#define UI_STREAM_TASK_STACK		4096U
+#define UI_STREAM_TASK_STACK		2048U
 #define UI_STREAM_HEARTBEAT_MS		5000U
 #define UI_TASK_REFRESH_MS		2000U
-#define LOG_LEASE_TASK_STACK		3572U
-#define HTTPS_MAX_OPEN_SOCKETS		4
+#define LOG_LEASE_TASK_STACK		2048U
+#define HTTPS_MAX_OPEN_SOCKETS		6
 #define UI_STATUS_JSON_MAX		16384U
 #define MESH_STATUS_JSON_MAX		16384U
 #define NODE_LIST_JSON_MAX		12288U
@@ -123,6 +139,11 @@ extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_http
 /* ----------------- State ----------------- */
 
 static httpd_handle_t s_http_server = NULL;
+static bool s_ota_validation_started;
+#if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
+static esp_timer_handle_t s_ota_validation_timer;
+static unsigned s_ota_validation_attempts;
+#endif
 
 typedef struct {
 	uint32_t updated_ms;
@@ -613,6 +634,7 @@ void log_http_server_refresh_routes(void)
 void log_http_server_mesh_state_changed(void)
 {
 	mesh_stream_mark_changed();
+	keelink_server_publish_inventory();
 }
 
 bool log_http_server_find_routable_by_tag(const char *tag, uint8_t mac[6])
@@ -2123,6 +2145,7 @@ void log_http_server_node_seen_uptime(const uint8_t mac[6], const char *tag,
 
 	remote_ota_note_node_seen(mac, uptime_valid, uptime_s);
 	mesh_stream_mark_changed();
+	keelink_server_publish_inventory();
 }
 
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag)
@@ -2323,6 +2346,7 @@ void log_http_server_node_topology(const uint8_t mac[6],
 
 	remote_ota_note_node_seen(mac, true, topology->uptime_s);
 	mesh_stream_mark_changed();
+	keelink_server_publish_inventory();
 }
 
 void log_http_server_task_snapshot_v2(const uint8_t mac[6],
@@ -2434,6 +2458,7 @@ void log_http_server_memory_snapshot_v2(const uint8_t mac[6],
 void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const char *line)
 {
 	if (!mac || !line) return;
+	keelink_server_publish_log(mac, tag, line);
 	uint8_t selected_mac[6];
 	selection_snapshot(selected_mac, NULL, 0);
 	if (!mac_eq(mac, selected_mac)) return;
@@ -3992,6 +4017,17 @@ static size_t append_node_list_json(char *out, size_t cap, size_t pos)
 	return append_fmt(out, cap, pos, "]}");
 }
 
+size_t log_http_server_node_list_json(char *out, size_t capacity)
+{
+	if (!out || capacity == 0) return 0;
+	size_t len = append_node_list_json(out, capacity, 0);
+	if (len >= capacity) {
+		out[capacity - 1] = '\0';
+		return 0;
+	}
+	return len;
+}
+
 static size_t append_local_ota_json(char *out, size_t cap, size_t pos)
 {
 	node0_ota_status_t status;
@@ -4927,6 +4963,11 @@ static bool ota_check_pin(httpd_req_t *req)
 		return false;
 	}
 	return strcmp(pin, CONFIG_NODE0_OTA_PIN) == 0;
+}
+
+bool log_http_server_admin_pin_valid(httpd_req_t *req)
+{
+	return ota_check_pin(req);
 }
 
 static esp_err_t http_admin_check_post(httpd_req_t *req)
@@ -6712,6 +6753,52 @@ static void ota_mark_running_app_valid_if_pending(void)
 #endif
 }
 
+#if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
+static void ota_validate_after_ble_start(void *arg)
+{
+	(void)arg;
+
+	if (s_ota_validation_attempts == 0) {
+		keelink_ble_note_boot_checkpoint(99);
+	}
+
+	if (keelink_ble_ready() || strcmp(keelink_ble_state(), "failed") == 0) {
+		ota_mark_running_app_valid_if_pending();
+		return;
+	}
+
+	if (++s_ota_validation_attempts >= 100) {
+		ESP_LOGE(TAG, "OTA rollback validation deferred: BLE startup did not settle");
+		return;
+	}
+
+	if (esp_timer_start_once(s_ota_validation_timer, 100000) != ESP_OK) {
+		ESP_LOGE(TAG, "OTA rollback validation timer restart failed");
+	}
+}
+#endif
+
+void log_http_server_network_ready(void)
+{
+	(void)keelink_server_network_ready();
+	if (s_ota_validation_started) return;
+	s_ota_validation_started = true;
+#if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
+	const esp_timer_create_args_t timer_args = {
+		.callback = ota_validate_after_ble_start,
+		.name = "ota_ble_valid",
+		.skip_unhandled_events = true,
+	};
+	if (esp_timer_create(&timer_args, &s_ota_validation_timer) != ESP_OK ||
+	    esp_timer_start_once(s_ota_validation_timer, 100000) != ESP_OK) {
+		ESP_LOGE(TAG, "OTA rollback validation timer start failed");
+		ota_mark_running_app_valid_if_pending();
+	}
+#else
+	ota_mark_running_app_valid_if_pending();
+#endif
+}
+
 static esp_err_t http_tasks_get(httpd_req_t *req)
 {
 	enum { TASKS_JSON_MAX = 4096 };
@@ -8438,9 +8525,9 @@ esp_err_t log_http_server_start(void)
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-	config.httpd.max_uri_handlers = 25;
+	config.httpd.max_uri_handlers = 30;
 #else
-	config.httpd.max_uri_handlers = 23;
+	config.httpd.max_uri_handlers = 28;
 #endif
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
@@ -8452,6 +8539,9 @@ esp_err_t log_http_server_start(void)
 	config.servercert_len = node0_https_servercert_pem_end - node0_https_servercert_pem_start;
 	config.prvtkey_pem = node0_https_prvtkey_pem_start;
 	config.prvtkey_len = node0_https_prvtkey_pem_end - node0_https_prvtkey_pem_start;
+#if CONFIG_NODE0_KEELINK_ENABLE
+	config.user_cb = https_session_event;
+#endif
 
 	esp_log_level_set("esp_https_server", ESP_LOG_WARN);
 
@@ -8460,6 +8550,7 @@ esp_err_t log_http_server_start(void)
 		ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
 		return err;
 	}
+	keelink_ble_note_boot_checkpoint(96);
 
 	err = register_log_http_handlers(s_http_server);
 	if (err != ESP_OK) {
@@ -8468,8 +8559,18 @@ esp_err_t log_http_server_start(void)
 		s_http_server = NULL;
 		return err;
 	}
+	keelink_ble_note_boot_checkpoint(97);
+#if CONFIG_NODE0_KEELINK_ENABLE
+	err = keelink_server_register(s_http_server);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "register KeeLink handlers failed: %s", esp_err_to_name(err));
+		httpd_ssl_stop(s_http_server);
+		s_http_server = NULL;
+		return err;
+	}
+	keelink_ble_note_boot_checkpoint(98);
+#endif
 
 	ESP_LOGI(TAG, "HTTPS log server started on port %d", CONFIG_NODE0_HTTPS_PORT);
-	ota_mark_running_app_valid_if_pending();
 	return ESP_OK;
 }

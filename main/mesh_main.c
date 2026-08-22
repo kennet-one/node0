@@ -8,6 +8,7 @@
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
@@ -20,6 +21,7 @@
 #include "stack_monitor.h"
 #include "uart_bridge.h"
 #include "log_http_server.h"
+#include "keelink_ble.h"
 #include "time_sync.h"
 #include "log_time_vprintf.h"
 #include "mesh_proto.h"
@@ -33,13 +35,23 @@
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
-#define MESH_TX_TASK_STACK (4096U)
-#define MESH_RX_TASK_STACK (5120U)
+#define MESH_TX_TASK_STACK (2048U)
+#define MESH_RX_TASK_STACK (6144U)
 #define NODE0_WIFI_MTXON_STACK_EXTRA_WORDS (1000U)
 #define NODE0_WIFI_MRX_STACK_EXTRA_WORDS   (500U)
 //#define FIXED_ROOT  1   // node0 only
 
 static const char *MESH_TAG = "node0";
+
+static void log_internal_heap(const char *stage)
+{
+	ESP_LOGI(MESH_TAG,
+	         "internal heap %s: free=%u largest=%u minimum=%u",
+	         stage ? stage : "unknown",
+	         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+	         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+	         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
 
 /* Same MESH_ID on every node in this mesh network. */
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77 };
@@ -793,7 +805,10 @@ static void ip_event_handler(void *arg,
 
 	// Start the web server only on root.
 	if (esp_mesh_is_root()) {
-		log_http_server_start();
+		keelink_ble_note_boot_checkpoint(95);
+		if (log_http_server_start() == ESP_OK) {
+			log_http_server_network_ready();
+		}
 	}
 }
 
@@ -877,8 +892,23 @@ void app_main(void)
 
 	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 
-	log_http_server_init();
+	ESP_ERROR_CHECK(log_http_server_init());
+	ESP_ERROR_CHECK(log_http_server_start());
+	log_internal_heap("before BLE");
+#if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
+	esp_err_t ble_err = keelink_ble_init();
+	if (ble_err == ESP_OK) {
+		keelink_ble_note_boot_checkpoint(75);
+		ble_err = keelink_ble_start_host();
+	}
+	if (ble_err != ESP_OK) {
+		ESP_LOGW(MESH_TAG, "KeeLink BLE pre-mesh startup failed: %s",
+			esp_err_to_name(ble_err));
+	}
+	log_internal_heap("after BLE host start");
+#endif
 	ESP_ERROR_CHECK(esp_mesh_start());
+	keelink_ble_note_boot_checkpoint(90);
 	mesh_v2_link_require();
 	esp_err_t v2_init_err = mesh_v2_root_init();
 	ESP_ERROR_CHECK(v2_init_err);
@@ -891,6 +921,7 @@ void app_main(void)
 	         esp_mesh_get_topology(),
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
+	log_internal_heap("after mesh start");
 
 	uart_bridge_init();
 	uart_bridge_start();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "esp_http_server.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -13,6 +14,7 @@ extern "C" {
 
 esp_err_t log_http_server_init(void);
 esp_err_t log_http_server_start(void);
+void log_http_server_network_ready(void);
 
 // Called by root RX path for NODEINFO.
 void log_http_server_node_seen(const uint8_t mac[6], const char *tag);
@@ -44,6 +46,8 @@ void log_http_server_mesh_state_changed(void);
 bool log_http_server_find_routable_by_tag(const char *tag, uint8_t mac[6]);
 void log_http_server_command_status(const char *state, const char *owner,
                                     uint32_t command_id, const char *detail);
+bool log_http_server_admin_pin_valid(httpd_req_t *req);
+size_t log_http_server_node_list_json(char *out, size_t capacity);
 
 #ifdef __cplusplus
 }

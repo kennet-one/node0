@@ -15,6 +15,9 @@ esp_err_t mesh_root_send_state_to_mixer(const char *legacy_token);
 void mesh_root_command_result(const uint8_t peer[6], uint32_t root_session,
 			      uint32_t command_id, uint8_t status,
 			      const char *text);
+esp_err_t mesh_root_submit_direct_command(const uint8_t peer[6],
+					  const char *payload,
+					  uint32_t command_id);
 
 #ifdef __cplusplus
 }

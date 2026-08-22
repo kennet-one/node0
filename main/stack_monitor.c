@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #define STACK_MONITOR_PERIOD_MS		60000
@@ -311,13 +312,14 @@ void stack_monitor_start(UBaseType_t priority)
 		}
 	}
 
-	BaseType_t ok = xTaskCreate(
+	BaseType_t ok = xTaskCreateWithCaps(
 			stack_monitor_task,
 			"stack_mon",
 			STACK_MONITOR_TASK_STACK,
 			NULL,
 			priority,
-			NULL);
+			NULL,
+			MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
 	if (ok != pdPASS) {
 		ESP_LOGE(TAG, "failed to create stack_monitor task");
