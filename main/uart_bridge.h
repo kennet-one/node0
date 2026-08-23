@@ -6,13 +6,13 @@
 extern "C" {
 #endif
 
-/** Ініціалізація UART-бріджа (конфіг порта, пінів, драйвера) */
+/** Configure the UART bridge port, pins and driver. */
 void uart_bridge_init(void);
 
-/** Старт задачі, яка читає UART і шле текст у mesh root-broadcast */
+/** Start the task that reads UART lines and routes legacy text into the mesh. */
 void uart_bridge_start(void);
 
-/** Відправити одну строку в UART (додасть '\n' в кінці). */
+/** Send one UART line and append a newline. */
 void uart_bridge_send_line(const char *text);
 
 #ifdef __cplusplus

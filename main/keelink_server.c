@@ -48,6 +48,11 @@
 #define KEELINK_PRIORITY_LOG 3U
 #define KEELINK_BLE_FALLBACK_DELAY_MS 3000U
 #define KEELINK_BLE_RETRY_MS 5000U
+#define KEELINK_UART_CLAIM_PREFIX "keelink.claim.v1:"
+#define KEELINK_UART_CLAIM_OK_PREFIX "keelink.claim.ok.v1:"
+#define KEELINK_UART_CLAIM_ERROR "keelink.claim.err.v1:rejected"
+#define KEELINK_UART_COMPACT_PREFIX "KC1:"
+#define KEELINK_UART_COMPACT_TIMEOUT_MS 20000U
 
 enum {
 	KL_FIELD_PROTOCOL_VERSION = 1,
@@ -85,6 +90,14 @@ typedef struct {
 	uint32_t created_ms;
 } command_map_t;
 
+typedef struct {
+	char session[5];
+	char nonce_b64[25];
+	char token_b64[45];
+	uint8_t received_mask;
+	uint32_t updated_ms;
+} uart_claim_state_t;
+
 static const char *TAG = "keelink";
 static bool s_mdns_ready;
 static httpd_handle_t s_server;
@@ -111,6 +124,7 @@ static keelink_ble_send_fn s_ble_sender;
 static uint32_t s_pair_fail_count;
 static uint32_t s_pair_block_until_ms;
 static uint32_t s_log_dropped;
+static uart_claim_state_t s_uart_claim;
 
 extern const unsigned char node0_https_servercert_pem_start[] asm("_binary_node0_https_servercert_pem_start");
 extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_https_servercert_pem_end");
@@ -192,6 +206,230 @@ static esp_err_t token_revoke(void)
 	if (err == ESP_OK) err = nvs_commit(handle);
 	nvs_close(handle);
 	return err;
+}
+
+static void authenticated_sessions_close(void)
+{
+	lock();
+	int fd = s_ws_fd;
+	s_ws_fd = -1;
+	s_ws_ready = false;
+	s_ws_down_since_ms = 0;
+	s_ble_fallback_active = false;
+	s_log_subscribed = false;
+	unlock();
+	if (fd >= 0 && s_server) httpd_sess_trigger_close(s_server, fd);
+	keelink_ble_disable();
+}
+
+static int hex_nibble(char value)
+{
+	if (value >= '0' && value <= '9') return value - '0';
+	if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+	if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+	return -1;
+}
+
+static bool decode_hex(const char *text, uint8_t *out, size_t out_len)
+{
+	if (!text || !out) return false;
+	for (size_t i = 0; i < out_len; i++) {
+		int high = hex_nibble(text[i * 2]);
+		int low = hex_nibble(text[i * 2 + 1]);
+		if (high < 0 || low < 0) return false;
+		out[i] = (uint8_t)((high << 4) | low);
+	}
+	return true;
+}
+
+static void encode_hex(const uint8_t *bytes, size_t len, char *out)
+{
+	static const char digits[] = "0123456789abcdef";
+	for (size_t i = 0; i < len; i++) {
+		out[i * 2] = digits[bytes[i] >> 4];
+		out[i * 2 + 1] = digits[bytes[i] & 0x0f];
+	}
+	out[len * 2] = '\0';
+}
+
+static void uart_claim_state_reset(void)
+{
+	mbedtls_platform_zeroize(&s_uart_claim, sizeof(s_uart_claim));
+}
+
+static esp_err_t uart_claim_commit(const uint8_t nonce[16], const char token_b64[45],
+				   uint8_t proof[32])
+{
+	static const uint8_t context[] = "KeeLink UART claim v1";
+	uint8_t token[32] = {0};
+	uint8_t token_hash[32] = {0};
+	uint8_t root_mac[6] = {0};
+	uint8_t proof_input[(sizeof(context) - 1U) + 16U + sizeof(root_mac)];
+	size_t token_len = 0;
+	esp_err_t err = ESP_FAIL;
+
+	if (mbedtls_base64_decode(token, sizeof(token), &token_len,
+		(const unsigned char *)token_b64, 44U) != 0 ||
+	    token_len != sizeof(token) ||
+	    sha256(token, sizeof(token), token_hash) != ESP_OK ||
+	    esp_wifi_get_mac(WIFI_IF_STA, root_mac) != ESP_OK) {
+		goto done;
+	}
+	memcpy(proof_input, context, sizeof(context) - 1U);
+	memcpy(proof_input + sizeof(context) - 1U, nonce, 16U);
+	memcpy(proof_input + sizeof(context) - 1U + 16U, root_mac, sizeof(root_mac));
+	const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	if (!info || mbedtls_md_hmac(info, token, sizeof(token), proof_input,
+				     sizeof(proof_input), proof) != 0 ||
+	    token_hash_store(token_hash) != ESP_OK) {
+		goto done;
+	}
+
+	authenticated_sessions_close();
+	lock();
+	s_pair_fail_count = 0;
+	s_pair_block_until_ms = 0;
+	unlock();
+	err = ESP_OK;
+
+done:
+	mbedtls_platform_zeroize(token, sizeof(token));
+	mbedtls_platform_zeroize(token_hash, sizeof(token_hash));
+	mbedtls_platform_zeroize(root_mac, sizeof(root_mac));
+	mbedtls_platform_zeroize(proof_input, sizeof(proof_input));
+	return err;
+}
+
+static bool uart_claim_handle_compact(const char *line, char *response,
+				      size_t response_capacity)
+{
+	const size_t line_len = strlen(line);
+	if (line_len < 13U || strncmp(line, KEELINK_UART_COMPACT_PREFIX,
+					 sizeof(KEELINK_UART_COMPACT_PREFIX) - 1U) != 0) {
+		return false;
+	}
+	if (!response || response_capacity == 0) return true;
+	response[0] = '\0';
+	if (line[8] != ':' || line[11] != ':' || hex_nibble(line[4]) < 0 ||
+	    hex_nibble(line[5]) < 0 || hex_nibble(line[6]) < 0 ||
+	    hex_nibble(line[7]) < 0) {
+		return true;
+	}
+
+	char session[5];
+	memcpy(session, line + 4, 4);
+	session[4] = '\0';
+	const uint32_t now = now_ms();
+	if (s_uart_claim.updated_ms == 0 ||
+	    (uint32_t)(now - s_uart_claim.updated_ms) > KEELINK_UART_COMPACT_TIMEOUT_MS ||
+	    strcmp(s_uart_claim.session, session) != 0) {
+		uart_claim_state_reset();
+		memcpy(s_uart_claim.session, session, sizeof(session));
+	}
+	s_uart_claim.updated_ms = now;
+
+	const char group = line[9];
+	const char part = line[10];
+	const char *chunk = line + 12;
+	const size_t chunk_len = line_len - 12U;
+	uint8_t bit = 0;
+	if (group == 'N' && (part == '0' || part == '1') && chunk_len == 12U) {
+		const unsigned index = (unsigned)(part - '0');
+		memcpy(s_uart_claim.nonce_b64 + index * 12U, chunk, 12U);
+		bit = (uint8_t)(1U << index);
+	} else if (group == 'T' && part >= '0' && part <= '3' && chunk_len == 11U) {
+		const unsigned index = (unsigned)(part - '0');
+		memcpy(s_uart_claim.token_b64 + index * 11U, chunk, 11U);
+		bit = (uint8_t)(1U << (index + 2U));
+	} else {
+		snprintf(response, response_capacity, "KC1:%s:E:rejected", session);
+		uart_claim_state_reset();
+		return true;
+	}
+	s_uart_claim.received_mask |= bit;
+	if (s_uart_claim.received_mask != 0x3fU) {
+		snprintf(response, response_capacity, "KC1:%s:A:%c%c", session, group, part);
+		return true;
+	}
+
+	uint8_t nonce[16] = {0};
+	uint8_t proof[32] = {0};
+	unsigned char proof_b64[45] = {0};
+	size_t nonce_len = 0;
+	size_t proof_len = 0;
+	if (mbedtls_base64_decode(nonce, sizeof(nonce), &nonce_len,
+		(const unsigned char *)s_uart_claim.nonce_b64, 24U) != 0 ||
+	    nonce_len != sizeof(nonce) ||
+	    uart_claim_commit(nonce, s_uart_claim.token_b64, proof) != ESP_OK ||
+	    mbedtls_base64_encode(proof_b64, sizeof(proof_b64), &proof_len,
+		proof, sizeof(proof)) != 0 || proof_len != 44U) {
+		snprintf(response, response_capacity, "KC1:%s:E:rejected", session);
+	} else {
+		const int written = snprintf(response, response_capacity,
+			"KC1:%s:A:%c%c\nKC1:%s:P0:%.*s\nKC1:%s:P1:%.*s\n"
+			"KC1:%s:P2:%.*s\nKC1:%s:P3:%.*s",
+			session, group, part, session, 11, proof_b64,
+			session, 11, proof_b64 + 11,
+			session, 11, proof_b64 + 22, session, 11, proof_b64 + 33);
+		if (written < 0 || written >= (int)response_capacity) {
+			(void)token_revoke();
+			response[0] = '\0';
+		}
+	}
+	mbedtls_platform_zeroize(nonce, sizeof(nonce));
+	mbedtls_platform_zeroize(proof, sizeof(proof));
+	mbedtls_platform_zeroize(proof_b64, sizeof(proof_b64));
+	uart_claim_state_reset();
+	return true;
+}
+
+bool keelink_server_handle_uart_claim(const char *line, char *response,
+				      size_t response_capacity)
+{
+	if (line && strncmp(line, KEELINK_UART_COMPACT_PREFIX,
+			   sizeof(KEELINK_UART_COMPACT_PREFIX) - 1U) == 0) {
+		return uart_claim_handle_compact(line, response, response_capacity);
+	}
+	const size_t prefix_len = sizeof(KEELINK_UART_CLAIM_PREFIX) - 1U;
+	if (!line || strncmp(line, KEELINK_UART_CLAIM_PREFIX, prefix_len) != 0) {
+		return false;
+	}
+	if (!response || response_capacity == 0) return true;
+	response[0] = '\0';
+	const char *payload = line + prefix_len;
+	if (strlen(payload) != 32U + 1U + 44U || payload[32] != ':') {
+		snprintf(response, response_capacity, "%s", KEELINK_UART_CLAIM_ERROR);
+		return true;
+	}
+
+	uint8_t nonce[16] = {0};
+	uint8_t proof[32] = {0};
+	esp_err_t err = ESP_FAIL;
+
+	if (!decode_hex(payload, nonce, sizeof(nonce)) ||
+	    uart_claim_commit(nonce, payload + 33, proof) != ESP_OK) {
+		goto done;
+	}
+	char nonce_hex[33];
+	char proof_hex[65];
+	encode_hex(nonce, sizeof(nonce), nonce_hex);
+	encode_hex(proof, sizeof(proof), proof_hex);
+	if (snprintf(response, response_capacity, "%s%s:%s",
+		     KEELINK_UART_CLAIM_OK_PREFIX, nonce_hex, proof_hex) >=
+	    (int)response_capacity) {
+		(void)token_revoke();
+		response[0] = '\0';
+		goto done;
+	}
+	err = ESP_OK;
+
+done:
+	if (err != ESP_OK && response[0] == '\0') {
+		snprintf(response, response_capacity, "%s", KEELINK_UART_CLAIM_ERROR);
+	}
+	mbedtls_platform_zeroize(nonce, sizeof(nonce));
+	mbedtls_platform_zeroize(proof, sizeof(proof));
+	return true;
 }
 
 static esp_err_t public_key_fingerprint(char out[65])
@@ -939,21 +1177,12 @@ static esp_err_t pair_post(httpd_req_t *req)
 
 static esp_err_t revoke_post(httpd_req_t *req)
 {
-	if (!log_http_server_admin_pin_valid(req)) {
-		return json_error(req, "403 Forbidden", "bad admin PIN");
+	if (!bearer_token_valid(req) && !log_http_server_admin_pin_valid(req)) {
+		return json_error(req, "403 Forbidden", "authentication required");
 	}
 	esp_err_t err = token_revoke();
 	if (err != ESP_OK) return json_error(req, "500 Internal Server Error", "revoke failed");
-	lock();
-	int fd = s_ws_fd;
-	s_ws_fd = -1;
-	s_ws_ready = false;
-	s_ws_down_since_ms = 0;
-	s_ble_fallback_active = false;
-	s_log_subscribed = false;
-	unlock();
-	if (fd >= 0 && s_server) httpd_sess_trigger_close(s_server, fd);
-	keelink_ble_disable();
+	authenticated_sessions_close();
 	httpd_resp_set_type(req, "application/json");
 	return httpd_resp_sendstr(req, "{\"ok\":true,\"message\":\"token revoked\"}");
 }

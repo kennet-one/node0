@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "mesh_root_bcast.h"
+#include "keelink_server.h"
 
 static const char *TAG = "uart_bridge";
 
@@ -75,9 +76,26 @@ static void uart_bridge_task(void *arg)
 					}
 
 					if (L > 0) {
-						ESP_LOGI(TAG, "RX UART: '%s'", line);
-						// Route HMI lines through the owner map.
-						mesh_root_broadcast_text(line);
+						char response[128] = {0};
+						if (keelink_server_handle_uart_claim(line, response,
+									    sizeof(response))) {
+							ESP_LOGI(TAG, "RX UART: KeeLink commissioning request");
+							char *reply = response;
+							while (reply && *reply) {
+								char *next = strchr(reply, '\n');
+								if (next) *next = '\0';
+								if (*reply) {
+									uart_bridge_send_line(reply);
+									if (next) vTaskDelay(pdMS_TO_TICKS(125));
+								}
+								reply = next ? next + 1 : NULL;
+							}
+							memset(response, 0, sizeof(response));
+						} else {
+							ESP_LOGI(TAG, "RX UART: '%s'", line);
+							// Route HMI lines through the owner map.
+							mesh_root_broadcast_text(line);
+						}
 					}
 
 					// Move the remaining bytes to the start of the buffer.
@@ -111,7 +129,7 @@ void uart_bridge_init(void)
 		.source_clk = UART_SCLK_DEFAULT
 	};
 
-	// RX-буфер для драйвера, TX не використовуємо буферизацію
+	// The driver owns the RX buffer; TX remains unbuffered.
 	ESP_ERROR_CHECK(uart_driver_install(
 	    UART_BRIDGE_PORT,
 	    UART_BRIDGE_RX_BUF * 2,
@@ -177,5 +195,10 @@ void uart_bridge_send_line(const char *text)
 	const char nl = '\n';
 	uart_write_bytes(UART_BRIDGE_PORT, &nl, 1);
 
-	ESP_LOGI(TAG, "TX UART: '%s'", text);
+	if (strncmp(text, "keelink.claim.", 15) == 0 ||
+	    strncmp(text, "KC1:", 4) == 0) {
+		ESP_LOGI(TAG, "TX UART: KeeLink commissioning response");
+	} else {
+		ESP_LOGI(TAG, "TX UART: '%s'", text);
+	}
 }
