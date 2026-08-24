@@ -51,9 +51,63 @@ static bool strict_number_in_range(const char *text, float minimum, float maximu
 	       isfinite(value) && value >= minimum && value <= maximum;
 }
 
+static bool parse_hex_field(const char *text, size_t offset, size_t digits,
+			    uint32_t *value)
+{
+	if (!text || !value || digits == 0 || digits > 8) return false;
+	uint32_t parsed = 0;
+	for (size_t i = 0; i < digits; i++) {
+		char c = text[offset + i];
+		uint8_t nibble;
+		if (c >= '0' && c <= '9') nibble = (uint8_t)(c - '0');
+		else if (c >= 'a' && c <= 'f') nibble = (uint8_t)(c - 'a' + 10);
+		else if (c >= 'A' && c <= 'F') nibble = (uint8_t)(c - 'A' + 10);
+		else return false;
+		parsed = (parsed << 4) | nibble;
+	}
+	*value = parsed;
+	return true;
+}
+
+static bool is_heater_schedule_command(const char *payload)
+{
+	if (!payload || strncmp(payload, "S5", 2) != 0) return false;
+	size_t length = strlen(payload);
+	uint32_t generation = 0;
+	if (strcmp(payload, "S5Q") == 0) return true;
+	if (length == 4 && strncmp(payload, "S5Q", 3) == 0) {
+		uint32_t index = 0;
+		return parse_hex_field(payload, 3, 1, &index) && index < 8;
+	}
+	if (length == 11 && strncmp(payload, "S5C", 3) == 0) {
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0;
+	}
+	if (length == 14 && strncmp(payload, "S5B", 3) == 0) {
+		uint32_t count = 0, enabled = 0, persist = 0;
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0 &&
+		       parse_hex_field(payload, 11, 1, &count) && count <= 8 &&
+		       parse_hex_field(payload, 12, 1, &enabled) && enabled <= 1 &&
+		       parse_hex_field(payload, 13, 1, &persist) && persist <= 1;
+	}
+	if (length == 22 && strncmp(payload, "S5P", 3) == 0) {
+		uint32_t index = 0, enabled = 0, minute = 0;
+		uint32_t target = 0, action = 0, days = 0;
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0 &&
+		       parse_hex_field(payload, 11, 1, &index) && index < 8 &&
+		       parse_hex_field(payload, 12, 1, &enabled) && enabled <= 1 &&
+		       parse_hex_field(payload, 13, 3, &minute) && minute < 24U * 60U &&
+		       parse_hex_field(payload, 16, 3, &target) &&
+		       target >= 50 && target <= 350 &&
+		       parse_hex_field(payload, 19, 1, &action) && action <= 6 &&
+		       parse_hex_field(payload, 20, 2, &days) && days != 0 && days <= 0x7f;
+	}
+	return false;
+}
+
 static bool is_heater_command(const char *payload)
 {
 	if (!payload) return false;
+	if (is_heater_schedule_command(payload)) return true;
 	if (strcmp(payload, "hero") == 0 || strcmp(payload, "heho") == 0 ||
 	    strcmp(payload, "heater.status") == 0) {
 		return true;
