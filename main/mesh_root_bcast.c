@@ -65,6 +65,10 @@ static bool is_heater_command(const char *payload)
 	if (starts_with(payload, "W5")) {
 		return strict_number_in_range(payload + 2, 5.0f, 35.0f);
 	}
+	if (strlen(payload) == 3 && payload[0] == 'P' && payload[1] == '5' &&
+	    (payload[2] == '0' || payload[2] == '1')) {
+		return true;
+	}
 	if (starts_with(payload, "05")) {
 		return strict_number_in_range(payload + 2, -40.0f, 80.0f);
 	}
