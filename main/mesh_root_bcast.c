@@ -104,6 +104,39 @@ static bool is_heater_schedule_command(const char *payload)
 	return false;
 }
 
+static bool is_power_schedule_command(const char *payload)
+{
+	if (!payload || strncmp(payload, "PS", 2) != 0) return false;
+	size_t length = strlen(payload);
+	uint32_t generation = 0;
+	if (strcmp(payload, "PSQ") == 0) return true;
+	if (length == 4 && strncmp(payload, "PSQ", 3) == 0) {
+		uint32_t index = 0;
+		return parse_hex_field(payload, 3, 1, &index) && index < 8;
+	}
+	if (length == 11 && strncmp(payload, "PSC", 3) == 0) {
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0;
+	}
+	if (length == 14 && strncmp(payload, "PSB", 3) == 0) {
+		uint32_t count = 0, enabled = 0, persist = 0;
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0 &&
+		       parse_hex_field(payload, 11, 1, &count) && count <= 8 &&
+		       parse_hex_field(payload, 12, 1, &enabled) && enabled <= 1 &&
+		       parse_hex_field(payload, 13, 1, &persist) && persist <= 1;
+	}
+	if (length == 19 && strncmp(payload, "PSP", 3) == 0) {
+		uint32_t index = 0, enabled = 0, minute = 0, action = 0, days = 0;
+		return parse_hex_field(payload, 3, 8, &generation) && generation != 0 &&
+		       parse_hex_field(payload, 11, 1, &index) && index < 8 &&
+		       parse_hex_field(payload, 12, 1, &enabled) && enabled <= 1 &&
+		       parse_hex_field(payload, 13, 3, &minute) && minute < 24U * 60U &&
+		       parse_hex_field(payload, 16, 1, &action) && action <= 1 &&
+		       parse_hex_field(payload, 17, 2, &days) &&
+		       days != 0 && days <= 0x7f;
+	}
+	return false;
+}
+
 static bool is_heater_command(const char *payload)
 {
 	if (!payload) return false;
@@ -133,6 +166,7 @@ static const char *command_owner(const char *payload)
 {
 	if (!payload) return NULL;
 	if (is_heater_command(payload)) return "Kheater";
+	if (is_power_schedule_command(payload)) return "kPowerLed";
 	if (starts_with(payload, "garland") || starts_with(payload, "garl")) return "garland";
 	if (starts_with(payload, "powled") || strcmp(payload, "pwech") == 0) return "kPowerLed";
 	if (strcmp(payload, "lam") == 0 || strcmp(payload, "lamech") == 0 ||
@@ -292,6 +326,11 @@ void mesh_root_broadcast_text(const char *payload)
 	}
 
 	if (!payload || !payload[0]) {
+		return;
+	}
+	if (starts_with(payload, "PS") && !is_power_schedule_command(payload)) {
+		command_feedback("REJECTED", "kPowerLed", 0,
+				 "invalid power schedule payload");
 		return;
 	}
 	if ((starts_with(payload, "W5") &&
