@@ -75,6 +75,7 @@ static bool is_heater_schedule_command(const char *payload)
 	size_t length = strlen(payload);
 	uint32_t generation = 0;
 	if (strcmp(payload, "S5Q") == 0) return true;
+	if (strcmp(payload, "S5D") == 0) return true;
 	if (length == 4 && strncmp(payload, "S5Q", 3) == 0) {
 		uint32_t index = 0;
 		return parse_hex_field(payload, 3, 1, &index) && index < 8;
@@ -110,6 +111,7 @@ static bool is_power_schedule_command(const char *payload)
 	size_t length = strlen(payload);
 	uint32_t generation = 0;
 	if (strcmp(payload, "PSQ") == 0) return true;
+	if (strcmp(payload, "PSD") == 0) return true;
 	if (length == 4 && strncmp(payload, "PSQ", 3) == 0) {
 		uint32_t index = 0;
 		return parse_hex_field(payload, 3, 1, &index) && index < 8;
