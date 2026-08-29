@@ -858,7 +858,8 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
 
 	ESP_ERROR_CHECK(esp_mesh_disable_ps());
-	ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10));
+	/* Encrypted mesh children may be quiet for more than the 10 s default. */
+	ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(30));
 
 	mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
 
