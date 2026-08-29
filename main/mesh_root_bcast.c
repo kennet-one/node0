@@ -147,6 +147,19 @@ static bool is_heater_command(const char *payload)
 	    strcmp(payload, "heater.status") == 0) {
 		return true;
 	}
+	if (strlen(payload) == 3 && payload[0] == 'H' && payload[1] == 'R' &&
+	    (payload[2] == '0' || payload[2] == '1')) {
+		return true;
+	}
+	if (strcmp(payload, "D5Q") == 0) return true;
+	if (strlen(payload) == 3 && payload[0] == 'D' && payload[1] == '5' &&
+	    (payload[2] == '0' || payload[2] == '1')) {
+		return true;
+	}
+	if (strlen(payload) == 4 && strncmp(payload, "D5P", 3) == 0 &&
+	    (payload[3] == '0' || payload[3] == '1')) {
+		return true;
+	}
 	if (strlen(payload) == 3 && payload[0] == 'h' && payload[1] == 'e' &&
 	    payload[2] >= '0' && payload[2] <= '5') {
 		return true;
