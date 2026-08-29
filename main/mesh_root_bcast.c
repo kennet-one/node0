@@ -158,6 +158,10 @@ static bool is_heater_command(const char *payload)
 	    (payload[2] == '0' || payload[2] == '1')) {
 		return true;
 	}
+	if (strlen(payload) == 3 && payload[0] == 'M' && payload[1] == '5' &&
+	    (payload[2] == '0' || payload[2] == '1')) {
+		return true;
+	}
 	if (starts_with(payload, "05")) {
 		return strict_number_in_range(payload + 2, -40.0f, 80.0f);
 	}
