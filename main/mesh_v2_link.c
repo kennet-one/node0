@@ -17,6 +17,7 @@
 #include "legacy_proto.h"
 #include "log_http_server.h"
 #include "mesh_root_bcast.h"
+#include "heater_zone.h"
 #include "uart_bridge.h"
 
 static keemash_mesh_tx_broker_t *s_tx_broker;
@@ -98,11 +99,13 @@ void keemash_mesh_root_on_node_seen_uptime(const uint8_t mac[6], const char *tag
                                            bool uptime_valid, uint32_t uptime_s)
 {
 	log_http_server_node_seen_uptime(mac, tag, uptime_valid, uptime_s);
+	heater_zone_node(mac, tag, uptime_valid, uptime_s);
 }
 
 void keemash_mesh_root_on_node_seen(const uint8_t mac[6], const char *tag)
 {
 	log_http_server_node_seen(mac, tag);
+	heater_zone_node(mac, tag, false, 0);
 }
 
 void keemash_mesh_root_on_log_line(const uint8_t mac[6], const char *tag, const char *line)
@@ -207,6 +210,7 @@ void keemash_mesh_root_on_sensor_snapshot(
 	const uint8_t mac[6],
 	const mesh_v2_sensor_snapshot_payload_t *snapshot)
 {
+	heater_zone_sensor(mac, snapshot);
 	if (mac && snapshot) {
 		for (uint8_t i = 0; i < snapshot->count; i++) {
 			const mesh_v2_sensor_entry_t *entry = &snapshot->entries[i];

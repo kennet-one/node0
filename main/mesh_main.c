@@ -27,6 +27,7 @@
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
 #include "mesh_v2_link.h"
+#include "heater_zone.h"
 #include "keemash_mesh_network.h"
 
 /* -------------------------------------------------------------------------- */
@@ -823,6 +824,8 @@ void app_main(void)
 	log_time_vprintf_start();
 	
 	ESP_ERROR_CHECK(nvs_flash_init());
+	esp_err_t zone_err = heater_zone_init();
+	if (zone_err != ESP_OK) ESP_LOGE("heater_zone", "zone routing unavailable: %s", esp_err_to_name(zone_err));
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 

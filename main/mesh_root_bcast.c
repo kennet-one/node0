@@ -13,6 +13,7 @@
 
 #include "mesh_root_bcast.h"
 #include "mesh_v2_link.h"
+#include "heater_zone.h"
 #include "keemash_mesh_root.h"
 #include "keelink_server.h"
 #include "log_http_server.h"
@@ -144,7 +145,7 @@ static bool is_heater_command(const char *payload)
 	if (!payload) return false;
 	if (is_heater_schedule_command(payload)) return true;
 	if (strcmp(payload, "hero") == 0 || strcmp(payload, "heho") == 0 ||
-	    strcmp(payload, "heater.status") == 0) {
+	    strcmp(payload, "heater.status") == 0 || strcmp(payload, "heater.climate?") == 0) {
 		return true;
 	}
 	if (strlen(payload) == 3 && payload[0] == 'H' && payload[1] == 'R' &&
@@ -363,6 +364,11 @@ void mesh_root_broadcast_text(const char *payload)
 
 	const char *owner = command_owner(payload);
 	if (owner) {
+		if (starts_with(payload, "05")) {
+			uint8_t climate_mac[6];
+			if (mesh_v2_root_find_lossless_by_tag("Kheater", climate_mac,
+				MESH_V2_CAP_TYPED_SENSOR)) return;
+		}
 		if (!ensure_pending_task()) {
 			command_feedback("REJECTED", owner, 0,
 					 "command result tracker unavailable");
@@ -495,6 +501,14 @@ esp_err_t mesh_root_submit_direct_command(const uint8_t peer[6],
 	if (!peer || !payload || !payload[0] || command_id == 0) {
 		return ESP_ERR_INVALID_ARG;
 	}
+	char zone_reply[128] = {0};
+	esp_err_t zone_error;
+	if (heater_zone_command(peer, payload, zone_reply, sizeof(zone_reply), &zone_error)) {
+		keelink_server_command_result(command_id,
+			zone_error == ESP_OK ? MESH_V2_CONTROL_STATUS_OK : MESH_V2_CONTROL_STATUS_FAILED,
+			zone_reply);
+		return ESP_OK;
+	}
 	const char *owner = command_owner(payload);
 	if (!owner) return ESP_ERR_NOT_SUPPORTED;
 	uint8_t owner_mac[6] = {0};
@@ -524,6 +538,7 @@ void mesh_root_command_result(const uint8_t peer[6], uint32_t root_session,
 			      uint32_t command_id, uint8_t status,
 			      const char *text)
 {
+	heater_zone_result(peer, root_session, command_id, status);
 	pending_command_t found = {0};
 	if (!pending_take(peer, root_session, command_id, &found)) return;
 	keelink_server_command_result(command_id, status, text);
