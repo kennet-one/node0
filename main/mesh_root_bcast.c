@@ -145,7 +145,9 @@ static bool is_heater_command(const char *payload)
 	if (!payload) return false;
 	if (is_heater_schedule_command(payload)) return true;
 	if (strcmp(payload, "hero") == 0 || strcmp(payload, "heho") == 0 ||
-	    strcmp(payload, "heater.status") == 0 || strcmp(payload, "heater.climate?") == 0) {
+	    strcmp(payload, "heater.status") == 0 || strcmp(payload, "heater.climate?") == 0 ||
+        strcmp(payload, "heater.relay?") == 0 || strcmp(payload, "heater.relay:10") == 0 ||
+        strcmp(payload, "heater.relay:30") == 0 || strcmp(payload, "heater.relay:60") == 0) {
 		return true;
 	}
 	if (strlen(payload) == 3 && payload[0] == 'H' && payload[1] == 'R' &&
