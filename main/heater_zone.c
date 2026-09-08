@@ -239,6 +239,7 @@ bool heater_zone_command(const uint8_t target[6], const char *text, char *out,
         s.invalid_sent = false;
         s.last_sample_ms = 0;
         s.config_id = 0;
+        s.last_error = ESP_OK;
         portEXIT_CRITICAL(&s_lock);
         xTaskNotifyGive(s_task);
     }
@@ -299,6 +300,10 @@ static void zone_task(void *arg)
         if (target.node_session_id != node_session || !target.route_up || !target.reliable_ready) {
             applied = false;
             portENTER_CRITICAL(&s_lock);
+            if (s.binding.revision != b.revision) {
+                portEXIT_CRITICAL(&s_lock);
+                continue;
+            }
             s.applied = false;
             if (target.node_session_id != node_session) {
                 s.applied_session = target.node_session_id;
@@ -317,14 +322,18 @@ static void zone_task(void *arg)
             snprintf(command, sizeof(command), "HC:%08lx:%u:%012llx",
                 (unsigned long)b.revision, b.enabled, mac_number(b.source));
             portENTER_CRITICAL(&s_lock);
-            if (s.binding.revision == b.revision) {
-                s.config_id = id;
-                s.config_root_session = target.root_session_id;
+            if (s.binding.revision != b.revision) {
+                portEXIT_CRITICAL(&s_lock);
+                continue;
             }
+            s.config_id = id;
+            s.config_root_session = target.root_session_id;
             portEXIT_CRITICAL(&s_lock);
             esp_err_t err = mesh_v2_root_send_command(b.target, id, command);
             portENTER_CRITICAL(&s_lock);
-            s.last_error = err;
+            /* A delivered result or a newer binding takes precedence over TX. */
+            if (s.binding.revision == b.revision && s.config_id == id)
+                s.last_error = err;
             portEXIT_CRITICAL(&s_lock);
             last_config = now; last_revision = b.revision;
             continue;
@@ -353,7 +362,7 @@ static void zone_task(void *arg)
         } else continue;
         esp_err_t err = mesh_v2_root_send_command(b.target, mesh_v2_root_next_command_id(), command);
         portENTER_CRITICAL(&s_lock);
-        s.last_error = err;
+        if (s.binding.revision == b.revision) s.last_error = err;
         if (err == ESP_OK && s.binding.revision == b.revision && s.generation == generation) {
             s.sample_pending = false;
             s.invalid_pending = false;
