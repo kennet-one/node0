@@ -1,6 +1,6 @@
 dependencies:
   espressif/mdns:
-    component_hash: e81ca7a7f53ea34e78274df054da692c272e1315572876b237b1748e267c013b
+    component_hash: 3ba256ac95e07c274be53cbd73f06cb846c403b61e8fbdf1be57bdb79db7a63e
     dependencies:
     - name: idf
       require: private
@@ -8,24 +8,33 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.11.3
+    version: 1.12.0
   idf:
     source:
       type: idf
     version: 6.0.1
   keemash_mesh_core:
-    component_hash: fec82a83fd909c8bb8864e3053ba352ba067e9ba3e91d1ce44be1ee0d91eec1d
+    component_hash: cc4c9989687819eb1bab340ee869c0ae257b199140c96a9acf9c3b86648d3d13
     dependencies:
     - name: idf
       version: '>=6.0.1,<6.1'
+    - name: livekit/nanopb
+      version: ^0.4.9
     source:
       git: https://github.com/kennet-one/keemash_core.git
       path: .
       type: git
-    version: edeb3e59e14bdb0148f33217b0fc9ac692700d92
+    version: 100d4c16311aa842ff1fbe3ae968659eb3613175
+  livekit/nanopb:
+    component_hash: 6a1682f4de30d155d0ec14552e482875f295df75af1740f687fd88198cd19f48
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.4.9~2
 direct_dependencies:
 - espressif/mdns
 - keemash_mesh_core
-manifest_hash: 47a3e23bfa4a45bd469b2a85957af436248f1ba34a73c6c2b3e87e66ab88bd4e
+manifest_hash: 2fb23a3cc1cb9ebfba89d87da370e7c3a21aeac6379136576fd674629a70a099
 target: esp32s3
 version: 3.0.0

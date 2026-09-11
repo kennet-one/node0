@@ -37,8 +37,8 @@
 #define KEELINK_MAX_FRAME (KEEMASH_KEELINK_HEADER_SIZE + KEEMASH_KEELINK_MAX_PAYLOAD)
 #define KEELINK_WORKER_STACK 9216U
 #define KEELINK_HEARTBEAT_MS 5000U
-#define KEELINK_WS_PING_MS 1000U
-#define KEELINK_WS_PONG_TIMEOUT_MS 3000U
+#define KEELINK_WS_PING_MS 5000U
+#define KEELINK_WS_PONG_TIMEOUT_MS 15000U
 #define KEELINK_PAIR_FAIL_LIMIT 5U
 #define KEELINK_PAIR_BLOCK_MS 60000U
 #define KEELINK_COMMAND_MAP_SLOTS 24U
@@ -73,6 +73,7 @@ enum {
 	KL_FIELD_LOG_SUBSCRIBED = 16,
 	KL_FIELD_GAP_FIRST = 17,
 	KL_FIELD_GAP_LAST = 18,
+	KL_FIELD_RTT_MS = 19,
 };
 
 typedef struct {
@@ -119,6 +120,9 @@ static bool s_inventory_dirty;
 static uint32_t s_last_heartbeat_ms;
 static uint32_t s_last_ws_ping_ms;
 static uint32_t s_last_ws_pong_ms;
+static uint32_t s_last_ws_ping_value;
+static uint32_t s_ws_rtt_ms;
+static bool s_ws_rtt_valid;
 static command_map_t s_commands[KEELINK_COMMAND_MAP_SLOTS];
 static keelink_ble_send_fn s_ble_sender;
 static uint32_t s_pair_fail_count;
@@ -694,6 +698,7 @@ static void worker_task(void *arg)
 			   (uint32_t)(now - s_last_ws_ping_ms) >= KEELINK_WS_PING_MS) {
 			ping_due = true;
 			s_last_ws_ping_ms = now;
+			s_last_ws_ping_value = now;
 		}
 		int ping_fd = s_ws_fd;
 		unlock();
@@ -744,6 +749,13 @@ static void worker_task(void *arg)
 			unlock();
 			(void)keemash_keelink_put_u32(&writer, KL_FIELD_CURRENT_EVENT,
 				current_event);
+			lock();
+			bool rtt_valid = s_ws_rtt_valid;
+			uint32_t rtt_ms = s_ws_rtt_ms;
+			unlock();
+			if (rtt_valid) {
+				(void)keemash_keelink_put_u32(&writer, KL_FIELD_RTT_MS, rtt_ms);
+			}
 			esp_err_t heartbeat_err = encode_frame(frame, sizeof(frame),
 				KEEMASH_KEELINK_HEARTBEAT, KEEMASH_KEELINK_CH_SYSTEM,
 				0, 0, payload, writer.length, &frame_len);
@@ -858,6 +870,9 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	s_ble_retry_after_ms = 0;
 	s_last_ws_ping_ms = now_ms();
 	s_last_ws_pong_ms = s_last_ws_ping_ms;
+	s_last_ws_ping_value = s_last_ws_ping_ms;
+	s_ws_rtt_ms = 0;
+	s_ws_rtt_valid = false;
 	s_log_subscribed = false;
 	s_next_send_id = s_event_id + 1;
 	unlock();
@@ -867,21 +882,17 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	return ESP_OK;
 }
 
-static void command_map_add(uint32_t command_id, uint32_t correlation_id, bool ble)
+static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool ble)
 {
 	lock();
 	size_t chosen = KEELINK_COMMAND_MAP_SLOTS;
-	uint32_t oldest = UINT32_MAX;
 	for (size_t i = 0; i < KEELINK_COMMAND_MAP_SLOTS; i++) {
 		if (!s_commands[i].used) {
 			chosen = i;
 			break;
 		}
-		if (s_commands[i].created_ms < oldest) {
-			oldest = s_commands[i].created_ms;
-			chosen = i;
-		}
 	}
+	bool added = false;
 	if (chosen < KEELINK_COMMAND_MAP_SLOTS) {
 		s_commands[chosen] = (command_map_t){
 			.used = true,
@@ -890,8 +901,10 @@ static void command_map_add(uint32_t command_id, uint32_t correlation_id, bool b
 			.correlation_id = correlation_id,
 			.created_ms = now_ms(),
 		};
+		added = true;
 	}
 	unlock();
+	return added;
 }
 
 static bool command_map_take(uint32_t command_id, uint32_t *correlation_id,
@@ -939,7 +952,18 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 			out, writer.length);
 	}
 	uint32_t command_id = mesh_v2_root_next_command_id();
-	command_map_add(command_id, header->correlation_id, false);
+	if (!command_map_add(command_id, header->correlation_id, false)) {
+		uint8_t out[96];
+		keemash_keelink_writer_t writer;
+		keemash_keelink_writer_init(&writer, out, sizeof(out));
+		(void)keemash_keelink_put_u32(&writer, KL_FIELD_STATUS,
+			(uint32_t)ESP_ERR_NO_MEM);
+		(void)keemash_keelink_put_utf8(&writer, KL_FIELD_TEXT,
+			"command window busy");
+		return req_send_frame(req, KEEMASH_KEELINK_RESPONSE,
+			KEEMASH_KEELINK_CH_CONTROL, 0, header->correlation_id,
+			out, writer.length);
+	}
 	esp_err_t err = mesh_root_submit_direct_command(mac, command, command_id);
 	if (err != ESP_OK) {
 		uint32_t ignored;
@@ -988,9 +1012,19 @@ static esp_err_t ws_handler(httpd_req_t *req)
 			httpd_sess_trigger_close(req->handle, fd);
 			return err;
 		}
-		lock();
-		if (s_ws_fd == httpd_req_to_sockfd(req)) s_last_ws_pong_ms = now_ms();
-		unlock();
+		if (ws.len == sizeof(uint32_t)) {
+			uint32_t echoed = 0;
+			memcpy(&echoed, ws.payload, sizeof(echoed));
+			uint32_t received_ms = now_ms();
+			lock();
+			if (s_ws_fd == httpd_req_to_sockfd(req) &&
+			    echoed == s_last_ws_ping_value) {
+				s_last_ws_pong_ms = received_ms;
+				s_ws_rtt_ms = received_ms - echoed;
+				s_ws_rtt_valid = true;
+			}
+			unlock();
+		}
 		return ESP_OK;
 	}
 	if (ws.type != HTTPD_WS_TYPE_BINARY || ws.len > KEELINK_MAX_FRAME) return ESP_ERR_INVALID_SIZE;
@@ -1425,7 +1459,9 @@ esp_err_t keelink_server_handle_ble_frame(const uint8_t *frame, size_t frame_len
 		if (!parse_mac(mac_text, mac) || !command[0] ||
 		    header.correlation_id == 0) return ESP_ERR_INVALID_ARG;
 		uint32_t command_id = mesh_v2_root_next_command_id();
-		command_map_add(command_id, header.correlation_id, true);
+		if (!command_map_add(command_id, header.correlation_id, true)) {
+			return ESP_ERR_NO_MEM;
+		}
 		err = mesh_root_submit_direct_command(mac, command, command_id);
 		if (err != ESP_OK) {
 			uint32_t ignored;

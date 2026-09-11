@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +28,8 @@
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_tls.h"
+#include "lwip/sockets.h"
+#include "lwip/tcp.h"
 #include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
@@ -52,6 +55,17 @@ extern const unsigned char node0_https_prvtkey_pem_start[] asm("_binary_node0_ht
 extern const unsigned char node0_https_prvtkey_pem_end[] asm("_binary_node0_https_prvtkey_pem_end");
 
 #if CONFIG_NODE0_KEELINK_ENABLE
+static esp_err_t https_socket_open(httpd_handle_t server, int fd)
+{
+	(void)server;
+	int enabled = 1;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
+		ESP_LOGW(TAG, "failed to enable TCP_NODELAY on fd=%d errno=%d", fd, errno);
+		return ESP_FAIL;
+	}
+	return ESP_OK;
+}
+
 static void https_session_event(esp_https_server_user_cb_arg_t *event)
 {
 	if (!event || event->user_cb_state != HTTPD_SSL_USER_CB_SESS_CLOSE || !event->tls) return;
@@ -8564,6 +8578,7 @@ esp_err_t log_http_server_start(void)
 	config.prvtkey_pem = node0_https_prvtkey_pem_start;
 	config.prvtkey_len = node0_https_prvtkey_pem_end - node0_https_prvtkey_pem_start;
 #if CONFIG_NODE0_KEELINK_ENABLE
+	config.httpd.open_fn = https_socket_open;
 	config.user_cb = https_session_event;
 #endif
 
