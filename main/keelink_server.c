@@ -1314,12 +1314,14 @@ static esp_err_t info_get(httpd_req_t *req)
 	format_mac(mac, mac_text);
 	char body[768];
 	bool wss_active;
+	keelink_ws_protocol_t wss_protocol;
 	uint32_t wss_connect_count;
 	uint64_t graph_revision;
 	bool ble_fallback_active;
 	uint32_t ws_down_age_ms;
 	lock();
 	wss_active = s_ws_ready && s_ws_fd >= 0;
+	wss_protocol = s_ws_protocol;
 	wss_connect_count = s_wss_connect_count;
 	graph_revision = s_graph_revision;
 	ble_fallback_active = s_ble_fallback_active;
@@ -1329,6 +1331,7 @@ static esp_err_t info_get(httpd_req_t *req)
 		"{\"protocol\":\"KeeLink\",\"version\":1,\"fabric_version\":2,"
 		"\"fabric_transports\":[\"wss\"],\"quic\":false,\"root_mac\":\"%s\","
 		"\"paired\":%s,\"wss\":true,\"wss_active\":%s,"
+		"\"wss_protocol\":\"%s\","
 		"\"wss_seen\":%s,\"wss_connect_count\":%" PRIu32 ","
 		"\"graph_revision\":%" PRIu64 ","
 		"\"ws_down_age_ms\":%" PRIu32 ","
@@ -1337,6 +1340,8 @@ static esp_err_t info_get(httpd_req_t *req)
 		"\"ble_boot_checkpoint\":%" PRIu32 ",\"reset_reason\":%d,"
 		"\"tls_public_key_sha256\":\"%s\",\"max_frame\":%u}",
 		mac_text, paired ? "true" : "false", wss_active ? "true" : "false",
+		wss_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2 ? "fabric-v2" :
+			(wss_protocol == KEELINK_WS_PROTOCOL_V1 ? "keelink-v1" : "none"),
 		wss_connect_count ? "true" : "false", wss_connect_count,
 		graph_revision, ws_down_age_ms,
 		ble_fallback_active ? "true" : "false",
