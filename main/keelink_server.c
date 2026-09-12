@@ -1,6 +1,7 @@
 #include "keelink_server.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "keemash_keelink.h"
+#include "keemash_fabric.h"
 #include "keemash_mesh_root.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/md.h"
@@ -34,7 +36,10 @@
 #include "mesh_root_bcast.h"
 
 #define KEELINK_REPLAY_SLOTS 128U
-#define KEELINK_MAX_FRAME (KEEMASH_KEELINK_HEADER_SIZE + KEEMASH_KEELINK_MAX_PAYLOAD)
+#define KEELINK_V1_MAX_FRAME (KEEMASH_KEELINK_HEADER_SIZE + KEEMASH_KEELINK_MAX_PAYLOAD)
+#define KEELINK_MAX_FRAME \
+	((KEELINK_V1_MAX_FRAME > KEEMASH_FABRIC_MAX_WIRE_FRAME) \
+		 ? KEELINK_V1_MAX_FRAME : KEEMASH_FABRIC_MAX_WIRE_FRAME)
 #define KEELINK_WORKER_STACK 9216U
 #define KEELINK_HEARTBEAT_MS 5000U
 #define KEELINK_WS_PING_MS 5000U
@@ -46,13 +51,9 @@
 #define KEELINK_LOG_BACKLOG_HIGH 96U
 #define KEELINK_LOG_BACKLOG_LOW 64U
 #define KEELINK_PRIORITY_LOG 3U
+#define KEELINK_FABRIC_MESSAGE_SLOTS 4U
 #define KEELINK_BLE_FALLBACK_DELAY_MS 3000U
 #define KEELINK_BLE_RETRY_MS 5000U
-#define KEELINK_UART_CLAIM_PREFIX "keelink.claim.v1:"
-#define KEELINK_UART_CLAIM_OK_PREFIX "keelink.claim.ok.v1:"
-#define KEELINK_UART_CLAIM_ERROR "keelink.claim.err.v1:rejected"
-#define KEELINK_UART_COMPACT_PREFIX "KC1:"
-#define KEELINK_UART_COMPACT_TIMEOUT_MS 20000U
 
 enum {
 	KL_FIELD_PROTOCOL_VERSION = 1,
@@ -86,18 +87,18 @@ typedef struct {
 typedef struct {
 	bool used;
 	bool ble;
+	bool fabric;
 	uint32_t command_id;
 	uint32_t correlation_id;
 	uint32_t created_ms;
+	keemash_fabric_id_t operation_id;
 } command_map_t;
 
-typedef struct {
-	char session[5];
-	char nonce_b64[25];
-	char token_b64[45];
-	uint8_t received_mask;
-	uint32_t updated_ms;
-} uart_claim_state_t;
+typedef enum {
+	KEELINK_WS_PROTOCOL_NONE = 0,
+	KEELINK_WS_PROTOCOL_V1,
+	KEELINK_WS_PROTOCOL_FABRIC_V2,
+} keelink_ws_protocol_t;
 
 static const char *TAG = "keelink";
 static bool s_mdns_ready;
@@ -105,17 +106,23 @@ static httpd_handle_t s_server;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_worker;
 static uint8_t *s_replay;
+static keemash_fabric_envelope_t *s_fabric_messages;
+static uint32_t s_fabric_message_used;
 static replay_meta_t s_replay_meta[KEELINK_REPLAY_SLOTS];
 static uint32_t s_event_id;
 static uint64_t s_session_id;
 static int s_ws_fd = -1;
 static bool s_ws_ready;
+static keelink_ws_protocol_t s_ws_protocol;
+static keemash_fabric_id_t s_controller_id;
+static keemash_fabric_id_t s_transport_session;
 static uint32_t s_wss_connect_count;
 static bool s_ble_fallback_active;
 static uint32_t s_ws_down_since_ms;
 static uint32_t s_ble_retry_after_ms;
 static bool s_log_subscribed;
 static uint32_t s_next_send_id;
+static bool fabric_session_active(void);
 static bool s_inventory_dirty;
 static uint32_t s_last_heartbeat_ms;
 static uint32_t s_last_ws_ping_ms;
@@ -128,7 +135,6 @@ static keelink_ble_send_fn s_ble_sender;
 static uint32_t s_pair_fail_count;
 static uint32_t s_pair_block_until_ms;
 static uint32_t s_log_dropped;
-static uart_claim_state_t s_uart_claim;
 
 extern const unsigned char node0_https_servercert_pem_start[] asm("_binary_node0_https_servercert_pem_start");
 extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_https_servercert_pem_end");
@@ -148,12 +154,45 @@ static void unlock(void)
 	if (s_lock) xSemaphoreGive(s_lock);
 }
 
+static keemash_fabric_envelope_t *fabric_message_acquire(void)
+{
+	keemash_fabric_envelope_t *message = NULL;
+	lock();
+	for (uint32_t i = 0; s_fabric_messages && i < KEELINK_FABRIC_MESSAGE_SLOTS; i++) {
+		uint32_t bit = 1U << i;
+		if ((s_fabric_message_used & bit) != 0) continue;
+		s_fabric_message_used |= bit;
+		message = &s_fabric_messages[i];
+		break;
+	}
+	unlock();
+	if (message) {
+		*message = (keemash_fabric_envelope_t)
+			keemash_fabric_v2_Envelope_init_zero;
+	}
+	return message;
+}
+
+static void fabric_message_release(keemash_fabric_envelope_t *message)
+{
+	if (!message || !s_fabric_messages) return;
+	ptrdiff_t index = message - s_fabric_messages;
+	if (index < 0 || (size_t)index >= KEELINK_FABRIC_MESSAGE_SLOTS) return;
+	memset(message, 0, sizeof(*message));
+	lock();
+	s_fabric_message_used &= ~(1U << (uint32_t)index);
+	unlock();
+}
+
 static void ws_mark_down(int fd)
 {
 	lock();
 	if (s_ws_fd == fd) {
 		s_ws_fd = -1;
 		s_ws_ready = false;
+		s_ws_protocol = KEELINK_WS_PROTOCOL_NONE;
+		memset(&s_controller_id, 0, sizeof(s_controller_id));
+		memset(&s_transport_session, 0, sizeof(s_transport_session));
 		s_log_subscribed = false;
 		if (s_wss_connect_count) s_ws_down_since_ms = now_ms();
 	}
@@ -224,216 +263,6 @@ static void authenticated_sessions_close(void)
 	unlock();
 	if (fd >= 0 && s_server) httpd_sess_trigger_close(s_server, fd);
 	keelink_ble_disable();
-}
-
-static int hex_nibble(char value)
-{
-	if (value >= '0' && value <= '9') return value - '0';
-	if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-	if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-	return -1;
-}
-
-static bool decode_hex(const char *text, uint8_t *out, size_t out_len)
-{
-	if (!text || !out) return false;
-	for (size_t i = 0; i < out_len; i++) {
-		int high = hex_nibble(text[i * 2]);
-		int low = hex_nibble(text[i * 2 + 1]);
-		if (high < 0 || low < 0) return false;
-		out[i] = (uint8_t)((high << 4) | low);
-	}
-	return true;
-}
-
-static void encode_hex(const uint8_t *bytes, size_t len, char *out)
-{
-	static const char digits[] = "0123456789abcdef";
-	for (size_t i = 0; i < len; i++) {
-		out[i * 2] = digits[bytes[i] >> 4];
-		out[i * 2 + 1] = digits[bytes[i] & 0x0f];
-	}
-	out[len * 2] = '\0';
-}
-
-static void uart_claim_state_reset(void)
-{
-	mbedtls_platform_zeroize(&s_uart_claim, sizeof(s_uart_claim));
-}
-
-static esp_err_t uart_claim_commit(const uint8_t nonce[16], const char token_b64[45],
-				   uint8_t proof[32])
-{
-	static const uint8_t context[] = "KeeLink UART claim v1";
-	uint8_t token[32] = {0};
-	uint8_t token_hash[32] = {0};
-	uint8_t root_mac[6] = {0};
-	uint8_t proof_input[(sizeof(context) - 1U) + 16U + sizeof(root_mac)];
-	size_t token_len = 0;
-	esp_err_t err = ESP_FAIL;
-
-	if (mbedtls_base64_decode(token, sizeof(token), &token_len,
-		(const unsigned char *)token_b64, 44U) != 0 ||
-	    token_len != sizeof(token) ||
-	    sha256(token, sizeof(token), token_hash) != ESP_OK ||
-	    esp_wifi_get_mac(WIFI_IF_STA, root_mac) != ESP_OK) {
-		goto done;
-	}
-	memcpy(proof_input, context, sizeof(context) - 1U);
-	memcpy(proof_input + sizeof(context) - 1U, nonce, 16U);
-	memcpy(proof_input + sizeof(context) - 1U + 16U, root_mac, sizeof(root_mac));
-	const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-	if (!info || mbedtls_md_hmac(info, token, sizeof(token), proof_input,
-				     sizeof(proof_input), proof) != 0 ||
-	    token_hash_store(token_hash) != ESP_OK) {
-		goto done;
-	}
-
-	authenticated_sessions_close();
-	lock();
-	s_pair_fail_count = 0;
-	s_pair_block_until_ms = 0;
-	unlock();
-	err = ESP_OK;
-
-done:
-	mbedtls_platform_zeroize(token, sizeof(token));
-	mbedtls_platform_zeroize(token_hash, sizeof(token_hash));
-	mbedtls_platform_zeroize(root_mac, sizeof(root_mac));
-	mbedtls_platform_zeroize(proof_input, sizeof(proof_input));
-	return err;
-}
-
-static bool uart_claim_handle_compact(const char *line, char *response,
-				      size_t response_capacity)
-{
-	const size_t line_len = strlen(line);
-	if (line_len < 13U || strncmp(line, KEELINK_UART_COMPACT_PREFIX,
-					 sizeof(KEELINK_UART_COMPACT_PREFIX) - 1U) != 0) {
-		return false;
-	}
-	if (!response || response_capacity == 0) return true;
-	response[0] = '\0';
-	if (line[8] != ':' || line[11] != ':' || hex_nibble(line[4]) < 0 ||
-	    hex_nibble(line[5]) < 0 || hex_nibble(line[6]) < 0 ||
-	    hex_nibble(line[7]) < 0) {
-		return true;
-	}
-
-	char session[5];
-	memcpy(session, line + 4, 4);
-	session[4] = '\0';
-	const uint32_t now = now_ms();
-	if (s_uart_claim.updated_ms == 0 ||
-	    (uint32_t)(now - s_uart_claim.updated_ms) > KEELINK_UART_COMPACT_TIMEOUT_MS ||
-	    strcmp(s_uart_claim.session, session) != 0) {
-		uart_claim_state_reset();
-		memcpy(s_uart_claim.session, session, sizeof(session));
-	}
-	s_uart_claim.updated_ms = now;
-
-	const char group = line[9];
-	const char part = line[10];
-	const char *chunk = line + 12;
-	const size_t chunk_len = line_len - 12U;
-	uint8_t bit = 0;
-	if (group == 'N' && (part == '0' || part == '1') && chunk_len == 12U) {
-		const unsigned index = (unsigned)(part - '0');
-		memcpy(s_uart_claim.nonce_b64 + index * 12U, chunk, 12U);
-		bit = (uint8_t)(1U << index);
-	} else if (group == 'T' && part >= '0' && part <= '3' && chunk_len == 11U) {
-		const unsigned index = (unsigned)(part - '0');
-		memcpy(s_uart_claim.token_b64 + index * 11U, chunk, 11U);
-		bit = (uint8_t)(1U << (index + 2U));
-	} else {
-		snprintf(response, response_capacity, "KC1:%s:E:rejected", session);
-		uart_claim_state_reset();
-		return true;
-	}
-	s_uart_claim.received_mask |= bit;
-	if (s_uart_claim.received_mask != 0x3fU) {
-		snprintf(response, response_capacity, "KC1:%s:A:%c%c", session, group, part);
-		return true;
-	}
-
-	uint8_t nonce[16] = {0};
-	uint8_t proof[32] = {0};
-	unsigned char proof_b64[45] = {0};
-	size_t nonce_len = 0;
-	size_t proof_len = 0;
-	if (mbedtls_base64_decode(nonce, sizeof(nonce), &nonce_len,
-		(const unsigned char *)s_uart_claim.nonce_b64, 24U) != 0 ||
-	    nonce_len != sizeof(nonce) ||
-	    uart_claim_commit(nonce, s_uart_claim.token_b64, proof) != ESP_OK ||
-	    mbedtls_base64_encode(proof_b64, sizeof(proof_b64), &proof_len,
-		proof, sizeof(proof)) != 0 || proof_len != 44U) {
-		snprintf(response, response_capacity, "KC1:%s:E:rejected", session);
-	} else {
-		const int written = snprintf(response, response_capacity,
-			"KC1:%s:A:%c%c\nKC1:%s:P0:%.*s\nKC1:%s:P1:%.*s\n"
-			"KC1:%s:P2:%.*s\nKC1:%s:P3:%.*s",
-			session, group, part, session, 11, proof_b64,
-			session, 11, proof_b64 + 11,
-			session, 11, proof_b64 + 22, session, 11, proof_b64 + 33);
-		if (written < 0 || written >= (int)response_capacity) {
-			(void)token_revoke();
-			response[0] = '\0';
-		}
-	}
-	mbedtls_platform_zeroize(nonce, sizeof(nonce));
-	mbedtls_platform_zeroize(proof, sizeof(proof));
-	mbedtls_platform_zeroize(proof_b64, sizeof(proof_b64));
-	uart_claim_state_reset();
-	return true;
-}
-
-bool keelink_server_handle_uart_claim(const char *line, char *response,
-				      size_t response_capacity)
-{
-	if (line && strncmp(line, KEELINK_UART_COMPACT_PREFIX,
-			   sizeof(KEELINK_UART_COMPACT_PREFIX) - 1U) == 0) {
-		return uart_claim_handle_compact(line, response, response_capacity);
-	}
-	const size_t prefix_len = sizeof(KEELINK_UART_CLAIM_PREFIX) - 1U;
-	if (!line || strncmp(line, KEELINK_UART_CLAIM_PREFIX, prefix_len) != 0) {
-		return false;
-	}
-	if (!response || response_capacity == 0) return true;
-	response[0] = '\0';
-	const char *payload = line + prefix_len;
-	if (strlen(payload) != 32U + 1U + 44U || payload[32] != ':') {
-		snprintf(response, response_capacity, "%s", KEELINK_UART_CLAIM_ERROR);
-		return true;
-	}
-
-	uint8_t nonce[16] = {0};
-	uint8_t proof[32] = {0};
-	esp_err_t err = ESP_FAIL;
-
-	if (!decode_hex(payload, nonce, sizeof(nonce)) ||
-	    uart_claim_commit(nonce, payload + 33, proof) != ESP_OK) {
-		goto done;
-	}
-	char nonce_hex[33];
-	char proof_hex[65];
-	encode_hex(nonce, sizeof(nonce), nonce_hex);
-	encode_hex(proof, sizeof(proof), proof_hex);
-	if (snprintf(response, response_capacity, "%s%s:%s",
-		     KEELINK_UART_CLAIM_OK_PREFIX, nonce_hex, proof_hex) >=
-	    (int)response_capacity) {
-		(void)token_revoke();
-		response[0] = '\0';
-		goto done;
-	}
-	err = ESP_OK;
-
-done:
-	if (err != ESP_OK && response[0] == '\0') {
-		snprintf(response, response_capacity, "%s", KEELINK_UART_CLAIM_ERROR);
-	}
-	mbedtls_platform_zeroize(nonce, sizeof(nonce));
-	mbedtls_platform_zeroize(proof, sizeof(proof));
-	return true;
 }
 
 static esp_err_t public_key_fingerprint(char out[65])
@@ -546,6 +375,42 @@ static uint32_t replay_append(uint8_t kind, uint16_t channel, uint32_t correlati
 	return id;
 }
 
+static uint64_t fabric_replay_append(keemash_fabric_envelope_t *message,
+				     uint8_t priority)
+{
+	if (!message) return 0;
+	uint32_t id;
+	lock();
+	uint32_t backlog = s_next_send_id <= s_event_id
+		? s_event_id - s_next_send_id + 1U : 0U;
+	if (priority == KEELINK_PRIORITY_LOG && s_ws_ready &&
+	    backlog >= KEELINK_LOG_BACKLOG_HIGH) {
+		s_log_dropped++;
+		unlock();
+		if (s_worker) xTaskNotifyGive(s_worker);
+		return 0;
+	}
+	id = ++s_event_id;
+	message->sequence = id;
+	message->root_session = s_session_id;
+	message->has_transport_session = true;
+	message->transport_session = s_transport_session;
+	size_t slot = id % KEELINK_REPLAY_SLOTS;
+	uint8_t *frame = s_replay + slot * KEELINK_MAX_FRAME;
+	size_t frame_len = 0;
+	if (keemash_fabric_encode_wire(message, frame, KEEMASH_FABRIC_MAX_WIRE_FRAME,
+		&frame_len) != ESP_OK) {
+		id = 0;
+	} else {
+		s_replay_meta[slot].id = id;
+		s_replay_meta[slot].len = (uint16_t)frame_len;
+		s_replay_meta[slot].priority = priority;
+	}
+	unlock();
+	if (id && s_worker) xTaskNotifyGive(s_worker);
+	return id;
+}
+
 static esp_err_t ws_send_sync(int fd, const uint8_t *data, size_t len)
 {
 	if (!s_server || fd < 0 || !data || len == 0) return ESP_ERR_INVALID_STATE;
@@ -590,6 +455,27 @@ static esp_err_t req_send_frame(httpd_req_t *req, uint8_t kind, uint16_t channel
 	return err;
 }
 
+static esp_err_t req_send_fabric(httpd_req_t *req,
+				 const keemash_fabric_envelope_t *message)
+{
+	uint8_t *frame_data = heap_caps_malloc(KEEMASH_FABRIC_MAX_WIRE_FRAME,
+		MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!frame_data) return ESP_ERR_NO_MEM;
+	size_t frame_len = 0;
+	esp_err_t err = keemash_fabric_encode_wire(message, frame_data,
+		KEEMASH_FABRIC_MAX_WIRE_FRAME, &frame_len);
+	if (err == ESP_OK) {
+		httpd_ws_frame_t frame = {
+			.type = HTTPD_WS_TYPE_BINARY,
+			.payload = frame_data,
+			.len = frame_len,
+		};
+		err = httpd_ws_send_frame(req, &frame);
+	}
+	free(frame_data);
+	return err;
+}
+
 static void publish_gap(uint32_t first, uint32_t last)
 {
 	uint8_t payload[32];
@@ -617,6 +503,22 @@ static esp_err_t send_gap_sync(int fd, uint32_t first, uint32_t last)
 
 static void publish_log_backpressure_gap(uint32_t dropped)
 {
+	if (fabric_session_active()) {
+		keemash_fabric_envelope_t *message = fabric_message_acquire();
+		if (!message) return;
+		message->protocol_version = KEEMASH_FABRIC_VERSION;
+		message->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_LOG;
+		message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+		message->which_body = keemash_fabric_v2_Envelope_gap_tag;
+		message->body.gap.traffic_class =
+			keemash_fabric_v2_TrafficClass_TRAFFIC_LOG;
+		message->body.gap.last_sequence = dropped;
+		snprintf(message->body.gap.reason, sizeof(message->body.gap.reason),
+			 "backpressure dropped logs");
+		(void)fabric_replay_append(message, 0);
+		fabric_message_release(message);
+		return;
+	}
 	uint8_t payload[96];
 	char text[56];
 	keemash_keelink_writer_t writer;
@@ -864,6 +766,9 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	int old_fd = s_ws_fd;
 	s_ws_fd = fd;
 	s_ws_ready = false;
+	s_ws_protocol = KEELINK_WS_PROTOCOL_NONE;
+	memset(&s_controller_id, 0, sizeof(s_controller_id));
+	memset(&s_transport_session, 0, sizeof(s_transport_session));
 	s_wss_connect_count++;
 	s_ws_down_since_ms = 0;
 	s_ble_fallback_active = false;
@@ -882,7 +787,8 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	return ESP_OK;
 }
 
-static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool ble)
+static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool ble,
+			    bool fabric, const keemash_fabric_id_t *operation_id)
 {
 	lock();
 	size_t chosen = KEELINK_COMMAND_MAP_SLOTS;
@@ -897,25 +803,25 @@ static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool b
 		s_commands[chosen] = (command_map_t){
 			.used = true,
 			.ble = ble,
+			.fabric = fabric,
 			.command_id = command_id,
 			.correlation_id = correlation_id,
 			.created_ms = now_ms(),
 		};
+		if (operation_id) s_commands[chosen].operation_id = *operation_id;
 		added = true;
 	}
 	unlock();
 	return added;
 }
 
-static bool command_map_take(uint32_t command_id, uint32_t *correlation_id,
-			     bool *ble)
+static bool command_map_take(uint32_t command_id, command_map_t *result)
 {
 	bool found = false;
 	lock();
 	for (size_t i = 0; i < KEELINK_COMMAND_MAP_SLOTS; i++) {
 		if (s_commands[i].used && s_commands[i].command_id == command_id) {
-			if (correlation_id) *correlation_id = s_commands[i].correlation_id;
-			if (ble) *ble = s_commands[i].ble;
+			if (result) *result = s_commands[i];
 			memset(&s_commands[i], 0, sizeof(s_commands[i]));
 			found = true;
 			break;
@@ -952,7 +858,7 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 			out, writer.length);
 	}
 	uint32_t command_id = mesh_v2_root_next_command_id();
-	if (!command_map_add(command_id, header->correlation_id, false)) {
+	if (!command_map_add(command_id, header->correlation_id, false, false, NULL)) {
 		uint8_t out[96];
 		keemash_keelink_writer_t writer;
 		keemash_keelink_writer_init(&writer, out, sizeof(out));
@@ -966,8 +872,7 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 	}
 	esp_err_t err = mesh_root_submit_direct_command(mac, command, command_id);
 	if (err != ESP_OK) {
-		uint32_t ignored;
-		(void)command_map_take(command_id, &ignored, NULL);
+		(void)command_map_take(command_id, NULL);
 		uint8_t out[128];
 		keemash_keelink_writer_t writer;
 		keemash_keelink_writer_init(&writer, out, sizeof(out));
@@ -978,6 +883,172 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 			out, writer.length);
 	}
 	return ESP_OK;
+}
+
+static esp_err_t send_fabric_control_result(httpd_req_t *req,
+					    uint64_t correlation,
+					    const keemash_fabric_id_t *operation_id,
+					    uint32_t status, const char *text)
+{
+	keemash_fabric_envelope_t *reply = fabric_message_acquire();
+	if (!reply) return ESP_ERR_NO_MEM;
+	reply->protocol_version = KEEMASH_FABRIC_VERSION;
+	reply->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_CONTROL;
+	reply->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+	reply->root_session = s_session_id;
+	reply->has_transport_session = true;
+	reply->transport_session = s_transport_session;
+	reply->correlation = correlation;
+	reply->which_body = keemash_fabric_v2_Envelope_control_result_tag;
+	reply->body.control_result.has_operation_id = operation_id != NULL;
+	if (operation_id) reply->body.control_result.operation_id = *operation_id;
+	reply->body.control_result.outcome = status == ESP_OK
+		? keemash_fabric_v2_Outcome_OUTCOME_OK
+		: keemash_fabric_v2_Outcome_OUTCOME_FAILED;
+	reply->body.control_result.status = status;
+	snprintf(reply->body.control_result.text,
+		sizeof(reply->body.control_result.text), "%s", text ? text : "");
+	esp_err_t err = req_send_fabric(req, reply);
+	fabric_message_release(reply);
+	return err;
+}
+
+static esp_err_t handle_fabric_hello(httpd_req_t *req,
+				     const keemash_fabric_envelope_t *message)
+{
+	const keemash_fabric_v2_Hello *hello = &message->body.hello;
+	if (!hello->has_controller_id || !hello->has_transport_session ||
+	    keemash_fabric_id_is_zero(&hello->controller_id) ||
+	    keemash_fabric_id_is_zero(&hello->transport_session) || hello->zero_rtt) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	keemash_fabric_envelope_t *reply = fabric_message_acquire();
+	if (!reply) return ESP_ERR_NO_MEM;
+	reply->protocol_version = KEEMASH_FABRIC_VERSION;
+	reply->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_GRAPH;
+	reply->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+	reply->root_session = s_session_id;
+	reply->has_transport_session = true;
+	reply->transport_session = hello->transport_session;
+	reply->correlation = message->sequence;
+	reply->which_body = keemash_fabric_v2_Envelope_welcome_tag;
+	reply->body.welcome.protocol_version = KEEMASH_FABRIC_VERSION;
+	reply->body.welcome.max_frame = KEEMASH_FABRIC_MAX_WIRE_FRAME;
+	reply->body.welcome.capabilities = KEEMASH_FABRIC_CAP_TYPED_GRAPH |
+		KEEMASH_FABRIC_CAP_RESUME | KEEMASH_FABRIC_CAP_OPERATION_ID |
+		KEEMASH_FABRIC_CAP_LATEST_SENSOR;
+	reply->body.welcome.has_transport_session = true;
+	reply->body.welcome.transport_session = hello->transport_session;
+	reply->body.welcome.root_session = s_session_id;
+	reply->body.welcome.resume_accepted = false;
+	snprintf(reply->body.welcome.fallback_reason,
+		sizeof(reply->body.welcome.fallback_reason), "snapshot reset");
+
+	esp_err_t err = req_send_fabric(req, reply);
+	fabric_message_release(reply);
+	lock();
+	if (err == ESP_OK && s_ws_fd == httpd_req_to_sockfd(req)) {
+		s_controller_id = hello->controller_id;
+		s_transport_session = hello->transport_session;
+		s_ws_protocol = KEELINK_WS_PROTOCOL_FABRIC_V2;
+		s_ws_ready = true;
+		s_next_send_id = s_event_id + 1U;
+	}
+	unlock();
+	if (err == ESP_OK) {
+		keelink_server_publish_inventory();
+		if (s_worker) xTaskNotifyGive(s_worker);
+	}
+	return err;
+}
+
+static esp_err_t handle_fabric_control_request(httpd_req_t *req,
+					       const keemash_fabric_envelope_t *message)
+{
+	const keemash_fabric_v2_ControlRequest *request =
+		&message->body.control_request;
+	if (!request->has_operation_id || !request->has_target_node_id ||
+	    request->payload.size != 6U || !request->command[0] ||
+	    message->correlation == 0 || message->correlation > UINT32_MAX ||
+	    (message->has_operation_id &&
+	     (message->operation_id.high != request->operation_id.high ||
+	      message->operation_id.low != request->operation_id.low))) {
+		return send_fabric_control_result(req, message->correlation,
+			request->has_operation_id ? &request->operation_id : NULL,
+			ESP_ERR_INVALID_ARG, "invalid Fabric control request");
+	}
+
+	uint8_t root_mac[6];
+	keemash_fabric_id_t expected_node_id;
+	esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+	if (keemash_fabric_legacy_node_id(root_mac, request->payload.bytes,
+		&expected_node_id) != ESP_OK ||
+	    expected_node_id.high != request->target_node_id.high ||
+	    expected_node_id.low != request->target_node_id.low) {
+		return send_fabric_control_result(req, message->correlation,
+			&request->operation_id, ESP_ERR_INVALID_ARG,
+			"target identity does not match route alias");
+	}
+
+	uint32_t command_id = mesh_v2_root_next_command_id();
+	if (!command_map_add(command_id, (uint32_t)message->correlation, false,
+		true, &request->operation_id)) {
+		return send_fabric_control_result(req, message->correlation,
+			&request->operation_id, ESP_ERR_NO_MEM, "command window busy");
+	}
+	esp_err_t err = mesh_root_submit_direct_command(request->payload.bytes,
+		request->command, command_id);
+	if (err != ESP_OK) {
+		(void)command_map_take(command_id, NULL);
+		return send_fabric_control_result(req, message->correlation,
+			&request->operation_id, err, esp_err_to_name(err));
+	}
+	return ESP_OK;
+}
+
+static esp_err_t handle_fabric_frame(httpd_req_t *req, const uint8_t *frame,
+				     size_t frame_len)
+{
+	keemash_fabric_envelope_t *message = fabric_message_acquire();
+	if (!message) return ESP_ERR_NO_MEM;
+	esp_err_t err = keemash_fabric_decode_wire(frame, frame_len, message);
+	if (err != ESP_OK) {
+		fabric_message_release(message);
+		return err;
+	}
+	if (message->which_body == keemash_fabric_v2_Envelope_hello_tag &&
+	    message->traffic_class == keemash_fabric_v2_TrafficClass_TRAFFIC_GRAPH) {
+		err = handle_fabric_hello(req, message);
+		fabric_message_release(message);
+		return err;
+	}
+	lock();
+	bool valid_lease = s_ws_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2 &&
+		message->has_transport_session &&
+		message->transport_session.high == s_transport_session.high &&
+		message->transport_session.low == s_transport_session.low;
+	unlock();
+	if (!valid_lease) {
+		fabric_message_release(message);
+		return ESP_ERR_INVALID_STATE;
+	}
+	if (message->which_body == keemash_fabric_v2_Envelope_control_request_tag &&
+	    message->traffic_class == keemash_fabric_v2_TrafficClass_TRAFFIC_CONTROL) {
+		err = handle_fabric_control_request(req, message);
+		fabric_message_release(message);
+		return err;
+	}
+	if (message->which_body == keemash_fabric_v2_Envelope_probe_tag) {
+		message->root_session = s_session_id;
+		message->body.probe.receiver_mono_us = (uint64_t)esp_timer_get_time();
+		message->body.probe.reply_mono_us = (uint64_t)esp_timer_get_time();
+		err = req_send_fabric(req, message);
+		fabric_message_release(message);
+		return err;
+	}
+	fabric_message_release(message);
+	return ESP_ERR_NOT_SUPPORTED;
 }
 
 static esp_err_t ws_handler(httpd_req_t *req)
@@ -1036,6 +1107,11 @@ static esp_err_t ws_handler(httpd_req_t *req)
 		free(frame);
 		return err;
 	}
+	if (keemash_fabric_is_wire_frame(frame, ws.len)) {
+		err = handle_fabric_frame(req, frame, ws.len);
+		free(frame);
+		return err;
+	}
 	keemash_keelink_header_t header = {0};
 	err = keemash_keelink_decode_header(frame, ws.len, &header);
 	if (err != ESP_OK) {
@@ -1074,6 +1150,8 @@ static esp_err_t ws_handler(httpd_req_t *req)
 		uint32_t oldest = s_event_id >= KEELINK_REPLAY_SLOTS
 			? s_event_id - KEELINK_REPLAY_SLOTS + 1 : 1;
 		s_ws_ready = err == ESP_OK;
+		s_ws_protocol = err == ESP_OK ? KEELINK_WS_PROTOCOL_V1
+			: KEELINK_WS_PROTOCOL_NONE;
 		s_next_send_id = last_event + 1;
 		if (s_next_send_id < oldest) s_next_send_id = s_event_id + 1;
 		bool needs_snapshot = last_event == 0 || last_event + 1 < oldest;
@@ -1085,7 +1163,11 @@ static esp_err_t ws_handler(httpd_req_t *req)
 		if (s_worker) xTaskNotifyGive(s_worker);
 	} else if (header.kind == KEEMASH_KEELINK_REQUEST &&
 		   header.channel == KEEMASH_KEELINK_CH_CONTROL) {
-		err = handle_control_request(req, &header, payload);
+		lock();
+		bool fabric_session = s_ws_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2;
+		unlock();
+		err = fabric_session ? ESP_ERR_NOT_SUPPORTED
+			: handle_control_request(req, &header, payload);
 	} else if (header.kind == KEEMASH_KEELINK_REQUEST &&
 		   header.channel == KEEMASH_KEELINK_CH_INVENTORY) {
 		keelink_server_publish_inventory();
@@ -1124,7 +1206,7 @@ static esp_err_t info_get(httpd_req_t *req)
 	char mac_text[13];
 	esp_wifi_get_mac(WIFI_IF_STA, mac);
 	format_mac(mac, mac_text);
-	char body[640];
+	char body[768];
 	bool wss_active;
 	uint32_t wss_connect_count;
 	bool ble_fallback_active;
@@ -1136,7 +1218,8 @@ static esp_err_t info_get(httpd_req_t *req)
 	ws_down_age_ms = s_ws_down_since_ms ? now_ms() - s_ws_down_since_ms : 0;
 	unlock();
 	snprintf(body, sizeof(body),
-		"{\"protocol\":\"KeeLink\",\"version\":1,\"root_mac\":\"%s\","
+		"{\"protocol\":\"KeeLink\",\"version\":1,\"fabric_version\":2,"
+		"\"fabric_transports\":[\"wss\"],\"quic\":false,\"root_mac\":\"%s\","
 		"\"paired\":%s,\"wss\":true,\"wss_active\":%s,"
 		"\"wss_seen\":%s,\"wss_connect_count\":%" PRIu32 ","
 		"\"ws_down_age_ms\":%" PRIu32 ","
@@ -1229,7 +1312,13 @@ esp_err_t keelink_server_init(void)
 	if (!s_lock) return ESP_ERR_NO_MEM;
 	s_replay = heap_caps_calloc(KEELINK_REPLAY_SLOTS, KEELINK_MAX_FRAME,
 		MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	if (!s_replay) {
+	s_fabric_messages = heap_caps_calloc(KEELINK_FABRIC_MESSAGE_SLOTS,
+		sizeof(*s_fabric_messages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!s_replay || !s_fabric_messages) {
+		free(s_fabric_messages);
+		s_fabric_messages = NULL;
+		free(s_replay);
+		s_replay = NULL;
 		vSemaphoreDelete(s_lock);
 		s_lock = NULL;
 		return ESP_ERR_NO_MEM;
@@ -1237,14 +1326,17 @@ esp_err_t keelink_server_init(void)
 	s_session_id = ((uint64_t)esp_random() << 32) | esp_random();
 	if (xTaskCreateWithCaps(worker_task, "keelink_tx", KEELINK_WORKER_STACK, NULL, 5,
 		&s_worker, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+		free(s_fabric_messages);
+		s_fabric_messages = NULL;
 		free(s_replay);
 		s_replay = NULL;
 		vSemaphoreDelete(s_lock);
 		s_lock = NULL;
 		return ESP_ERR_NO_MEM;
 	}
-	ESP_LOGI(TAG, "KeeLink v1 ready, replay=%u bytes in PSRAM",
-		(unsigned)(KEELINK_REPLAY_SLOTS * KEELINK_MAX_FRAME));
+	ESP_LOGI(TAG, "KeeLink Fabric v2 + v1 fallback ready, replay=%u bytes, messages=%u bytes in PSRAM",
+		(unsigned)(KEELINK_REPLAY_SLOTS * KEELINK_MAX_FRAME),
+		(unsigned)(KEELINK_FABRIC_MESSAGE_SLOTS * sizeof(*s_fabric_messages)));
 	return ESP_OK;
 }
 
@@ -1264,6 +1356,8 @@ esp_err_t keelink_server_network_ready(void)
 	(void)mdns_instance_name_set("KeeMASH node0");
 	mdns_txt_item_t txt[] = {
 		{"version", "1"},
+		{"fabric", "2"},
+		{"transports", "wss"},
 		{"root", mac_text},
 		{"path", "/keelink/ws"},
 	};
@@ -1331,37 +1425,280 @@ void keelink_server_publish_text_event(uint16_t channel, const uint8_t mac[6],
 	publish_text_event_priority(channel, mac, tag, text, 2);
 }
 
+static bool fabric_session_active(void)
+{
+	lock();
+	bool active = s_ws_ready && s_ws_fd >= 0 &&
+		s_ws_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2;
+	unlock();
+	return active;
+}
+
+static bool fabric_node_identity(const uint8_t mac[6],
+				 keemash_fabric_id_t *node_id,
+				 uint32_t *boot_session)
+{
+	if (!mac || !node_id) return false;
+	uint8_t root_mac[6];
+	esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+	if (keemash_fabric_legacy_node_id(root_mac, mac, node_id) != ESP_OK) {
+		return false;
+	}
+	if (boot_session) {
+		mesh_v2_root_stats_t stats = {0};
+		*boot_session = mesh_v2_root_stats_for_mac(mac, &stats)
+			? stats.node_session_id : 0;
+	}
+	return true;
+}
+
+static const char *fabric_sensor_path(uint16_t metric_id)
+{
+	switch (metric_id) {
+	case MESH_V2_SENSOR_METRIC_CO2_PPM:
+		return "sensors.co2.ppm";
+	case MESH_V2_SENSOR_METRIC_TEMPERATURE_C:
+		return "sensors.temperature.c";
+	case MESH_V2_SENSOR_METRIC_HUMIDITY_RH:
+		return "sensors.humidity.rh";
+	case MESH_V2_SENSOR_METRIC_ILLUMINANCE_LUX:
+		return "sensors.illuminance.lux";
+	case MESH_V2_SENSOR_METRIC_HEART_RATE_BPM:
+		return "sensors.heart_rate.bpm";
+	default:
+		return NULL;
+	}
+}
+
+static double fabric_sensor_value(const mesh_v2_sensor_entry_t *entry)
+{
+	double value = entry->value;
+	if (entry->scale10 < 0) {
+		for (int i = 0; i < -entry->scale10; i++) value /= 10.0;
+	} else {
+		for (int i = 0; i < entry->scale10; i++) value *= 10.0;
+	}
+	return value;
+}
+
+bool keelink_server_publish_sensor_fabric(
+	const uint8_t mac[6], const mesh_v2_sensor_snapshot_payload_t *snapshot)
+{
+	if (!mac || !snapshot || !fabric_session_active()) return false;
+	keemash_fabric_id_t node_id;
+	uint32_t boot_session = 0;
+	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
+	for (uint8_t i = 0; i < snapshot->count; i++) {
+		const mesh_v2_sensor_entry_t *entry = &snapshot->entries[i];
+		const char *path = fabric_sensor_path(entry->metric_id);
+		if (!path) continue;
+		keemash_fabric_envelope_t *message = fabric_message_acquire();
+		if (!message) return false;
+		message->protocol_version = KEEMASH_FABRIC_VERSION;
+		message->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_SENSOR;
+		message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_LATEST;
+		message->has_source_node_id = true;
+		message->source_node_id = node_id;
+		message->which_body = keemash_fabric_v2_Envelope_telemetry_tag;
+		message->body.telemetry.has_endpoint_id = true;
+		if (keemash_fabric_endpoint_id(&node_id, path,
+			&message->body.telemetry.endpoint_id) != ESP_OK) {
+			fabric_message_release(message);
+			continue;
+		}
+		message->body.telemetry.boot_session = boot_session;
+		message->body.telemetry.sample_sequence =
+			((uint64_t)snapshot->generation << 8) | i;
+		message->body.telemetry.acquisition_mono_us =
+			(uint64_t)snapshot->sample_uptime_ms * 1000ULL;
+		message->body.telemetry.quality_flags = entry->status;
+		message->body.telemetry.generation = snapshot->generation;
+		message->body.telemetry.request_id = snapshot->request_id;
+		message->body.telemetry.metric_id = entry->metric_id;
+		message->body.telemetry.scale10 = entry->scale10;
+		message->body.telemetry.validity =
+			(entry->status & MESH_V2_SENSOR_STATUS_ERROR)
+				? keemash_fabric_v2_Validity_VALIDITY_INVALID
+			: !(entry->status & MESH_V2_SENSOR_STATUS_VALID)
+				? keemash_fabric_v2_Validity_VALIDITY_UNAVAILABLE
+			: (entry->status & MESH_V2_SENSOR_STATUS_STALE)
+				? keemash_fabric_v2_Validity_VALIDITY_STALE
+				: keemash_fabric_v2_Validity_VALIDITY_VALID;
+		message->body.telemetry.which_value =
+			keemash_fabric_v2_TelemetrySample_double_value_tag;
+		message->body.telemetry.value.double_value = fabric_sensor_value(entry);
+		(void)fabric_replay_append(message, 2);
+		fabric_message_release(message);
+	}
+	return true;
+}
+
+bool keelink_server_publish_task_fabric(
+	const uint8_t mac[6], const mesh_v2_task_snapshot_payload_t *snapshot)
+{
+	if (!mac || !snapshot || !fabric_session_active()) return false;
+	keemash_fabric_id_t node_id;
+	uint32_t boot_session = 0;
+	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
+	keemash_fabric_envelope_t *message = fabric_message_acquire();
+	if (!message) return false;
+	message->protocol_version = KEEMASH_FABRIC_VERSION;
+	message->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_TASK;
+	message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+	message->has_source_node_id = true;
+	message->source_node_id = node_id;
+	message->which_body = keemash_fabric_v2_Envelope_tasks_tag;
+	message->body.tasks.has_node_id = true;
+	message->body.tasks.node_id = node_id;
+	message->body.tasks.boot_session = boot_session;
+	message->body.tasks.acquisition_mono_us = (uint64_t)snapshot->updated_ms * 1000ULL;
+	message->body.tasks.actual_count = snapshot->task_total;
+	message->body.tasks.truncated =
+		(snapshot->flags & MESH_V2_TASK_SNAPSHOT_FLAG_LAST) == 0;
+	message->body.tasks.request_id = snapshot->request_id;
+	message->body.tasks.updated_ms = snapshot->updated_ms;
+	message->body.tasks.uptime_s = snapshot->uptime_s;
+	message->body.tasks.cpu_load_x10 = snapshot->cpu_load_x10;
+	message->body.tasks.cpu_valid = snapshot->cpu_valid != 0;
+	message->body.tasks.task_index = snapshot->task_index;
+	size_t count = snapshot->task_count;
+	if (count > MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES) {
+		count = MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES;
+	}
+	message->body.tasks.tasks_count = count;
+	for (size_t i = 0; i < count; i++) {
+		const mesh_v2_task_entry_t *source = &snapshot->tasks[i];
+		keemash_fabric_v2_TaskEntry *target = &message->body.tasks.tasks[i];
+		snprintf(target->name, sizeof(target->name), "%.*s",
+			MESH_V2_TASK_NAME_MAX, source->name);
+		target->stack_free_words = source->free_words;
+		target->priority = source->priority;
+		target->cpu_load_x10 = source->cpu_x10 > 0
+			? (uint32_t)source->cpu_x10 : 0;
+	}
+	bool published = fabric_replay_append(message, 1) != 0;
+	fabric_message_release(message);
+	return published;
+}
+
+bool keelink_server_publish_memory_fabric(
+	const uint8_t mac[6], const mesh_v2_memory_payload_t *snapshot)
+{
+	if (!mac || !snapshot || !fabric_session_active()) return false;
+	keemash_fabric_id_t node_id;
+	uint32_t boot_session = 0;
+	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
+	keemash_fabric_envelope_t *message = fabric_message_acquire();
+	if (!message) return false;
+	message->protocol_version = KEEMASH_FABRIC_VERSION;
+	message->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_MEMORY;
+	message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+	message->has_source_node_id = true;
+	message->source_node_id = node_id;
+	message->which_body = keemash_fabric_v2_Envelope_memory_tag;
+	message->body.memory.has_node_id = true;
+	message->body.memory.node_id = node_id;
+	message->body.memory.boot_session = boot_session;
+	message->body.memory.acquisition_mono_us =
+		(uint64_t)snapshot->uptime_s * 1000000ULL;
+	message->body.memory.internal_total = snapshot->internal_total;
+	message->body.memory.internal_free = snapshot->internal_free;
+	message->body.memory.internal_min_free = snapshot->internal_min_free;
+	message->body.memory.psram_total = snapshot->psram_total;
+	message->body.memory.psram_free = snapshot->psram_free;
+	message->body.memory.psram_min_free = snapshot->psram_min_free;
+	message->body.memory.flash_size = snapshot->flash_chip;
+	message->body.memory.image_size = snapshot->app_used;
+	message->body.memory.app_slot_size = snapshot->app_slot;
+	message->body.memory.nvs_used_entries = snapshot->nvs_used;
+	message->body.memory.nvs_total_entries = snapshot->nvs_total;
+	message->body.memory.uptime_s = snapshot->uptime_s;
+	message->body.memory.psram_expected = snapshot->psram_expected;
+	message->body.memory.nvs_free_entries = snapshot->nvs_free;
+	message->body.memory.nvs_available_entries = snapshot->nvs_available;
+	message->body.memory.heap_total = snapshot->heap_total;
+	message->body.memory.heap_free = snapshot->heap_free;
+	message->body.memory.heap_min_free = snapshot->heap_min_free;
+	message->body.memory.psram_enabled = snapshot->psram_enabled != 0;
+	bool published = fabric_replay_append(message, 1) != 0;
+	fabric_message_release(message);
+	return published;
+}
+
 void keelink_server_publish_log(const uint8_t mac[6], const char *tag, const char *line)
 {
 	lock();
 	bool enabled = s_log_subscribed;
 	unlock();
-	if (enabled) publish_text_event_priority(KEEMASH_KEELINK_CH_LOG, mac, tag,
-		line, KEELINK_PRIORITY_LOG);
+	if (!enabled || !line) return;
+	if (fabric_session_active()) {
+		keemash_fabric_id_t node_id;
+		uint32_t boot_session = 0;
+		if (!fabric_node_identity(mac, &node_id, &boot_session)) return;
+		keemash_fabric_envelope_t *message = fabric_message_acquire();
+		if (!message) return;
+		message->protocol_version = KEEMASH_FABRIC_VERSION;
+		message->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_LOG;
+		message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+		message->has_source_node_id = true;
+		message->source_node_id = node_id;
+		message->which_body = keemash_fabric_v2_Envelope_log_tag;
+		message->body.log.has_node_id = true;
+		message->body.log.node_id = node_id;
+		message->body.log.boot_session = boot_session;
+		message->body.log.acquisition_mono_us = (uint64_t)now_ms() * 1000ULL;
+		snprintf(message->body.log.text, sizeof(message->body.log.text), "%s", line);
+		(void)fabric_replay_append(message, KEELINK_PRIORITY_LOG);
+		fabric_message_release(message);
+		return;
+	}
+	publish_text_event_priority(KEEMASH_KEELINK_CH_LOG, mac, tag, line,
+		KEELINK_PRIORITY_LOG);
 }
 
 void keelink_server_command_result(uint32_t command_id, uint8_t status, const char *text)
 {
-	uint32_t correlation_id;
-	bool ble = false;
-	if (!command_map_take(command_id, &correlation_id, &ble)) return;
+	command_map_t command = {0};
+	if (!command_map_take(command_id, &command)) return;
+	if (command.fabric) {
+		keemash_fabric_envelope_t *reply = fabric_message_acquire();
+		if (!reply) return;
+		reply->protocol_version = KEEMASH_FABRIC_VERSION;
+		reply->traffic_class = keemash_fabric_v2_TrafficClass_TRAFFIC_CONTROL;
+		reply->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+		reply->correlation = command.correlation_id;
+		reply->has_operation_id = true;
+		reply->operation_id = command.operation_id;
+		reply->which_body = keemash_fabric_v2_Envelope_control_result_tag;
+		reply->body.control_result.has_operation_id = true;
+		reply->body.control_result.operation_id = command.operation_id;
+		reply->body.control_result.outcome = status == 0
+			? keemash_fabric_v2_Outcome_OUTCOME_OK
+			: keemash_fabric_v2_Outcome_OUTCOME_FAILED;
+		reply->body.control_result.status = status;
+		snprintf(reply->body.control_result.text,
+			sizeof(reply->body.control_result.text), "%s", text ? text : "");
+		(void)fabric_replay_append(reply, 0);
+		fabric_message_release(reply);
+		return;
+	}
 	uint8_t payload[256];
 	keemash_keelink_writer_t writer;
 	keemash_keelink_writer_init(&writer, payload, sizeof(payload));
 	(void)keemash_keelink_put_u32(&writer, KL_FIELD_STATUS, status);
 	(void)keemash_keelink_put_u32(&writer, KL_FIELD_COMMAND_ID, command_id);
 	(void)keemash_keelink_put_utf8(&writer, KL_FIELD_TEXT, text ? text : "");
-	if (ble && s_ble_sender) {
+	if (command.ble && s_ble_sender) {
 		uint8_t frame[KEEMASH_KEELINK_HEADER_SIZE + sizeof(payload)];
 		size_t frame_len = 0;
 		if (encode_frame(frame, sizeof(frame), KEEMASH_KEELINK_RESPONSE,
-			KEEMASH_KEELINK_CH_CONTROL, 0, correlation_id, payload,
+			KEEMASH_KEELINK_CH_CONTROL, 0, command.correlation_id, payload,
 			writer.length, &frame_len) == ESP_OK) {
 			(void)s_ble_sender(frame, frame_len);
 		}
 	} else {
 		(void)replay_append(KEEMASH_KEELINK_RESPONSE,
-			KEEMASH_KEELINK_CH_CONTROL, correlation_id,
+			KEEMASH_KEELINK_CH_CONTROL, command.correlation_id,
 			payload, writer.length, 0);
 	}
 }
@@ -1459,13 +1796,12 @@ esp_err_t keelink_server_handle_ble_frame(const uint8_t *frame, size_t frame_len
 		if (!parse_mac(mac_text, mac) || !command[0] ||
 		    header.correlation_id == 0) return ESP_ERR_INVALID_ARG;
 		uint32_t command_id = mesh_v2_root_next_command_id();
-		if (!command_map_add(command_id, header.correlation_id, true)) {
+		if (!command_map_add(command_id, header.correlation_id, true, false, NULL)) {
 			return ESP_ERR_NO_MEM;
 		}
 		err = mesh_root_submit_direct_command(mac, command, command_id);
 		if (err != ESP_OK) {
-			uint32_t ignored;
-			(void)command_map_take(command_id, &ignored, NULL);
+			(void)command_map_take(command_id, NULL);
 			return err;
 		}
 		return ESP_OK;

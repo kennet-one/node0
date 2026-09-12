@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
-#include "esp_wifi.h"
 #include "esp_mesh.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -17,7 +16,6 @@
 #include "keemash_mesh_root.h"
 #include "keelink_server.h"
 #include "log_http_server.h"
-#include "uart_bridge.h"
 
 static const char *TAG = "root_bcast";
 #define COMMAND_PENDING_SLOTS 16
@@ -209,8 +207,6 @@ static const char *command_owner(const char *payload)
 	    starts_with(payload, "mixer.weather:")) return "esp_mixer";
 	return NULL;
 }
-static uint32_t s_root_cnt = 1000000;
-
 static uint32_t now_ms(void)
 {
 	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -221,7 +217,6 @@ static void command_feedback(const char *code, const char *owner,
 {
 	char token[48];
 	snprintf(token, sizeof(token), "ERR:%s:%s", code, owner);
-	uart_bridge_send_line(token);
 	log_http_server_command_status(
 		strcmp(code, "OFFLINE") == 0 ? "offline" :
 		strcmp(code, "TIMEOUT") == 0 ? "timeout" : "rejected",
@@ -312,19 +307,6 @@ static bool pending_take(const uint8_t peer[6], uint32_t root_session,
 	return found.used;
 }
 
-static esp_err_t send_v1_text(const uint8_t dst[6], const char *payload)
-{
-	mesh_packet_t pkt = {0};
-	pkt.magic = MESH_PKT_MAGIC;
-	pkt.version = MESH_PKT_VERSION;
-	pkt.type = MESH_PKT_TYPE_TEXT;
-	pkt.counter = s_root_cnt++;
-	esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-	strncpy(pkt.payload, payload, sizeof(pkt.payload) - 1);
-	return mesh_v2_link_send(dst, &pkt, sizeof(pkt),
-				 KEEMASH_REL_PRIORITY_CONTROL);
-}
-
 esp_err_t mesh_root_send_state_to_mixer(const char *legacy_token)
 {
 	if (!legacy_token || !legacy_token[0]) return ESP_ERR_INVALID_ARG;
@@ -405,97 +387,12 @@ void mesh_root_broadcast_text(const char *payload)
 			}
 			return;
 		}
-		if (!log_http_server_find_routable_by_tag(owner, owner_mac)) {
-			command_feedback("OFFLINE", owner, 0, "owner route unavailable");
-			return;
-		}
-		if (mesh_v2_root_peer_advertises_lossless(
-			    owner_mac, MESH_V2_CAP_TYPED_CONTROL)) {
-			command_feedback("OFFLINE", owner, 0,
-					 "lossless session not ready");
-			return;
-		}
-		esp_err_t v1_err = send_v1_text(owner_mac, payload);
-		if (v1_err != ESP_OK) {
-			command_feedback("REJECTED", owner, 0,
-					 esp_err_to_name(v1_err));
-		} else {
-			log_http_server_command_status("queued", owner, 0,
-							 "legacy unicast");
-		}
+		command_feedback("OFFLINE", owner, 0,
+				 "reliable session not ready");
 		return;
 	}
-
-	mesh_packet_t pkt;
-	memset(&pkt, 0, sizeof(pkt));
-
-	pkt.magic   = MESH_PKT_MAGIC;
-	pkt.version = MESH_PKT_VERSION;
-	pkt.type    = MESH_PKT_TYPE_TEXT;
-	pkt.counter = s_root_cnt++;
-
-	// Fill root STA MAC for legacy packet routing.
-	esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-
-	// Copy the legacy text command into the fixed packet payload.
-	strncpy(pkt.payload, payload, sizeof(pkt.payload) - 1);
-	pkt.payload[sizeof(pkt.payload) - 1] = '\0';
-
-	mesh_data_t data = {
-		.data  = (uint8_t *)&pkt,
-		.size  = sizeof(pkt),
-		.proto = MESH_PROTO_BIN,
-		.tos   = MESH_TOS_P2P,
-	};
-
-	// Collect current ESP-MESH routes.
-	mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
-	int route_table_size = 0;
-
-	esp_err_t err = esp_mesh_get_routing_table(
-		route_table,
-		CONFIG_MESH_ROUTE_TABLE_SIZE * sizeof(mesh_addr_t),
-		&route_table_size
-	);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "esp_mesh_get_routing_table failed: 0x%x (%s)",
-		         err, esp_err_to_name(err));
-		return;
-	}
-
-	if (route_table_size == 0) {
-		ESP_LOGW(TAG, "no children in routing table, nothing to broadcast");
-		return;
-	}
-
-	int target_count = 0;
-	for (int i = 0; i < route_table_size; ++i) {
-		if (memcmp(route_table[i].addr, pkt.src_mac, 6) != 0) {
-			target_count++;
-		}
-	}
-
-	if (target_count == 0) {
-		ESP_LOGW(TAG, "no remote children in routing table, nothing to broadcast");
-		return;
-	}
-
-	ESP_LOGI(TAG,
-	         "ROOT UART BCAST: to %d nodes, payload=\"%s\"",
-	         target_count, pkt.payload);
-
-	for (int i = 0; i < route_table_size; ++i) {
-		if (memcmp(route_table[i].addr, pkt.src_mac, 6) == 0) {
-			continue;
-		}
-		err = mesh_v2_link_send(route_table[i].addr, data.data, data.size,
-					KEEMASH_REL_PRIORITY_CONTROL);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG,
-			         "send[%d] failed: 0x%x (%s)",
-			         i, err, esp_err_to_name(err));
-		}
-	}
+	command_feedback("REJECTED", "unmapped", 0,
+			 "command has no reliable owner");
 }
 
 esp_err_t mesh_root_submit_direct_command(const uint8_t peer[6],

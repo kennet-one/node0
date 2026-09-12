@@ -7,8 +7,6 @@ if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/${NODE0_HTTPS_CERT}" OR
 endif()
 
 idf_component_register(SRCS "mesh_main.c"
-                        "legacy_proto.c"
-                        "uart_bridge.c"
                         "mesh_root_bcast.c"
                         "heater_zone.c"
                         "mesh_v2_link.c"
@@ -18,7 +16,7 @@ idf_component_register(SRCS "mesh_main.c"
                         "mesh_time_sync.c"
                         "stack_monitor.c"
                         "time_sync.c"
-                    PRIV_REQUIRES keemash_mesh_core mdns esp_wifi esp_netif esp_driver_gpio esp_driver_uart esp_http_server esp_https_server driver nvs_flash heap app_update esp_app_format spi_flash bootloader_support mbedtls bt
+                    PRIV_REQUIRES keemash_mesh_core mdns esp_wifi esp_netif esp_driver_gpio esp_http_server esp_https_server driver nvs_flash heap app_update esp_app_format spi_flash bootloader_support mbedtls bt
                     INCLUDE_DIRS "." "include"
                     EMBED_TXTFILES "${NODE0_HTTPS_CERT}"
                                    "${NODE0_HTTPS_KEY}")

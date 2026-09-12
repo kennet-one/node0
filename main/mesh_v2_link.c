@@ -14,11 +14,9 @@
 #include "keemash_mesh_tx_broker.h"
 #include "keemash_keelink.h"
 #include "keelink_server.h"
-#include "legacy_proto.h"
 #include "log_http_server.h"
 #include "mesh_root_bcast.h"
 #include "heater_zone.h"
-#include "uart_bridge.h"
 
 static keemash_mesh_tx_broker_t *s_tx_broker;
 static const char *TAG = "mesh_v2_link";
@@ -118,6 +116,7 @@ void keemash_mesh_root_on_task_snapshot(const uint8_t mac[6],
                                         const mesh_v2_task_snapshot_payload_t *snapshot)
 {
 	log_http_server_task_snapshot_v2(mac, snapshot);
+	if (keelink_server_publish_task_fabric(mac, snapshot)) return;
 	char tag[MESH_V2_TAG_MAX + 1] = {0};
 	char event[192];
 	memcpy(tag, snapshot->tag, MESH_V2_TAG_MAX);
@@ -140,6 +139,7 @@ void keemash_mesh_root_on_memory_snapshot(const uint8_t mac[6],
                                           const mesh_v2_memory_payload_t *snapshot)
 {
 	log_http_server_memory_snapshot_v2(mac, snapshot);
+	if (keelink_server_publish_memory_fabric(mac, snapshot)) return;
 	char tag[MESH_V2_TAG_MAX + 1] = {0};
 	char event[384];
 	memcpy(tag, snapshot->tag, MESH_V2_TAG_MAX);
@@ -211,7 +211,9 @@ void keemash_mesh_root_on_sensor_snapshot(
 	const mesh_v2_sensor_snapshot_payload_t *snapshot)
 {
 	heater_zone_sensor(mac, snapshot);
-	if (mac && snapshot) {
+	bool fabric_published =
+		keelink_server_publish_sensor_fabric(mac, snapshot);
+	if (mac && snapshot && !fabric_published) {
 		for (uint8_t i = 0; i < snapshot->count; i++) {
 			const mesh_v2_sensor_entry_t *entry = &snapshot->entries[i];
 			char event[192];
@@ -237,18 +239,15 @@ void keemash_mesh_root_on_sensor_snapshot(
 		return;
 	}
 
-	bool legacy_reply =
-		(snapshot->flags & MESH_V2_SENSOR_FLAG_LEGACY_REPLY) != 0;
 	bool automation =
 		(snapshot->flags & MESH_V2_SENSOR_FLAG_AUTOMATION_UPDATE) != 0;
-	if (!legacy_reply && !automation) return;
+	if (!automation) return;
 
 	for (uint8_t i = 0; i < snapshot->count; i++) {
 		char line[32];
 		if (!sensor_legacy_line(&snapshot->entries[i], line, sizeof(line))) {
 			continue;
 		}
-		if (legacy_reply) uart_bridge_send_line(line);
 		if (automation &&
 		    snapshot->entries[i].metric_id ==
 			    MESH_V2_SENSOR_METRIC_TEMPERATURE_C) {
@@ -284,7 +283,6 @@ void keemash_mesh_root_on_topology(const uint8_t mac[6], const void *payload, si
 
 void keemash_mesh_root_on_control_event(const char *text)
 {
-	legacy_handle_text(text);
 	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_STATE,
 		NULL, NULL, text);
 	if (text && (strcmp(text, "garland_on") == 0 ||

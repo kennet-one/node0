@@ -105,9 +105,7 @@ static void https_session_event(esp_https_server_user_cb_arg_t *event)
 
 #define NODE0_OTA_BUF_SIZE		4096U
 #define NODE0_OTA_RECV_TIMEOUT_RETRIES	3
-#define REMOTE_OTA_ACK_TIMEOUT_MS	8000U
-#define REMOTE_OTA_SEND_RETRIES		3
-#define REMOTE_OTA_RETRY_DELAY_MS	120U
+#define REMOTE_OTA_V2_RETRY_DELAY_MS	120U
 #define REMOTE_OTA_V2_SEND_RETRIES	6
 #define REMOTE_OTA_V2_ACK_TIMEOUT_MS	30000U
 #define REMOTE_OTA_V2_RESYNC_TIMEOUT_MS	45000U
@@ -116,10 +114,6 @@ static void https_session_event(esp_https_server_user_cb_arg_t *event)
 #if REMOTE_OTA_V2_CHUNK_SIZE > MESH_V2_OTA_CHUNK_MAX
 	#error "REMOTE_OTA_V2_CHUNK_SIZE exceeds MESH_V2_OTA_CHUNK_MAX"
 #endif
-#define REMOTE_REBOOT_ACK_TIMEOUT_MS	7000U
-#define REMOTE_REBOOT_SEND_RETRIES	3
-#define REMOTE_REBOOT_RETRY_DELAY_MS	150U
-#define REMOTE_REBOOT_DELAY_MS		1200U
 #define LOG_STREAM_TASK_STACK		3072U
 #define LOG_STREAM_HEARTBEAT_MS		10000U
 #define MESH_STREAM_TASK_STACK		6144U
@@ -433,12 +427,9 @@ static node0_ota_status_t s_ota_status = {
 
 typedef struct {
 	bool waiting;
-	bool v2;
 	uint8_t mac[6];
 	uint8_t op;
-	uint16_t seq;
 	uint32_t op_id;
-	mesh_ota_status_packet_t ack;
 	mesh_v2_ota_status_payload_t ack_v2;
 } remote_ota_wait_t;
 
@@ -478,17 +469,6 @@ static remote_ota_status_t s_remote_ota_status = {
 static uint32_t s_debug_ota_v2_route_loss_after_sends = 0;
 static uint32_t s_debug_ota_v2_send_count = 0;
 #endif
-
-typedef struct {
-	bool waiting;
-	uint8_t mac[6];
-	uint16_t seq;
-	mesh_reboot_status_packet_t ack;
-} remote_reboot_wait_t;
-
-static SemaphoreHandle_t s_remote_reboot_ack_sem = NULL;
-static portMUX_TYPE s_remote_reboot_lock = portMUX_INITIALIZER_UNLOCKED;
-static remote_reboot_wait_t s_remote_reboot_wait = {0};
 
 /* ----------------- Helpers ----------------- */
 
@@ -1809,43 +1789,8 @@ static bool build_time_prefix(char *out, size_t out_sz)
 
 static esp_err_t mesh_send_log_ctrl(const uint8_t to_mac[6], bool enable)
 {
-	if (!to_mac) {
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	esp_err_t v2_err = mesh_v2_root_send_log_ctrl(to_mac, enable);
-	if (mesh_v2_root_peer_advertises_lossless(to_mac, 0)) {
-		return v2_err;
-	}
-
-	mesh_log_ctrl_packet_t p;
-	memset(&p, 0, sizeof(p));
-
-	p.h.magic = MESH_PKT_MAGIC;
-	p.h.version = MESH_PKT_VERSION;
-	p.h.type = MESH_LOG_TYPE_CTRL;
-	p.h.counter = ms_now();
-	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
-
-	p.enable = enable ? 1 : 0;
-
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)&p;
-	data.size = sizeof(p);
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest));
-	memcpy(dest.addr, to_mac, 6);
-
-	esp_err_t v1_err = mesh_v2_link_send(dest.addr, data.data, data.size,
-					    KEEMASH_REL_PRIORITY_CONTROL);
-	if (v2_err == ESP_OK || v1_err == ESP_OK) {
-		return ESP_OK;
-	}
-	return v1_err != ESP_OK ? v1_err : v2_err;
+	return to_mac ? mesh_v2_root_send_log_ctrl(to_mac, enable)
+		      : ESP_ERR_INVALID_ARG;
 }
 
 static void select_stream_node(const uint8_t mac[6], const char *tag)
@@ -2499,91 +2444,6 @@ void log_http_server_remote_line(const uint8_t mac[6], const char *tag, const ch
 	mesh_stream_mark_changed();
 }
 
-void log_http_server_remote_ota_status(const uint8_t mac[6],
-                                       const mesh_ota_status_packet_t *status,
-                                       size_t status_len)
-{
-	if (!mac || !status) return;
-
-	bool give_ack = false;
-	bool has_slot_info = status_len >= sizeof(mesh_ota_status_v2_packet_t);
-	char running_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
-	char update_label[MESH_OTA_SLOT_LABEL_MAX] = {0};
-	uint32_t running_size = 0;
-	uint32_t update_size = 0;
-
-	if (has_slot_info) {
-		const mesh_ota_status_v2_packet_t *v2 =
-			(const mesh_ota_status_v2_packet_t *)status;
-		copy_packet_text(running_label, sizeof(running_label),
-		                 v2->running_label, sizeof(v2->running_label));
-		copy_packet_text(update_label, sizeof(update_label),
-		                 v2->update_label, sizeof(v2->update_label));
-		running_size = v2->running_size;
-		update_size = v2->update_size;
-		has_slot_info = running_label[0] || update_label[0] ||
-		                running_size != 0 || update_size != 0;
-	}
-
-	portENTER_CRITICAL(&s_remote_ota_lock);
-	{
-		if (s_remote_ota_status.target_valid &&
-		    mac_eq(mac, s_remote_ota_status.target_mac)) {
-			if (status->total > 0) {
-				s_remote_ota_status.total_bytes = status->total;
-			}
-			s_remote_ota_status.written_bytes = status->offset;
-			if (has_slot_info) {
-				copy_packet_text(s_remote_ota_status.running_label,
-				                 sizeof(s_remote_ota_status.running_label),
-				                 running_label, sizeof(running_label));
-				copy_packet_text(s_remote_ota_status.update_label,
-				                 sizeof(s_remote_ota_status.update_label),
-				                 update_label, sizeof(update_label));
-				s_remote_ota_status.running_size = running_size;
-				s_remote_ota_status.update_size = update_size;
-			}
-
-			if (status->op != MESH_OTA_OP_DATA ||
-			    status->code != MESH_OTA_STATUS_OK) {
-				copy_packet_text(s_remote_ota_status.remote_message,
-				                 sizeof(s_remote_ota_status.remote_message),
-				                 status->message, sizeof(status->message));
-			}
-
-			if (status->code != MESH_OTA_STATUS_OK) {
-				s_remote_ota_status.state = NODE0_OTA_FAILED;
-				copy_packet_text(s_remote_ota_status.last_error,
-				                 sizeof(s_remote_ota_status.last_error),
-				                 status->message, sizeof(status->message));
-			}
-		}
-
-		if (s_remote_ota_wait.waiting &&
-		    !s_remote_ota_wait.v2 &&
-		    mac_eq(mac, s_remote_ota_wait.mac) &&
-		    status->op == s_remote_ota_wait.op &&
-		    status->seq == s_remote_ota_wait.seq) {
-			s_remote_ota_wait.ack = *status;
-			s_remote_ota_wait.waiting = false;
-			give_ack = true;
-		}
-	}
-	portEXIT_CRITICAL(&s_remote_ota_lock);
-
-	if (give_ack && s_remote_ota_ack_sem) {
-		xSemaphoreGive(s_remote_ota_ack_sem);
-	}
-
-	if (status->op != MESH_OTA_OP_DATA || status->code != MESH_OTA_STATUS_OK) {
-		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
-		copy_packet_text(msg, sizeof(msg), status->message, sizeof(status->message));
-		ESP_LOGI(TAG, "remote OTA status from " MACSTR ": op=%u code=%u seq=%u %s",
-		         MAC2STR(mac), (unsigned)status->op, (unsigned)status->code,
-		         (unsigned)status->seq, msg);
-	}
-}
-
 void log_http_server_remote_ota_status_v2(const uint8_t mac[6],
                                           const mesh_v2_ota_status_payload_t *status,
                                           size_t status_len)
@@ -2630,7 +2490,6 @@ void log_http_server_remote_ota_status_v2(const uint8_t mac[6],
 		}
 
 		if (s_remote_ota_wait.waiting &&
-		    s_remote_ota_wait.v2 &&
 		    mac_eq(mac, s_remote_ota_wait.mac) &&
 		    status->c.op_id == s_remote_ota_wait.op_id &&
 		    ack_op == s_remote_ota_wait.op) {
@@ -2652,35 +2511,6 @@ void log_http_server_remote_ota_status_v2(const uint8_t mac[6],
 		         MAC2STR(mac), (unsigned)ack_op, (unsigned)status->c.status,
 		         (unsigned long)status->c.op_id, msg);
 	}
-}
-
-void log_http_server_remote_reboot_status(const uint8_t mac[6],
-                                          const mesh_reboot_status_packet_t *status)
-{
-	if (!mac || !status) return;
-
-	bool give_ack = false;
-
-	portENTER_CRITICAL(&s_remote_reboot_lock);
-	{
-		if (s_remote_reboot_wait.waiting &&
-		    mac_eq(mac, s_remote_reboot_wait.mac) &&
-		    status->seq == s_remote_reboot_wait.seq) {
-			s_remote_reboot_wait.ack = *status;
-			s_remote_reboot_wait.waiting = false;
-			give_ack = true;
-		}
-	}
-	portEXIT_CRITICAL(&s_remote_reboot_lock);
-
-	if (give_ack && s_remote_reboot_ack_sem) {
-		xSemaphoreGive(s_remote_reboot_ack_sem);
-	}
-
-	char msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
-	copy_packet_text(msg, sizeof(msg), status->message, sizeof(status->message));
-	ESP_LOGI(TAG, "remote reboot status from " MACSTR ": code=%u seq=%u %s",
-	         MAC2STR(mac), (unsigned)status->code, (unsigned)status->seq, msg);
 }
 
 /* ----------------- HTTP handlers ----------------- */
@@ -4476,16 +4306,6 @@ static bool remote_ota_target_from_req(httpd_req_t *req, uint8_t mac[6],
 	return true;
 }
 
-static uint16_t remote_ota_next_seq(void)
-{
-	static uint16_t seq = 0;
-	seq++;
-	if (seq == 0) {
-		seq = 1;
-	}
-	return seq;
-}
-
 static uint32_t remote_ota_next_op_id(void)
 {
 	static uint32_t op_id = 0;
@@ -4502,17 +4322,8 @@ static uint32_t remote_ota_next_op_id(void)
 	return op_id;
 }
 
-typedef enum {
-	REMOTE_OTA_MODE_AUTO = 0,
-	REMOTE_OTA_MODE_V1,
-	REMOTE_OTA_MODE_V2,
-} remote_ota_mode_t;
-
-static bool remote_ota_mode_from_req(httpd_req_t *req, remote_ota_mode_t *mode,
-                                     char *err, size_t err_sz)
+static bool remote_ota_mode_from_req(httpd_req_t *req, char *err, size_t err_sz)
 {
-	if (!mode) return false;
-	*mode = REMOTE_OTA_MODE_AUTO;
 	char q[96] = {0};
 	if (!req || httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) {
 		return true;
@@ -4522,15 +4333,9 @@ static bool remote_ota_mode_from_req(httpd_req_t *req, remote_ota_mode_t *mode,
 		return true;
 	}
 	if (strcmp(v, "auto") == 0) {
-		*mode = REMOTE_OTA_MODE_AUTO;
-		return true;
-	}
-	if (strcmp(v, "v1") == 0) {
-		*mode = REMOTE_OTA_MODE_V1;
 		return true;
 	}
 	if (strcmp(v, "v2") == 0) {
-		*mode = REMOTE_OTA_MODE_V2;
 		return true;
 	}
 	snprintf(err, err_sz, "bad OTA mode");
@@ -4565,114 +4370,11 @@ static bool remote_ota_v2_supported_for_mac(const uint8_t mac[6])
 	return st.reliable_ready && ((caps & MESH_V2_CAP_OTA) != 0);
 }
 
-static void mesh_ota_fill_header(mesh_pkt_hdr_t *h, uint8_t type)
-{
-	if (!h) return;
-
-	memset(h, 0, sizeof(*h));
-	h->magic = MESH_PKT_MAGIC;
-	h->version = MESH_PKT_VERSION;
-	h->type = type;
-	h->counter = ms_now();
-	esp_wifi_get_mac(WIFI_IF_STA, h->src_mac);
-}
-
-static esp_err_t mesh_ota_send_to(const uint8_t to_mac[6], const void *pkt, size_t pkt_len)
-{
-	if (!to_mac || !pkt || pkt_len == 0) {
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)pkt;
-	data.size = pkt_len;
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest));
-	memcpy(dest.addr, to_mac, 6);
-
-	return mesh_v2_link_send(dest.addr, data.data, data.size,
-				 KEEMASH_REL_PRIORITY_HIGH);
-}
-
 static void remote_ota_clear_wait(void)
 {
 	portENTER_CRITICAL(&s_remote_ota_lock);
 	s_remote_ota_wait.waiting = false;
 	portEXIT_CRITICAL(&s_remote_ota_lock);
-}
-
-static esp_err_t remote_ota_send_wait(const uint8_t mac[6], const void *pkt,
-                                      size_t pkt_len, uint8_t op, uint16_t seq,
-                                      mesh_ota_status_packet_t *ack,
-                                      char *err, size_t err_sz)
-{
-	if (!s_remote_ota_ack_sem) {
-		snprintf(err, err_sz, "remote OTA ACK semaphore unavailable");
-		return ESP_ERR_INVALID_STATE;
-	}
-
-	esp_err_t last_err = ESP_ERR_TIMEOUT;
-
-	for (uint32_t attempt = 1; attempt <= REMOTE_OTA_SEND_RETRIES; attempt++) {
-		while (xSemaphoreTake(s_remote_ota_ack_sem, 0) == pdTRUE) {
-		}
-
-		portENTER_CRITICAL(&s_remote_ota_lock);
-		memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
-		s_remote_ota_wait.waiting = true;
-		mac_copy(s_remote_ota_wait.mac, mac);
-		s_remote_ota_wait.op = op;
-		s_remote_ota_wait.seq = seq;
-		portEXIT_CRITICAL(&s_remote_ota_lock);
-
-		esp_err_t send_err = mesh_ota_send_to(mac, pkt, pkt_len);
-		if (send_err != ESP_OK) {
-			remote_ota_clear_wait();
-			last_err = send_err;
-			snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
-			vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
-			continue;
-		}
-
-		if (xSemaphoreTake(s_remote_ota_ack_sem,
-		                   pdMS_TO_TICKS(REMOTE_OTA_ACK_TIMEOUT_MS)) == pdTRUE) {
-			last_err = ESP_OK;
-			break;
-		}
-
-		remote_ota_clear_wait();
-		last_err = ESP_ERR_TIMEOUT;
-		snprintf(err, err_sz, "remote OTA ACK timeout op=%u seq=%u try=%lu/%u",
-		         (unsigned)op, (unsigned)seq, (unsigned long)attempt,
-		         (unsigned)REMOTE_OTA_SEND_RETRIES);
-		vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
-	}
-
-	if (last_err != ESP_OK) {
-		return last_err;
-	}
-
-	mesh_ota_status_packet_t got;
-	portENTER_CRITICAL(&s_remote_ota_lock);
-	got = s_remote_ota_wait.ack;
-	portEXIT_CRITICAL(&s_remote_ota_lock);
-
-	if (ack) {
-		*ack = got;
-	}
-
-	if (got.code != MESH_OTA_STATUS_OK) {
-		char msg[MESH_OTA_STATUS_MSG_MAX + 1];
-		copy_packet_text(msg, sizeof(msg), got.message, sizeof(got.message));
-		snprintf(err, err_sz, "remote OTA error: %s", msg[0] ? msg : "unknown");
-		return ESP_FAIL;
-	}
-
-	return ESP_OK;
 }
 
 static bool remote_ota_v2_wait_ready_for_retry(const uint8_t mac[6])
@@ -4775,7 +4477,6 @@ static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *paylo
 		portENTER_CRITICAL(&s_remote_ota_lock);
 		memset(&s_remote_ota_wait, 0, sizeof(s_remote_ota_wait));
 		s_remote_ota_wait.waiting = true;
-		s_remote_ota_wait.v2 = true;
 		mac_copy(s_remote_ota_wait.mac, mac);
 		s_remote_ota_wait.op = op;
 		s_remote_ota_wait.op_id = op_id;
@@ -4801,7 +4502,7 @@ static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *paylo
 					break;
 				}
 			} else {
-				vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_RETRY_DELAY_MS));
+				vTaskDelay(pdMS_TO_TICKS(REMOTE_OTA_V2_RETRY_DELAY_MS));
 			}
 			continue;
 		}
@@ -4844,111 +4545,6 @@ static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *paylo
 	}
 
 	return ESP_OK;
-}
-
-static uint16_t remote_reboot_next_seq(void)
-{
-	static uint16_t seq = 0;
-	seq++;
-	if (seq == 0) {
-		seq = 1;
-	}
-	return seq;
-}
-
-static void remote_reboot_clear_wait(void)
-{
-	portENTER_CRITICAL(&s_remote_reboot_lock);
-	s_remote_reboot_wait.waiting = false;
-	portEXIT_CRITICAL(&s_remote_reboot_lock);
-}
-
-static esp_err_t remote_reboot_send_wait(const uint8_t mac[6],
-                                         const mesh_reboot_request_packet_t *pkt,
-                                         mesh_reboot_status_packet_t *ack,
-                                         char *err, size_t err_sz)
-{
-	if (!s_remote_reboot_ack_sem) {
-		snprintf(err, err_sz, "remote reboot ACK semaphore unavailable");
-		return ESP_ERR_INVALID_STATE;
-	}
-	if (!mac || !pkt) {
-		snprintf(err, err_sz, "bad remote reboot request");
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	esp_err_t last_err = ESP_ERR_TIMEOUT;
-
-	for (uint32_t attempt = 1; attempt <= REMOTE_REBOOT_SEND_RETRIES; attempt++) {
-		while (xSemaphoreTake(s_remote_reboot_ack_sem, 0) == pdTRUE) {
-		}
-
-		portENTER_CRITICAL(&s_remote_reboot_lock);
-		memset(&s_remote_reboot_wait, 0, sizeof(s_remote_reboot_wait));
-		s_remote_reboot_wait.waiting = true;
-		mac_copy(s_remote_reboot_wait.mac, mac);
-		s_remote_reboot_wait.seq = pkt->seq;
-		portEXIT_CRITICAL(&s_remote_reboot_lock);
-
-		esp_err_t send_err = mesh_ota_send_to(mac, pkt, sizeof(*pkt));
-		if (send_err != ESP_OK) {
-			remote_reboot_clear_wait();
-			last_err = send_err;
-			snprintf(err, err_sz, "mesh send failed: %s", esp_err_to_name(send_err));
-			vTaskDelay(pdMS_TO_TICKS(REMOTE_REBOOT_RETRY_DELAY_MS));
-			continue;
-		}
-
-		if (xSemaphoreTake(s_remote_reboot_ack_sem,
-		                   pdMS_TO_TICKS(REMOTE_REBOOT_ACK_TIMEOUT_MS)) == pdTRUE) {
-			last_err = ESP_OK;
-			break;
-		}
-
-		remote_reboot_clear_wait();
-		last_err = ESP_ERR_TIMEOUT;
-		snprintf(err, err_sz, "remote reboot ACK timeout seq=%u try=%lu/%u",
-		         (unsigned)pkt->seq, (unsigned long)attempt,
-		         (unsigned)REMOTE_REBOOT_SEND_RETRIES);
-		vTaskDelay(pdMS_TO_TICKS(REMOTE_REBOOT_RETRY_DELAY_MS));
-	}
-
-	if (last_err != ESP_OK) {
-		return last_err;
-	}
-
-	mesh_reboot_status_packet_t got;
-	portENTER_CRITICAL(&s_remote_reboot_lock);
-	got = s_remote_reboot_wait.ack;
-	portEXIT_CRITICAL(&s_remote_reboot_lock);
-
-	if (ack) {
-		*ack = got;
-	}
-
-	if (got.code != MESH_REBOOT_STATUS_OK) {
-		char msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
-		copy_packet_text(msg, sizeof(msg), got.message, sizeof(got.message));
-		snprintf(err, err_sz, "remote reboot error: %s", msg[0] ? msg : "unknown");
-		return ESP_FAIL;
-	}
-
-	return ESP_OK;
-}
-
-static void remote_ota_send_abort(const uint8_t mac[6], const char *reason)
-{
-	mesh_ota_abort_packet_t p;
-	memset(&p, 0, sizeof(p));
-
-	mesh_ota_fill_header(&p.h, MESH_OTA_TYPE_ABORT);
-	p.seq = remote_ota_next_seq();
-	if (reason) {
-		strncpy(p.reason, reason, sizeof(p.reason) - 1);
-		p.reason[sizeof(p.reason) - 1] = '\0';
-	}
-
-	mesh_ota_send_to(mac, &p, sizeof(p));
 }
 
 static esp_err_t remote_ota_send_abort_wait_v2(const uint8_t mac[6],
@@ -5905,60 +5501,36 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
-		if (mesh_v2_root_peer_advertises_lossless(target_mac,
-						      MESH_V2_CAP_TYPED_CONTROL)) {
-			uint32_t command_id = mesh_v2_root_next_command_id();
-			mesh_v2_command_result_t command_result = {0};
-			result = mesh_v2_root_send_command(target_mac, command_id,
-							"system.reboot");
-			if (result == ESP_OK)
-				result = wait_peer_command_result(target_mac, command_id,
-							  &command_result, 1000);
-			if (result != ESP_OK) {
-				snprintf(err_msg, sizeof(err_msg),
-					 "reliable reboot result timeout: %s",
-					 esp_err_to_name(result));
-				break;
-			}
-			if (command_result.status != MESH_V2_CONTROL_STATUS_OK) {
-				snprintf(err_msg, sizeof(err_msg), "reliable reboot rejected: %.48s",
-					 command_result.text);
-				result = ESP_FAIL;
-				break;
-			}
-			snprintf(err_msg, sizeof(err_msg), "remote reboot accepted, %s rebooting",
-			         target_tag);
-			ESP_LOGI(TAG, "%s via reliable CONTROL id=%lu", err_msg,
-			         (unsigned long)command_id);
-			xSemaphoreGive(s_ota_mutex);
-			return http_json_ok(req, err_msg);
-		}
-
-		mesh_reboot_request_packet_t p;
-		memset(&p, 0, sizeof(p));
-		mesh_ota_fill_header(&p.h, MESH_REBOOT_TYPE_REQUEST);
-		p.seq = remote_reboot_next_seq();
-		p.delay_ms = REMOTE_REBOOT_DELAY_MS;
-		strncpy(p.reason, "manual web reboot", sizeof(p.reason) - 1);
-		p.reason[sizeof(p.reason) - 1] = '\0';
-
-		ESP_LOGW(TAG, "manual remote reboot requested -> " MACSTR " tag=%s seq=%u",
-		         MAC2STR(target_mac), target_tag, (unsigned)p.seq);
-
-		mesh_reboot_status_packet_t ack;
-		result = remote_reboot_send_wait(target_mac, &p, &ack,
-		                                 err_msg, sizeof(err_msg));
-		if (result != ESP_OK) {
+		if (!mesh_v2_root_peer_advertises_lossless(target_mac,
+						       MESH_V2_CAP_TYPED_CONTROL)) {
+			snprintf(err_msg, sizeof(err_msg),
+				 "target reliable CONTROL session not ready");
 			break;
 		}
 
-		char remote_msg[MESH_REBOOT_STATUS_MSG_MAX + 1];
-		copy_packet_text(remote_msg, sizeof(remote_msg),
-		                 ack.message, sizeof(ack.message));
+		uint32_t command_id = mesh_v2_root_next_command_id();
+		mesh_v2_command_result_t command_result = {0};
+		result = mesh_v2_root_send_command(target_mac, command_id,
+						"system.reboot");
+		if (result == ESP_OK)
+			result = wait_peer_command_result(target_mac, command_id,
+						  &command_result, 1000);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg),
+				 "reliable reboot result timeout: %s",
+				 esp_err_to_name(result));
+			break;
+		}
+		if (command_result.status != MESH_V2_CONTROL_STATUS_OK) {
+			snprintf(err_msg, sizeof(err_msg), "reliable reboot rejected: %.48s",
+				 command_result.text);
+			result = ESP_FAIL;
+			break;
+		}
 		snprintf(err_msg, sizeof(err_msg), "remote reboot accepted, %s rebooting",
 		         target_tag);
-		ESP_LOGI(TAG, "%s: %s", err_msg,
-		         remote_msg[0] ? remote_msg : "OK");
+		ESP_LOGI(TAG, "%s via reliable CONTROL id=%lu", err_msg,
+		         (unsigned long)command_id);
 
 		xSemaphoreGive(s_ota_mutex);
 		return http_json_ok(req, err_msg);
@@ -6185,66 +5757,6 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 	return http_json_error(req, "400 Bad Request", err_msg);
 }
 
-static esp_err_t remote_ota_send_chunks_from_buffer(const uint8_t mac[6],
-                                                    const uint8_t *buf,
-                                                    size_t len,
-                                                    uint32_t total_len,
-                                                    uint32_t *written,
-                                                    char *err, size_t err_sz)
-{
-	if (!buf || !written) {
-		snprintf(err, err_sz, "bad remote OTA chunk buffer");
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	size_t pos = 0;
-	while (pos < len) {
-		size_t remain = len - pos;
-		uint16_t chunk_len = (uint16_t)(remain > MESH_OTA_CHUNK_MAX
-		                                ? MESH_OTA_CHUNK_MAX
-		                                : remain);
-		if ((uint32_t)chunk_len > total_len - *written) {
-			snprintf(err, err_sz, "remote OTA chunk exceeds image size");
-			return ESP_ERR_INVALID_SIZE;
-		}
-
-		mesh_ota_data_packet_t p;
-		memset(&p, 0, sizeof(p));
-		mesh_ota_fill_header(&p.h, MESH_OTA_TYPE_DATA);
-		p.seq = remote_ota_next_seq();
-		p.len = chunk_len;
-		p.offset = *written;
-		memcpy(p.data, buf + pos, chunk_len);
-
-		mesh_ota_status_packet_t ack;
-		esp_err_t result = remote_ota_send_wait(
-			mac,
-			&p,
-			offsetof(mesh_ota_data_packet_t, data) + chunk_len,
-			MESH_OTA_OP_DATA,
-			p.seq,
-			&ack,
-			err,
-			err_sz);
-		if (result != ESP_OK) {
-			return result;
-		}
-
-		uint32_t expected = *written + chunk_len;
-		if (ack.offset != expected) {
-			snprintf(err, err_sz, "remote OTA offset mismatch %lu/%lu",
-			         (unsigned long)ack.offset, (unsigned long)expected);
-			return ESP_FAIL;
-		}
-
-		*written = ack.offset;
-		remote_ota_status_progress(*written);
-		pos += chunk_len;
-	}
-
-	return ESP_OK;
-}
-
 static esp_err_t remote_ota_send_chunks_v2_from_buffer(const uint8_t mac[6],
                                                        const uint8_t *buf,
                                                        size_t len,
@@ -6336,7 +5848,7 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	bool telemetry_ready = route_ready && telemetry_recent;
 	bool v2_supported = target_supported && remote_ota_v2_supported_for_mac(mac);
 	bool v2_ready = route_ready && v2_supported;
-	bool supported = target_supported && route_ready;
+	bool supported = v2_ready;
 	const char *fallback_reason = "";
 	if (target_ok && target_supported && !route_ready) {
 		strncpy(target_err, "target route not ready", sizeof(target_err) - 1);
@@ -6346,7 +5858,9 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 		target_err[sizeof(target_err) - 1] = '\0';
 	}
 	if (target_supported && route_ready && !v2_supported) {
-		fallback_reason = "target has no OTA v2 capability";
+		fallback_reason = "reliable OTA v2 session not ready";
+		strncpy(target_err, fallback_reason, sizeof(target_err) - 1);
+		target_err[sizeof(target_err) - 1] = '\0';
 	}
 
 	char mac_hex[13] = {0};
@@ -6365,11 +5879,10 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	uint32_t written = target_match ? status.written_bytes : 0;
 	const char *last_result = target_match ? status.last_result : "";
 	const char *last_error = target_match ? status.last_error : "";
-	const char *effective_error = (!route_ready && target_ok && target_supported)
+	const char *effective_error = (!v2_ready && target_ok && target_supported)
 		? target_err : (target_ok ? last_error : target_err);
 	const char *remote_message = target_match ? status.remote_message : "";
-	const char *mode = target_match && status.v2_active ? "v2" :
-	                   (target_match && status.state != NODE0_OTA_IDLE ? "v1" : "auto");
+	const char *mode = target_match && status.v2_active ? "v2" : "auto";
 	uint32_t op_id = target_match ? status.v2_op_id : 0;
 	uint32_t chunk_size = target_match && status.v2_chunk_size ?
 	                      status.v2_chunk_size : REMOTE_OTA_V2_CHUNK_SIZE;
@@ -6463,7 +5976,6 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	char err_msg[96] = "remote OTA failed";
 	uint8_t *buf = NULL;
 	bool remote_started = false;
-	bool use_v2 = false;
 	uint32_t v2_op_id = 0;
 	esp_err_t result = ESP_FAIL;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
@@ -6481,9 +5993,7 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 #endif
 
 	do {
-		remote_ota_mode_t requested_mode = REMOTE_OTA_MODE_AUTO;
-		if (!remote_ota_mode_from_req(req, &requested_mode,
-		                              err_msg, sizeof(err_msg))) {
+		if (!remote_ota_mode_from_req(req, err_msg, sizeof(err_msg))) {
 			break;
 		}
 		if (!remote_ota_target_from_req(req, target_mac, target_tag, sizeof(target_tag),
@@ -6504,23 +6014,10 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
 		bool v2_supported = remote_ota_v2_supported_for_mac(target_mac);
-		bool v2_advertised = mesh_v2_root_peer_advertises_lossless(
-			target_mac, MESH_V2_CAP_OTA);
-		if (v2_advertised && requested_mode == REMOTE_OTA_MODE_V1) {
-			snprintf(err_msg, sizeof(err_msg),
-			         "OTA v1 disabled for lossless target");
-			break;
-		}
-		if (v2_advertised && !v2_supported) {
-			snprintf(err_msg, sizeof(err_msg),
-			         "target OTA v2 session not ready");
-			break;
-		}
-		if (requested_mode == REMOTE_OTA_MODE_V2 && !v2_supported) {
+		if (!v2_supported) {
 			snprintf(err_msg, sizeof(err_msg), "target OTA v2 not ready");
 			break;
 		}
-		use_v2 = requested_mode != REMOTE_OTA_MODE_V1 && v2_supported;
 
 		size_t total_len = req->content_len;
 		if (total_len == 0 || total_len > UINT32_MAX) {
@@ -6564,7 +6061,7 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 
 		remote_ota_status_begin(target_mac, target_tag, (uint32_t)total_len);
 
-		if (use_v2) {
+		{
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 			if (debug_route_loss_after_sends > 0) {
 				remote_ota_v2_debug_set_route_loss_after_sends(
@@ -6702,87 +6199,13 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 			return http_json_ok(req, err_msg);
 		}
 
-		mesh_ota_begin_packet_t begin;
-		memset(&begin, 0, sizeof(begin));
-		mesh_ota_fill_header(&begin.h, MESH_OTA_TYPE_BEGIN);
-		begin.seq = remote_ota_next_seq();
-		begin.chunk_size = MESH_OTA_CHUNK_MAX;
-		begin.image_size = (uint32_t)total_len;
-		copy_packet_text(begin.project_name, sizeof(begin.project_name),
-		                 new_desc.project_name, sizeof(new_desc.project_name));
-		copy_packet_text(begin.version, sizeof(begin.version),
-		                 new_desc.version, sizeof(new_desc.version));
-
-		mesh_ota_status_packet_t ack;
-		remote_started = true;
-		result = remote_ota_send_wait(target_mac, &begin, sizeof(begin),
-		                              MESH_OTA_OP_BEGIN, begin.seq,
-		                              &ack, err_msg, sizeof(err_msg));
-		if (result != ESP_OK) {
-			break;
-		}
-
-		uint32_t written = 0;
-		result = remote_ota_send_chunks_from_buffer(target_mac, buf, first_have,
-		                                            (uint32_t)total_len, &written,
-		                                            err_msg, sizeof(err_msg));
-		if (result != ESP_OK) {
-			break;
-		}
-
-		while (written < total_len) {
-			size_t to_read = total_len - written;
-			if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
-
-			int r = ota_recv_retry(req, buf, to_read);
-			if (r <= 0) {
-				snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
-				result = ESP_FAIL;
-				break;
-			}
-
-			result = remote_ota_send_chunks_from_buffer(target_mac, buf, (size_t)r,
-			                                            (uint32_t)total_len, &written,
-			                                            err_msg, sizeof(err_msg));
-			if (result != ESP_OK) {
-				break;
-			}
-		}
-		if (result != ESP_OK) {
-			break;
-		}
-
-		mesh_ota_end_packet_t end;
-		memset(&end, 0, sizeof(end));
-		mesh_ota_fill_header(&end.h, MESH_OTA_TYPE_END);
-		end.seq = remote_ota_next_seq();
-		end.image_size = (uint32_t)total_len;
-
-		result = remote_ota_send_wait(target_mac, &end, sizeof(end),
-		                              MESH_OTA_OP_END, end.seq,
-		                              &ack, err_msg, sizeof(err_msg));
-		if (result != ESP_OK) {
-			break;
-		}
-
-		snprintf(err_msg, sizeof(err_msg), "remote OTA OK, %s rebooting", target_tag);
-		remote_ota_status_finish(NODE0_OTA_REBOOTING, err_msg);
-		ESP_LOGI(TAG, "%s", err_msg);
-
-		free(buf);
-		xSemaphoreGive(s_ota_mutex);
-		return http_json_ok(req, err_msg);
 	} while (0);
 
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 	remote_ota_v2_debug_clear_faults();
 #endif
 	if (remote_started) {
-		if (use_v2) {
-			remote_ota_send_abort_v2(target_mac, v2_op_id, err_msg);
-		} else {
-			remote_ota_send_abort(target_mac, err_msg);
-		}
+		remote_ota_send_abort_v2(target_mac, v2_op_id, err_msg);
 	}
 	if (buf) {
 		free(buf);
@@ -8014,7 +7437,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
 		"  if(!j)return;\n"
 		"  const local=isLocalSelected();otaEnabled=!!j.enabled;otaSupported=local||!!j.supported;\n"
 		"  if(local){updateOtaSlotFromStatus(j);otaStatusText=otaEnabled?'':'PIN not set';}\n"
-		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');const mode=j.mode==='v2'?'OTA v2':(j.v2_supported?'OTA v2':'OTA v1 fallback');if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+mode+' '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='';}\n"
+		"  else{const hasSlot=!!(j.running_label||j.update_label||j.running_size||j.update_size);if(otaSupported||hasSlot)updateOtaSlotFromStatus(j);else setOtaSlot('A/B ?','otaSlotUnknown');const mode='OTA v2';if(!otaSupported)otaStatusText=j.last_error||'';else if(j.busy&&j.total_bytes>0)otaStatusText='remote '+mode+' '+Math.round((j.written_bytes||0)*100/j.total_bytes)+'%';else if(j.state==='failed')otaStatusText=j.last_error||'remote failed';else if(j.state==='success'||j.state==='rebooting')otaStatusText=j.last_result||j.state;else otaStatusText='';}\n"
 		"  updateOtaUi();\n"
 		"}\n"
 		"function applyTasks(j,mac,raw){\n"
@@ -8501,11 +7924,6 @@ esp_err_t log_http_server_init(void)
 	if (!s_remote_ota_ack_sem) {
 		ESP_LOGW(TAG, "remote OTA ACK semaphore allocation failed; remote OTA disabled");
 	}
-	s_remote_reboot_ack_sem = xSemaphoreCreateBinary();
-	if (!s_remote_reboot_ack_sem) {
-		ESP_LOGW(TAG, "remote reboot ACK semaphore allocation failed; remote reboot disabled");
-	}
-
 	s_log_stream_mutex = xSemaphoreCreateMutex();
 	if (!s_log_stream_mutex) {
 		ESP_LOGW(TAG, "log stream mutex allocation failed; /log/stream disabled");

@@ -17,9 +17,7 @@
 #include "nvs_flash.h"
 #include "lwip/ip4_addr.h"
 
-#include "legacy_proto.h"
 #include "stack_monitor.h"
-#include "uart_bridge.h"
 #include "log_http_server.h"
 #include "keelink_ble.h"
 #include "time_sync.h"
@@ -35,9 +33,7 @@
 /* -------------------------------------------------------------------------- */
 
 #define RX_SIZE          (256)
-#define TX_INTERVAL_MS   (5000)
-#define MESH_TX_TASK_STACK (2048U)
-#define MESH_RX_TASK_STACK (6144U)
+#define MESH_RX_TASK_STACK (10240U)
 #define NODE0_WIFI_MTXON_STACK_EXTRA_WORDS (1000U)
 #define NODE0_WIFI_MRX_STACK_EXTRA_WORDS   (500U)
 //#define FIXED_ROOT  1   // node0 only
@@ -154,20 +150,6 @@ static void node0_install_wifi_task_stack_patch(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Minimal local protocol                                                    */
-/* -------------------------------------------------------------------------- */
-/*
- * Packet format:
- *  magic    - 0xA5, identifies our packet
- *  version  - protocol version
- *  type     - packet type
- *  reserved - alignment / future use
- *  counter  - per-node packet counter
- *  src_mac  - sender MAC
- *  payload  - small zero-terminated text payload
- */
-
-/* -------------------------------------------------------------------------- */
 /*  Prototypes                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -181,7 +163,6 @@ static void ip_event_handler(void *arg,
                              int32_t event_id,
                              void *event_data);
 
-static void mesh_tx_task(void *arg);
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
 static esp_err_t node0_restart_dhcp_client(void);
@@ -189,24 +170,6 @@ static esp_err_t node0_restart_dhcp_client(void);
 #if CONFIG_NODE0_STATIC_IP_ENABLE
 static esp_err_t node0_apply_static_ip(void);
 #endif
-
-static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz)
-{
-	size_t n = 0;
-
-	if (!dst || dst_sz == 0) {
-		return;
-	}
-
-	if (src && src_sz > 0) {
-		n = strnlen(src, src_sz);
-		if (n >= dst_sz) {
-			n = dst_sz - 1;
-		}
-		memcpy(dst, src, n);
-	}
-	dst[n] = '\0';
-}
 
 static esp_err_t copy_mesh_config_string(uint8_t *dst, size_t dst_sz,
                                          const char *src, size_t *out_len,
@@ -233,33 +196,6 @@ static esp_err_t copy_mesh_config_string(uint8_t *dst, size_t dst_sz,
 	}
 	return ESP_OK;
 }
-
-#define I_AM_SINGLE_SENDER     0      // debug single-target sender; production node0 must keep this disabled
-
-// -----------------------------SINGLE_SENDER---------------------------------------
-#if I_AM_SINGLE_SENDER
-static const uint8_t NODE1_MAC[6] = { 0xA0, 0xDD, 0x6C, 0x0F, 0x31, 0xE4 };
-
-static esp_err_t mesh_send_single(const uint8_t to_mac[6],
-                                  const mesh_packet_t *pkt)
-{
-    mesh_addr_t dest = {0};
-    mesh_data_t data;
-
-    // Fill destination address.
-    memcpy(dest.addr, to_mac, 6);
-
-    data.data  = (uint8_t *)pkt;
-    data.size  = sizeof(*pkt);
-    data.proto = MESH_PROTO_BIN;
-    data.tos   = MESH_TOS_P2P;
-
-    // Normal P2P send; ESP-MESH resolves the route.
-    return mesh_v2_link_send(dest.addr, data.data, data.size,
-                             KEEMASH_REL_PRIORITY_NORMAL);
-}
-#endif
-
 
 static esp_err_t node0_restart_dhcp_client(void)
 {
@@ -364,118 +300,6 @@ static esp_err_t node0_apply_static_ip(void)
 #endif
 
 
-#define SINGLE_TX_INTERVAL_MS  5000   // 5 seconds
-
-// Keep this toggle so the debug sender can be enabled per build.
-#if I_AM_SINGLE_SENDER
-static void mesh_single_tx_task(void *arg)
-{
-    mesh_packet_t pkt;
-    esp_err_t     err;
-    uint32_t      counter = 0;
-
-    TickType_t last_wake = xTaskGetTickCount();
-
-    while (is_running) {
-        // Wait exactly one interval after the previous tick.
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SINGLE_TX_INTERVAL_MS));
-
-        // Do nothing before the node is in the mesh.
-        if (!is_mesh_connected) {
-            continue;
-        }
-
-        counter++;
-
-        memset(&pkt, 0, sizeof(pkt));
-        pkt.magic   = MESH_PKT_MAGIC;
-        pkt.version = MESH_PKT_VERSION;
-        pkt.type    = MESH_PKT_TYPE_TEXT;
-        pkt.counter = counter;
-
-        // This node MAC for diagnostics.
-        esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-
-        snprintf(pkt.payload, sizeof(pkt.payload),
-                 "single %lu", (unsigned long)counter);
-
-        err = mesh_send_single(NODE1_MAC, &pkt);
-        if (err == ESP_OK) {
-            ESP_LOGI(MESH_TAG,
-                     "SINGLE TX -> " MACSTR " cnt=%lu payload=\"%s\"",
-                     MAC2STR(NODE1_MAC),
-                     (unsigned long)counter,
-                     pkt.payload);
-        } else {
-            ESP_LOGE(MESH_TAG,
-                     "mesh_send_single failed: 0x%x (%s)",
-                     err, esp_err_to_name(err));
-        }
-    }
-
-    vTaskDelete(NULL);
-}
-#endif
-
-
-/* -------------------------------------------------------------------------- */
-/*  TX task: periodically send a packet to root                                */
-/* -------------------------------------------------------------------------- */
-
-static void mesh_tx_task(void *arg)
-{
-	mesh_packet_t pkt;
-	mesh_data_t   data;
-	mesh_addr_t   dest;
-	esp_err_t     err;
-	uint32_t      counter = 0;
-
-	data.data  = (uint8_t *)&pkt;
-	data.proto = MESH_PROTO_BIN;
-	data.tos   = MESH_TOS_P2P;
-
-	while (is_running) {
-		vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
-
-		// Send only when connected to mesh and not acting as root.
-		if (!is_mesh_connected || esp_mesh_is_root()) {
-			continue;
-		}
-
-		counter++;
-
-		memset(&pkt, 0, sizeof(pkt));
-		pkt.magic   = MESH_PKT_MAGIC;
-		pkt.version = MESH_PKT_VERSION;
-		pkt.type    = MESH_PKT_TYPE_TEXT;
-		pkt.counter = counter;
-
-		// This node MAC on the STA interface.
-		esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-
-		snprintf(pkt.payload, sizeof(pkt.payload),
-		         "Hello %lu", (unsigned long)counter);
-
-		data.size = sizeof(pkt);
-
-		// 00:00:00:00:00:00 means "send to root".
-		memset(&dest, 0, sizeof(dest));
-
-		err = mesh_v2_link_send(dest.addr, data.data, data.size,
-					KEEMASH_REL_PRIORITY_NORMAL);
-		if (err == ESP_OK) {
-			ESP_LOGI(MESH_TAG,
-			         "TX -> ROOT: cnt=%lu, payload=\"%s\"",
-			         (unsigned long)counter, pkt.payload);
-		} else {
-			ESP_LOGE(MESH_TAG,
-			         "esp_mesh_send failed: 0x%x (%s)",
-			         err, esp_err_to_name(err));
-		}
-	}
-	vTaskDelete(NULL);
-}
-
 /* -------------------------------------------------------------------------- */
 /*  RX task: receive packets from other nodes                                  */
 /* -------------------------------------------------------------------------- */
@@ -512,79 +336,8 @@ static void mesh_rx_task(void *arg)
 			continue;
 		}
 
-		// Our protocol?
-		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION) {
-
-			// 1) NodeInfo for menu/listing.
-			if (h->type == MESH_LOG_TYPE_NODEINFO) {
-				if (data.size >= sizeof(mesh_nodeinfo_v2_packet_t)) {
-					const mesh_nodeinfo_v2_packet_t *p = (const mesh_nodeinfo_v2_packet_t *)rx_buf;
-					char tag[sizeof(p->tag) + 1];
-					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
-					log_http_server_node_seen_uptime(p->h.src_mac, tag, true, p->uptime_s);
-				} else if (data.size >= sizeof(mesh_nodeinfo_packet_t)) {
-					const mesh_nodeinfo_packet_t *p = (const mesh_nodeinfo_packet_t *)rx_buf;
-					char tag[sizeof(p->tag) + 1];
-					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
-					log_http_server_node_seen(p->h.src_mac, tag);
-				}
-				continue;
-			}
-
-			// 2) Log line. The web log layer filters by selected node.
-			if (h->type == MESH_LOG_TYPE_LINE) {
-				if (data.size >= sizeof(mesh_log_line_packet_t)) {
-					const mesh_log_line_packet_t *p = (const mesh_log_line_packet_t *)rx_buf;
-					char tag[sizeof(p->tag) + 1];
-					char line[sizeof(p->line) + 1];
-					copy_packet_text(tag, sizeof(tag), p->tag, sizeof(p->tag));
-					copy_packet_text(line, sizeof(line), p->line, sizeof(p->line));
-					log_http_server_node_seen(p->h.src_mac, tag);          // keep node visible in the list
-					log_http_server_remote_line(p->h.src_mac, tag, line); // buffered only when selected
-				}
-				continue;
-			}
-
-			// 4) Legacy TEXT packet.
-			if (h->type == MESH_OTA_TYPE_STATUS) {
-				if (data.size >= sizeof(mesh_ota_status_packet_t)) {
-					const mesh_ota_status_packet_t *p = (const mesh_ota_status_packet_t *)rx_buf;
-					log_http_server_remote_ota_status(p->h.src_mac, p, data.size);
-				}
-				continue;
-			}
-
-			if (h->type == MESH_REBOOT_TYPE_STATUS) {
-				if (data.size >= sizeof(mesh_reboot_status_packet_t)) {
-					const mesh_reboot_status_packet_t *p = (const mesh_reboot_status_packet_t *)rx_buf;
-					log_http_server_remote_reboot_status(p->h.src_mac, p);
-				}
-				continue;
-			}
-
-			if (h->type == MESH_PKT_TYPE_TEXT) {
-				if (data.size >= sizeof(mesh_packet_t)) {
-					const mesh_packet_t *p = (const mesh_packet_t *)rx_buf;
-					char payload[33];
-					memcpy(payload, p->payload, 32);
-					payload[32] = '\0';
-
-					ESP_LOGI(MESH_TAG, "RX TEXT: cnt=%lu from " MACSTR " payload=\"%s\"",
-						(unsigned long)p->counter, MAC2STR(from.addr), payload);
-
-					// Hook legacy_handle_text() here if needed again.
-					legacy_handle_text(payload);
-				}
-				continue;
-			}
-
-			// Other packet types in our protocol.
-			ESP_LOGI(MESH_TAG, "RX type=%u from " MACSTR " len=%u", h->type, MAC2STR(from.addr), (unsigned)data.size);
-			continue;
-		}
-
-		// Unknown protocol; keep ignoring it for now.
-		ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " len=%u", MAC2STR(from.addr), (unsigned)data.size);
+		ESP_LOGW(MESH_TAG, "RX rejected non-V2 packet from " MACSTR " len=%u",
+		         MAC2STR(from.addr), (unsigned)data.size);
 	}
 	vTaskDelete(NULL);
 }
@@ -600,11 +353,7 @@ static esp_err_t mesh_comm_start(void)
 
 	if (!started) {
 		started = true;
-		xTaskCreate(mesh_tx_task, "mesh_tx", MESH_TX_TASK_STACK, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", MESH_RX_TASK_STACK, NULL, 5, NULL);
-#if I_AM_SINGLE_SENDER
-        xTaskCreate(mesh_single_tx_task,"mesh_single_tx",4096, NULL, 5, NULL);
-#endif
         stack_monitor_start(3);
 	}
 	return ESP_OK;
@@ -927,8 +676,6 @@ void app_main(void)
 	         esp_mesh_is_ps_enabled());
 	log_internal_heap("after mesh start");
 
-	uart_bridge_init();
-	uart_bridge_start();
 	mesh_time_sync_init();
 	
 }
