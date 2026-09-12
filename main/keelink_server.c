@@ -52,6 +52,7 @@
 #define KEELINK_LOG_BACKLOG_LOW 64U
 #define KEELINK_PRIORITY_LOG 3U
 #define KEELINK_FABRIC_MESSAGE_SLOTS 4U
+#define KEELINK_GRAPH_NODE_MAX 25U
 #define KEELINK_BLE_FALLBACK_DELAY_MS 3000U
 #define KEELINK_BLE_RETRY_MS 5000U
 
@@ -135,6 +136,10 @@ static keelink_ble_send_fn s_ble_sender;
 static uint32_t s_pair_fail_count;
 static uint32_t s_pair_block_until_ms;
 static uint32_t s_log_dropped;
+static uint64_t s_graph_revision;
+static log_http_graph_node_t s_graph_nodes_cache[KEELINK_GRAPH_NODE_MAX];
+static size_t s_graph_nodes_cache_count;
+static bool s_graph_force_publish = true;
 
 extern const unsigned char node0_https_servercert_pem_start[] asm("_binary_node0_https_servercert_pem_start");
 extern const unsigned char node0_https_servercert_pem_end[] asm("_binary_node0_https_servercert_pem_end");
@@ -530,8 +535,108 @@ static void publish_log_backpressure_gap(uint32_t dropped)
 		payload, writer.length, 0);
 }
 
+static void publish_fabric_graph_snapshot(void)
+{
+	if (!fabric_session_active()) return;
+	log_http_graph_node_t nodes[KEELINK_GRAPH_NODE_MAX] = {0};
+	size_t node_count = log_http_server_graph_nodes(nodes,
+		sizeof(nodes) / sizeof(nodes[0]));
+	if (node_count == 0) return;
+
+	bool force;
+	lock();
+	force = s_graph_force_publish;
+	unlock();
+	bool changed = node_count != s_graph_nodes_cache_count;
+	for (size_t i = 0; !changed && i < node_count; i++) {
+		changed = memcmp(nodes[i].mac, s_graph_nodes_cache[i].mac,
+			sizeof(nodes[i].mac)) != 0 ||
+			strncmp(nodes[i].tag, s_graph_nodes_cache[i].tag,
+				sizeof(nodes[i].tag)) != 0 ||
+			nodes[i].boot_session != s_graph_nodes_cache[i].boot_session ||
+			nodes[i].online != s_graph_nodes_cache[i].online;
+	}
+	if (!force && !changed) return;
+
+	const size_t nodes_per_page = 4U;
+	uint32_t page_count = (uint32_t)((node_count + nodes_per_page - 1U) /
+		nodes_per_page);
+	uint64_t revision;
+	lock();
+	revision = ++s_graph_revision;
+	unlock();
+
+	uint8_t root_mac[6];
+	esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+	keemash_fabric_id_t root_id;
+	if (keemash_fabric_legacy_node_id(root_mac, root_mac, &root_id) != ESP_OK) {
+		return;
+	}
+
+	bool published = true;
+	for (uint32_t page = 0; page < page_count; page++) {
+		keemash_fabric_envelope_t *message = fabric_message_acquire();
+		if (!message) {
+			published = false;
+			break;
+		}
+		message->protocol_version = KEEMASH_FABRIC_VERSION;
+		message->traffic_class =
+			keemash_fabric_v2_TrafficClass_TRAFFIC_GRAPH;
+		message->delivery = keemash_fabric_v2_DeliveryMode_DELIVERY_RELIABLE;
+		message->has_source_node_id = true;
+		message->source_node_id = root_id;
+		message->graph_revision = revision;
+		message->which_body = keemash_fabric_v2_Envelope_graph_tag;
+		message->body.graph.revision = revision;
+		message->body.graph.page_index = page;
+		message->body.graph.page_count = page_count;
+
+		size_t first = (size_t)page * nodes_per_page;
+		size_t limit = first + nodes_per_page;
+		if (limit > node_count) limit = node_count;
+		for (size_t i = first; i < limit; i++) {
+			keemash_fabric_v2_NodeDescriptor *descriptor =
+				&message->body.graph.nodes[message->body.graph.nodes_count++];
+			descriptor->has_node_id = true;
+			if (keemash_fabric_legacy_node_id(root_mac, nodes[i].mac,
+				&descriptor->node_id) != ESP_OK) {
+				message->body.graph.nodes_count--;
+				continue;
+			}
+			descriptor->route_mac.size = sizeof(nodes[i].mac);
+			memcpy(descriptor->route_mac.bytes, nodes[i].mac,
+				sizeof(nodes[i].mac));
+			snprintf(descriptor->tag, sizeof(descriptor->tag), "%s",
+				nodes[i].tag);
+			bool local = memcmp(nodes[i].mac, root_mac, sizeof(root_mac)) == 0;
+			descriptor->boot_session = local ? s_session_id : nodes[i].boot_session;
+			if (local) {
+				descriptor->core_version = KEEMASH_MESH_CORE_VERSION;
+				snprintf(descriptor->firmware_version,
+					sizeof(descriptor->firmware_version), "%s",
+					esp_app_get_description()->version);
+			}
+			descriptor->online = nodes[i].online;
+		}
+		if (fabric_replay_append(message, 1) == 0) published = false;
+		fabric_message_release(message);
+		if (!published) break;
+	}
+	lock();
+	if (published) {
+		memcpy(s_graph_nodes_cache, nodes, node_count * sizeof(nodes[0]));
+		s_graph_nodes_cache_count = node_count;
+		s_graph_force_publish = false;
+	} else {
+		s_graph_force_publish = true;
+	}
+	unlock();
+}
+
 static void publish_inventory_snapshot(void)
 {
+	publish_fabric_graph_snapshot();
 	char *json = heap_caps_malloc(12288, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!json) return;
 	size_t json_len = log_http_server_node_list_json(json, 12288);
@@ -954,6 +1059,7 @@ static esp_err_t handle_fabric_hello(httpd_req_t *req,
 		s_ws_protocol = KEELINK_WS_PROTOCOL_FABRIC_V2;
 		s_ws_ready = true;
 		s_next_send_id = s_event_id + 1U;
+		s_graph_force_publish = true;
 	}
 	unlock();
 	if (err == ESP_OK) {
@@ -1209,11 +1315,13 @@ static esp_err_t info_get(httpd_req_t *req)
 	char body[768];
 	bool wss_active;
 	uint32_t wss_connect_count;
+	uint64_t graph_revision;
 	bool ble_fallback_active;
 	uint32_t ws_down_age_ms;
 	lock();
 	wss_active = s_ws_ready && s_ws_fd >= 0;
 	wss_connect_count = s_wss_connect_count;
+	graph_revision = s_graph_revision;
 	ble_fallback_active = s_ble_fallback_active;
 	ws_down_age_ms = s_ws_down_since_ms ? now_ms() - s_ws_down_since_ms : 0;
 	unlock();
@@ -1222,13 +1330,15 @@ static esp_err_t info_get(httpd_req_t *req)
 		"\"fabric_transports\":[\"wss\"],\"quic\":false,\"root_mac\":\"%s\","
 		"\"paired\":%s,\"wss\":true,\"wss_active\":%s,"
 		"\"wss_seen\":%s,\"wss_connect_count\":%" PRIu32 ","
+		"\"graph_revision\":%" PRIu64 ","
 		"\"ws_down_age_ms\":%" PRIu32 ","
 		"\"ble_fallback_active\":%s,\"ble\":%s,"
 		"\"ble_state\":\"%s\",\"ble_error\":%d,"
 		"\"ble_boot_checkpoint\":%" PRIu32 ",\"reset_reason\":%d,"
 		"\"tls_public_key_sha256\":\"%s\",\"max_frame\":%u}",
 		mac_text, paired ? "true" : "false", wss_active ? "true" : "false",
-		wss_connect_count ? "true" : "false", wss_connect_count, ws_down_age_ms,
+		wss_connect_count ? "true" : "false", wss_connect_count,
+		graph_revision, ws_down_age_ms,
 		ble_fallback_active ? "true" : "false",
 		keelink_ble_ready() ? "true" : "false", keelink_ble_state(),
 		(int)keelink_ble_last_error(), keelink_ble_boot_checkpoint(),

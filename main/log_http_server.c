@@ -3897,6 +3897,45 @@ size_t log_http_server_node_list_json(char *out, size_t capacity)
 	return len;
 }
 
+size_t log_http_server_graph_nodes(log_http_graph_node_t *out, size_t capacity)
+{
+	if (!out || capacity == 0) return 0;
+
+	mesh_addr_t routes[LOG_HTTP_MAX_NODES];
+	int route_count = 0;
+	uint32_t now = ms_now();
+	if (esp_mesh_get_routing_table(routes, sizeof(routes), &route_count) != ESP_OK) {
+		route_count = 0;
+	}
+	if (route_count > LOG_HTTP_MAX_NODES) route_count = LOG_HTTP_MAX_NODES;
+	note_route_table_nodes(routes, route_count, now);
+
+	size_t count = 0;
+	mac_copy(out[count].mac, s_local_mac);
+	copy_tag(out[count].tag, sizeof(out[count].tag), s_local_tag);
+	out[count].online = true;
+	count++;
+
+	portENTER_CRITICAL(&s_nodes_lock);
+	for (uint32_t i = 0; i < s_nodes_count && count < capacity; i++) {
+		if (mac_eq(s_nodes[i].mac, s_local_mac)) continue;
+		mac_copy(out[count].mac, s_nodes[i].mac);
+		copy_tag(out[count].tag, sizeof(out[count].tag), s_nodes[i].tag);
+		out[count].online = route_table_contains(routes, route_count,
+			s_nodes[i].mac);
+		count++;
+	}
+	portEXIT_CRITICAL(&s_nodes_lock);
+
+	for (size_t i = 1; i < count; i++) {
+		mesh_v2_root_stats_t stats = {0};
+		if (mesh_v2_root_stats_for_mac(out[i].mac, &stats)) {
+			out[i].boot_session = stats.node_session_id;
+		}
+	}
+	return count;
+}
+
 static size_t append_local_ota_json(char *out, size_t cap, size_t pos)
 {
 	node0_ota_status_t status;

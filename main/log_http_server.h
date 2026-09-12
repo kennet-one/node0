@@ -44,6 +44,15 @@ void log_http_server_command_status(const char *state, const char *owner,
 bool log_http_server_admin_pin_valid(httpd_req_t *req);
 size_t log_http_server_node_list_json(char *out, size_t capacity);
 
+typedef struct {
+	uint8_t mac[6];
+	char tag[16];
+	uint32_t boot_session;
+	bool online;
+} log_http_graph_node_t;
+
+size_t log_http_server_graph_nodes(log_http_graph_node_t *out, size_t capacity);
+
 #ifdef __cplusplus
 }
 #endif
