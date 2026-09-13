@@ -120,6 +120,7 @@ static uint64_t s_session_id;
 static int s_ws_fd = -1;
 static bool s_ws_ready;
 static keelink_ws_protocol_t s_ws_protocol;
+static bool s_fabric_negotiated;
 static keemash_fabric_id_t s_controller_id;
 static keemash_fabric_id_t s_transport_session;
 static uint32_t s_wss_connect_count;
@@ -132,10 +133,11 @@ static uint32_t s_ws_down_since_ms;
 static uint32_t s_ble_retry_after_ms;
 static bool s_log_subscribed;
 static uint32_t s_next_send_id;
+static uint32_t s_last_stream_event_id;
 static bool s_resume_active;
 static uint32_t s_resume_end_id;
 static uint64_t s_resume_cursor[KEELINK_TRAFFIC_CLASS_SLOTS];
-static bool fabric_session_active(void);
+static bool fabric_queue_enabled(void);
 static bool s_inventory_dirty;
 static uint32_t s_last_heartbeat_ms;
 static uint32_t s_last_ws_ping_ms;
@@ -210,7 +212,6 @@ static void ws_mark_down(int fd)
 		s_ws_protocol = KEELINK_WS_PROTOCOL_NONE;
 		memset(&s_controller_id, 0, sizeof(s_controller_id));
 		memset(&s_transport_session, 0, sizeof(s_transport_session));
-		s_log_subscribed = false;
 		if (s_wss_connect_count) s_ws_down_since_ms = now_ms();
 	}
 	unlock();
@@ -274,6 +275,7 @@ static void authenticated_sessions_close(void)
 	int fd = s_ws_fd;
 	s_ws_fd = -1;
 	s_ws_ready = false;
+	s_fabric_negotiated = false;
 	s_ws_down_since_ms = 0;
 	s_ble_fallback_active = false;
 	s_log_subscribed = false;
@@ -553,7 +555,7 @@ static esp_err_t send_gap_sync(int fd, uint32_t first, uint32_t last)
 
 static void publish_log_backpressure_gap(uint32_t dropped)
 {
-	if (fabric_session_active()) {
+	if (fabric_queue_enabled()) {
 		keemash_fabric_envelope_t *message = fabric_message_acquire();
 		if (!message) return;
 		message->protocol_version = KEEMASH_FABRIC_VERSION;
@@ -582,7 +584,7 @@ static void publish_log_backpressure_gap(uint32_t dropped)
 
 static void publish_fabric_graph_snapshot(void)
 {
-	if (!fabric_session_active()) return;
+	if (!fabric_queue_enabled()) return;
 	log_http_graph_node_t nodes[KEELINK_GRAPH_NODE_MAX] = {0};
 	size_t node_count = log_http_server_graph_nodes(nodes,
 		sizeof(nodes) / sizeof(nodes[0]));
@@ -682,6 +684,12 @@ static void publish_fabric_graph_snapshot(void)
 static void publish_inventory_snapshot(void)
 {
 	publish_fabric_graph_snapshot();
+	lock();
+	bool defer_compatibility_snapshot = s_fabric_negotiated &&
+		(!s_ws_ready || s_ws_fd < 0 ||
+		 s_ws_protocol != KEELINK_WS_PROTOCOL_FABRIC_V2);
+	unlock();
+	if (defer_compatibility_snapshot) return;
 	char *json = heap_caps_malloc(12288, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!json) return;
 	size_t json_len = log_http_server_node_list_json(json, 12288);
@@ -744,7 +752,6 @@ static void worker_task(void *arg)
 			stale_fd = s_ws_fd;
 			s_ws_fd = -1;
 			s_ws_ready = false;
-			s_log_subscribed = false;
 			s_ws_down_since_ms = now - KEELINK_BLE_FALLBACK_DELAY_MS;
 		} else if (s_ws_ready && s_ws_fd >= 0 &&
 			   (uint32_t)(now - s_last_ws_ping_ms) >= KEELINK_WS_PING_MS) {
@@ -817,7 +824,6 @@ static void worker_task(void *arg)
 			if (heartbeat_err != ESP_OK && s_ws_fd == fd) {
 				s_ws_fd = -1;
 				s_ws_ready = false;
-				s_log_subscribed = false;
 				s_ws_down_since_ms = now;
 			}
 			unlock();
@@ -851,7 +857,6 @@ static void worker_task(void *arg)
 					if (s_ws_fd == fd) {
 						s_ws_fd = -1;
 						s_ws_ready = false;
-						s_log_subscribed = false;
 						s_ws_down_since_ms = now_ms();
 					}
 					unlock();
@@ -896,12 +901,12 @@ static void worker_task(void *arg)
 			lock();
 			if (err == ESP_OK && s_ws_fd == fd && s_next_send_id == id) {
 				s_next_send_id++;
+				s_last_stream_event_id = id;
 				if (replayed) s_resume_replayed_frames++;
 			} else if (err != ESP_ERR_NO_MEM && err != ESP_OK && s_ws_fd == fd) {
 				ESP_LOGW(TAG, "WSS send failed: %s", esp_err_to_name(err));
 				s_ws_fd = -1;
 				s_ws_ready = false;
-				s_log_subscribed = false;
 				s_ws_down_since_ms = now_ms();
 			}
 			unlock();
@@ -954,7 +959,6 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	s_last_ws_ping_value = s_last_ws_ping_ms;
 	s_ws_rtt_ms = 0;
 	s_ws_rtt_valid = false;
-	s_log_subscribed = false;
 	s_next_send_id = s_event_id + 1;
 	s_resume_active = false;
 	s_resume_end_id = 0;
@@ -1131,8 +1135,18 @@ static bool fabric_resume_prepare_locked(const keemash_fabric_v2_Hello *hello,
 
 	uint32_t oldest = s_event_id >= KEELINK_REPLAY_SLOTS
 		? s_event_id - KEELINK_REPLAY_SLOTS + 1U : 1U;
+	if ((uint32_t)(s_event_id - s_last_stream_event_id) > KEELINK_REPLAY_SLOTS) {
+		snprintf(reason, reason_size, "global replay window exceeded");
+		return false;
+	}
 	for (size_t i = 0; i < KEELINK_REPLAY_SLOTS; i++) {
 		const replay_meta_t *meta = &s_replay_meta[i];
+		if (!meta->fabric && meta->id > s_last_stream_event_id &&
+		    meta->id >= oldest && meta->id <= s_event_id) {
+			snprintf(reason, reason_size,
+				 "compatibility frame requires snapshot reset");
+			return false;
+		}
 		if (!meta->fabric || meta->id < oldest || meta->id > s_event_id ||
 		    !fabric_class_valid(meta->traffic_class)) continue;
 		if (meta->class_sequence > cursors[meta->traffic_class] &&
@@ -1203,6 +1217,7 @@ static esp_err_t handle_fabric_hello(httpd_req_t *req,
 		s_controller_id = hello->controller_id;
 		s_transport_session = hello->transport_session;
 		s_ws_protocol = KEELINK_WS_PROTOCOL_FABRIC_V2;
+		s_fabric_negotiated = true;
 		s_ws_ready = true;
 		if (!resume_accepted) {
 			s_resume_active = false;
@@ -1220,7 +1235,7 @@ static esp_err_t handle_fabric_hello(httpd_req_t *req,
 		ESP_LOGI(TAG, "Fabric resume %s%s%s",
 			 resume_accepted ? "accepted" : "reset",
 			 resume_reason[0] ? ": " : "", resume_reason);
-		if (!resume_accepted) keelink_server_publish_inventory();
+		keelink_server_publish_inventory();
 		if (s_worker) xTaskNotifyGive(s_worker);
 	}
 	return err;
@@ -1415,6 +1430,10 @@ static esp_err_t ws_handler(httpd_req_t *req)
 		s_ws_ready = err == ESP_OK;
 		s_ws_protocol = err == ESP_OK ? KEELINK_WS_PROTOCOL_V1
 			: KEELINK_WS_PROTOCOL_NONE;
+		if (err == ESP_OK) {
+			s_fabric_negotiated = false;
+			s_log_subscribed = false;
+		}
 		s_next_send_id = last_event + 1;
 		if (s_next_send_id < oldest) s_next_send_id = s_event_id + 1;
 		bool needs_snapshot = last_event == 0 || last_event + 1 < oldest;
@@ -1692,6 +1711,14 @@ static void publish_text_event_priority(uint16_t channel, const uint8_t mac[6],
 					const char *tag, const char *text,
 					uint8_t priority)
 {
+	lock();
+	bool defer_topology = channel == KEEMASH_KEELINK_CH_TOPOLOGY &&
+		s_fabric_negotiated &&
+		(!s_ws_ready || s_ws_fd < 0 ||
+		 s_ws_protocol != KEELINK_WS_PROTOCOL_FABRIC_V2);
+	unlock();
+	if (defer_topology) return;
+
 	uint8_t payload[512];
 	keemash_keelink_writer_t writer;
 	keemash_keelink_writer_init(&writer, payload, sizeof(payload));
@@ -1712,11 +1739,10 @@ void keelink_server_publish_text_event(uint16_t channel, const uint8_t mac[6],
 	publish_text_event_priority(channel, mac, tag, text, 2);
 }
 
-static bool fabric_session_active(void)
+static bool fabric_queue_enabled(void)
 {
 	lock();
-	bool active = s_ws_ready && s_ws_fd >= 0 &&
-		s_ws_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2;
+	bool active = s_fabric_negotiated;
 	unlock();
 	return active;
 }
@@ -1771,7 +1797,7 @@ static double fabric_sensor_value(const mesh_v2_sensor_entry_t *entry)
 bool keelink_server_publish_sensor_fabric(
 	const uint8_t mac[6], const mesh_v2_sensor_snapshot_payload_t *snapshot)
 {
-	if (!mac || !snapshot || !fabric_session_active()) return false;
+	if (!mac || !snapshot || !fabric_queue_enabled()) return false;
 	keemash_fabric_id_t node_id;
 	uint32_t boot_session = 0;
 	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
@@ -1823,7 +1849,7 @@ bool keelink_server_publish_sensor_fabric(
 bool keelink_server_publish_task_fabric(
 	const uint8_t mac[6], const mesh_v2_task_snapshot_payload_t *snapshot)
 {
-	if (!mac || !snapshot || !fabric_session_active()) return false;
+	if (!mac || !snapshot || !fabric_queue_enabled()) return false;
 	keemash_fabric_id_t node_id;
 	uint32_t boot_session = 0;
 	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
@@ -1871,7 +1897,7 @@ bool keelink_server_publish_task_fabric(
 bool keelink_server_publish_memory_fabric(
 	const uint8_t mac[6], const mesh_v2_memory_payload_t *snapshot)
 {
-	if (!mac || !snapshot || !fabric_session_active()) return false;
+	if (!mac || !snapshot || !fabric_queue_enabled()) return false;
 	keemash_fabric_id_t node_id;
 	uint32_t boot_session = 0;
 	if (!fabric_node_identity(mac, &node_id, &boot_session)) return false;
@@ -1918,7 +1944,7 @@ void keelink_server_publish_log(const uint8_t mac[6], const char *tag, const cha
 	bool enabled = s_log_subscribed;
 	unlock();
 	if (!enabled || !line) return;
-	if (fabric_session_active()) {
+	if (fabric_queue_enabled()) {
 		keemash_fabric_id_t node_id;
 		uint32_t boot_session = 0;
 		if (!fabric_node_identity(mac, &node_id, &boot_session)) return;
