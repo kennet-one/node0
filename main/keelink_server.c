@@ -53,6 +53,8 @@
 #define KEELINK_PRIORITY_LOG 3U
 #define KEELINK_FABRIC_MESSAGE_SLOTS 4U
 #define KEELINK_GRAPH_NODE_MAX 25U
+#define KEELINK_TRAFFIC_CLASS_COUNT 9U
+#define KEELINK_TRAFFIC_CLASS_SLOTS (KEELINK_TRAFFIC_CLASS_COUNT + 1U)
 #define KEELINK_BLE_FALLBACK_DELAY_MS 3000U
 #define KEELINK_BLE_RETRY_MS 5000U
 
@@ -82,7 +84,9 @@ typedef struct {
 	uint32_t id;
 	uint16_t len;
 	uint8_t priority;
-	uint8_t reserved;
+	uint8_t traffic_class;
+	uint64_t class_sequence;
+	bool fabric;
 } replay_meta_t;
 
 typedef struct {
@@ -111,6 +115,7 @@ static keemash_fabric_envelope_t *s_fabric_messages;
 static uint32_t s_fabric_message_used;
 static replay_meta_t s_replay_meta[KEELINK_REPLAY_SLOTS];
 static uint32_t s_event_id;
+static uint64_t s_class_sequence[KEELINK_TRAFFIC_CLASS_SLOTS];
 static uint64_t s_session_id;
 static int s_ws_fd = -1;
 static bool s_ws_ready;
@@ -118,11 +123,18 @@ static keelink_ws_protocol_t s_ws_protocol;
 static keemash_fabric_id_t s_controller_id;
 static keemash_fabric_id_t s_transport_session;
 static uint32_t s_wss_connect_count;
+static uint32_t s_resume_accept_count;
+static uint32_t s_resume_reset_count;
+static uint32_t s_resume_replayed_frames;
+static char s_last_resume_reason[65] = "not attempted";
 static bool s_ble_fallback_active;
 static uint32_t s_ws_down_since_ms;
 static uint32_t s_ble_retry_after_ms;
 static bool s_log_subscribed;
 static uint32_t s_next_send_id;
+static bool s_resume_active;
+static uint32_t s_resume_end_id;
+static uint64_t s_resume_cursor[KEELINK_TRAFFIC_CLASS_SLOTS];
 static bool fabric_session_active(void);
 static bool s_inventory_dirty;
 static uint32_t s_last_heartbeat_ms;
@@ -349,6 +361,12 @@ static esp_err_t encode_frame(uint8_t *frame, size_t capacity, uint8_t kind,
 	return ESP_OK;
 }
 
+static bool fabric_class_valid(int traffic_class)
+{
+	return traffic_class >= keemash_fabric_v2_TrafficClass_TRAFFIC_CONTROL &&
+		traffic_class <= keemash_fabric_v2_TrafficClass_TRAFFIC_OTA;
+}
+
 static uint32_t replay_append(uint8_t kind, uint16_t channel, uint32_t correlation_id,
 			      const uint8_t *payload, size_t payload_len, uint8_t priority)
 {
@@ -374,6 +392,9 @@ static uint32_t replay_append(uint8_t kind, uint16_t channel, uint32_t correlati
 		s_replay_meta[slot].id = id;
 		s_replay_meta[slot].len = (uint16_t)frame_len;
 		s_replay_meta[slot].priority = priority;
+		s_replay_meta[slot].traffic_class = 0;
+		s_replay_meta[slot].class_sequence = id;
+		s_replay_meta[slot].fabric = false;
 	}
 	unlock();
 	if (id && s_worker) xTaskNotifyGive(s_worker);
@@ -383,8 +404,9 @@ static uint32_t replay_append(uint8_t kind, uint16_t channel, uint32_t correlati
 static uint64_t fabric_replay_append(keemash_fabric_envelope_t *message,
 				     uint8_t priority)
 {
-	if (!message) return 0;
+	if (!message || !fabric_class_valid(message->traffic_class)) return 0;
 	uint32_t id;
+	uint64_t class_sequence;
 	lock();
 	uint32_t backlog = s_next_send_id <= s_event_id
 		? s_event_id - s_next_send_id + 1U : 0U;
@@ -396,7 +418,9 @@ static uint64_t fabric_replay_append(keemash_fabric_envelope_t *message,
 		return 0;
 	}
 	id = ++s_event_id;
-	message->sequence = id;
+	uint8_t traffic_class = (uint8_t)message->traffic_class;
+	class_sequence = s_class_sequence[traffic_class] + 1U;
+	message->sequence = class_sequence;
 	message->root_session = s_session_id;
 	message->has_transport_session = true;
 	message->transport_session = s_transport_session;
@@ -407,13 +431,34 @@ static uint64_t fabric_replay_append(keemash_fabric_envelope_t *message,
 		&frame_len) != ESP_OK) {
 		id = 0;
 	} else {
+		s_class_sequence[traffic_class] = class_sequence;
 		s_replay_meta[slot].id = id;
 		s_replay_meta[slot].len = (uint16_t)frame_len;
 		s_replay_meta[slot].priority = priority;
+		s_replay_meta[slot].traffic_class = traffic_class;
+		s_replay_meta[slot].class_sequence = class_sequence;
+		s_replay_meta[slot].fabric = true;
 	}
 	unlock();
 	if (id && s_worker) xTaskNotifyGive(s_worker);
-	return id;
+	return id ? class_sequence : 0;
+}
+
+static esp_err_t fabric_rebind_transport(uint8_t *frame, size_t capacity,
+					 size_t *length,
+					 const keemash_fabric_id_t *transport_session)
+{
+	if (!frame || !length || !transport_session) return ESP_ERR_INVALID_ARG;
+	keemash_fabric_envelope_t *message = fabric_message_acquire();
+	if (!message) return ESP_ERR_NO_MEM;
+	esp_err_t err = keemash_fabric_decode_wire(frame, *length, message);
+	if (err == ESP_OK) {
+		message->has_transport_session = true;
+		message->transport_session = *transport_session;
+		err = keemash_fabric_encode_wire(message, frame, capacity, length);
+	}
+	fabric_message_release(message);
+	return err;
 }
 
 static esp_err_t ws_send_sync(int fd, const uint8_t *data, size_t len)
@@ -782,7 +827,13 @@ static void worker_task(void *arg)
 			uint8_t *copy = NULL;
 			size_t len = 0;
 			uint32_t id = 0;
+			bool fabric = false;
+			bool replayed = false;
+			keemash_fabric_id_t transport_session = {0};
 			lock();
+			if (s_resume_active && s_next_send_id > s_resume_end_id) {
+				s_resume_active = false;
+			}
 			if (!s_ws_ready || s_ws_fd < 0 || s_next_send_id > s_event_id) {
 				unlock();
 				break;
@@ -815,18 +866,38 @@ static void worker_task(void *arg)
 				unlock();
 				continue;
 			}
+			if (s_resume_active && id <= s_resume_end_id &&
+			    (!s_replay_meta[slot].fabric ||
+			     !fabric_class_valid(s_replay_meta[slot].traffic_class) ||
+			     s_replay_meta[slot].class_sequence <=
+				s_resume_cursor[s_replay_meta[slot].traffic_class])) {
+				s_next_send_id++;
+				unlock();
+				continue;
+			}
 			len = s_replay_meta[slot].len;
-			copy = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+			fabric = s_replay_meta[slot].fabric;
+			replayed = s_resume_active && id <= s_resume_end_id;
+			transport_session = s_transport_session;
+			copy = heap_caps_malloc(KEELINK_MAX_FRAME,
+				MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 			if (copy) memcpy(copy, s_replay + slot * KEELINK_MAX_FRAME, len);
 			fd = s_ws_fd;
 			unlock();
 			if (!copy) break;
-			esp_err_t err = ws_send_sync(fd, copy, len);
+			esp_err_t err = ESP_OK;
+			if (fabric) {
+				err = fabric_rebind_transport(copy,
+					KEEMASH_FABRIC_MAX_WIRE_FRAME, &len,
+					&transport_session);
+			}
+			if (err == ESP_OK) err = ws_send_sync(fd, copy, len);
 			free(copy);
 			lock();
 			if (err == ESP_OK && s_ws_fd == fd && s_next_send_id == id) {
 				s_next_send_id++;
-			} else if (err != ESP_OK && s_ws_fd == fd) {
+				if (replayed) s_resume_replayed_frames++;
+			} else if (err != ESP_ERR_NO_MEM && err != ESP_OK && s_ws_fd == fd) {
 				ESP_LOGW(TAG, "WSS send failed: %s", esp_err_to_name(err));
 				s_ws_fd = -1;
 				s_ws_ready = false;
@@ -885,6 +956,9 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 	s_ws_rtt_valid = false;
 	s_log_subscribed = false;
 	s_next_send_id = s_event_id + 1;
+	s_resume_active = false;
+	s_resume_end_id = 0;
+	memset(s_resume_cursor, 0, sizeof(s_resume_cursor));
 	unlock();
 	keelink_ble_disable();
 	if (old_fd >= 0 && old_fd != fd) httpd_sess_trigger_close(req->handle, old_fd);
@@ -1004,6 +1078,8 @@ static esp_err_t send_fabric_control_result(httpd_req_t *req,
 	reply->has_transport_session = true;
 	reply->transport_session = s_transport_session;
 	reply->correlation = correlation;
+	reply->has_operation_id = operation_id != NULL;
+	if (operation_id) reply->operation_id = *operation_id;
 	reply->which_body = keemash_fabric_v2_Envelope_control_result_tag;
 	reply->body.control_result.has_operation_id = operation_id != NULL;
 	if (operation_id) reply->body.control_result.operation_id = *operation_id;
@@ -1016,6 +1092,70 @@ static esp_err_t send_fabric_control_result(httpd_req_t *req,
 	esp_err_t err = req_send_fabric(req, reply);
 	fabric_message_release(reply);
 	return err;
+}
+
+static bool fabric_resume_prepare_locked(const keemash_fabric_v2_Hello *hello,
+					 char *reason, size_t reason_size)
+{
+	uint64_t cursors[KEELINK_TRAFFIC_CLASS_SLOTS] = {0};
+	bool seen[KEELINK_TRAFFIC_CLASS_SLOTS] = {false};
+	uint32_t found[KEELINK_TRAFFIC_CLASS_SLOTS] = {0};
+
+	if (hello->known_root_session == 0 ||
+	    hello->known_root_session != s_session_id) {
+		snprintf(reason, reason_size, "root session reset");
+		return false;
+	}
+	if (hello->cursors_count != KEELINK_TRAFFIC_CLASS_COUNT) {
+		snprintf(reason, reason_size, "incomplete cursor set");
+		return false;
+	}
+	for (pb_size_t i = 0; i < hello->cursors_count; i++) {
+		int traffic_class = hello->cursors[i].traffic_class;
+		if (!fabric_class_valid(traffic_class) || seen[traffic_class]) {
+			snprintf(reason, reason_size, "invalid cursor set");
+			return false;
+		}
+		seen[traffic_class] = true;
+		cursors[traffic_class] = hello->cursors[i].sequence;
+		if (cursors[traffic_class] > s_class_sequence[traffic_class]) {
+			snprintf(reason, reason_size, "cursor ahead of root");
+			return false;
+		}
+		if (s_class_sequence[traffic_class] - cursors[traffic_class] >
+		    KEELINK_REPLAY_SLOTS) {
+			snprintf(reason, reason_size, "replay window exceeded");
+			return false;
+		}
+	}
+
+	uint32_t oldest = s_event_id >= KEELINK_REPLAY_SLOTS
+		? s_event_id - KEELINK_REPLAY_SLOTS + 1U : 1U;
+	for (size_t i = 0; i < KEELINK_REPLAY_SLOTS; i++) {
+		const replay_meta_t *meta = &s_replay_meta[i];
+		if (!meta->fabric || meta->id < oldest || meta->id > s_event_id ||
+		    !fabric_class_valid(meta->traffic_class)) continue;
+		if (meta->class_sequence > cursors[meta->traffic_class] &&
+		    meta->class_sequence <= s_class_sequence[meta->traffic_class]) {
+			found[meta->traffic_class]++;
+		}
+	}
+	for (uint32_t traffic_class = 1; traffic_class <= KEELINK_TRAFFIC_CLASS_COUNT;
+	     traffic_class++) {
+		uint64_t needed = s_class_sequence[traffic_class] - cursors[traffic_class];
+		if (needed != found[traffic_class]) {
+			snprintf(reason, reason_size, "replay gap in class %lu",
+				 (unsigned long)traffic_class);
+			return false;
+		}
+	}
+
+	memcpy(s_resume_cursor, cursors, sizeof(s_resume_cursor));
+	s_resume_end_id = s_event_id;
+	s_next_send_id = oldest;
+	s_resume_active = s_next_send_id <= s_resume_end_id;
+	reason[0] = '\0';
+	return true;
 }
 
 static esp_err_t handle_fabric_hello(httpd_req_t *req,
@@ -1046,9 +1186,15 @@ static esp_err_t handle_fabric_hello(httpd_req_t *req,
 	reply->body.welcome.has_transport_session = true;
 	reply->body.welcome.transport_session = hello->transport_session;
 	reply->body.welcome.root_session = s_session_id;
-	reply->body.welcome.resume_accepted = false;
-	snprintf(reply->body.welcome.fallback_reason,
-		sizeof(reply->body.welcome.fallback_reason), "snapshot reset");
+	lock();
+	bool resume_accepted = fabric_resume_prepare_locked(hello,
+		reply->body.welcome.fallback_reason,
+		sizeof(reply->body.welcome.fallback_reason));
+	unlock();
+	reply->body.welcome.resume_accepted = resume_accepted;
+	char resume_reason[sizeof(reply->body.welcome.fallback_reason)];
+	snprintf(resume_reason, sizeof(resume_reason), "%s",
+		reply->body.welcome.fallback_reason);
 
 	esp_err_t err = req_send_fabric(req, reply);
 	fabric_message_release(reply);
@@ -1058,12 +1204,23 @@ static esp_err_t handle_fabric_hello(httpd_req_t *req,
 		s_transport_session = hello->transport_session;
 		s_ws_protocol = KEELINK_WS_PROTOCOL_FABRIC_V2;
 		s_ws_ready = true;
-		s_next_send_id = s_event_id + 1U;
-		s_graph_force_publish = true;
+		if (!resume_accepted) {
+			s_resume_active = false;
+			s_next_send_id = s_event_id + 1U;
+			s_graph_force_publish = true;
+			s_resume_reset_count++;
+		} else {
+			s_resume_accept_count++;
+		}
+		snprintf(s_last_resume_reason, sizeof(s_last_resume_reason), "%s",
+			 resume_accepted ? "accepted" : resume_reason);
 	}
 	unlock();
 	if (err == ESP_OK) {
-		keelink_server_publish_inventory();
+		ESP_LOGI(TAG, "Fabric resume %s%s%s",
+			 resume_accepted ? "accepted" : "reset",
+			 resume_reason[0] ? ": " : "", resume_reason);
+		if (!resume_accepted) keelink_server_publish_inventory();
 		if (s_worker) xTaskNotifyGive(s_worker);
 	}
 	return err;
@@ -1316,6 +1473,10 @@ static esp_err_t info_get(httpd_req_t *req)
 	bool wss_active;
 	keelink_ws_protocol_t wss_protocol;
 	uint32_t wss_connect_count;
+	uint32_t resume_accept_count;
+	uint32_t resume_reset_count;
+	uint32_t resume_replayed_frames;
+	char last_resume_reason[sizeof(s_last_resume_reason)];
 	uint64_t graph_revision;
 	bool ble_fallback_active;
 	uint32_t ws_down_age_ms;
@@ -1323,6 +1484,11 @@ static esp_err_t info_get(httpd_req_t *req)
 	wss_active = s_ws_ready && s_ws_fd >= 0;
 	wss_protocol = s_ws_protocol;
 	wss_connect_count = s_wss_connect_count;
+	resume_accept_count = s_resume_accept_count;
+	resume_reset_count = s_resume_reset_count;
+	resume_replayed_frames = s_resume_replayed_frames;
+	snprintf(last_resume_reason, sizeof(last_resume_reason), "%s",
+		s_last_resume_reason);
 	graph_revision = s_graph_revision;
 	ble_fallback_active = s_ble_fallback_active;
 	ws_down_age_ms = s_ws_down_since_ms ? now_ms() - s_ws_down_since_ms : 0;
@@ -1333,6 +1499,10 @@ static esp_err_t info_get(httpd_req_t *req)
 		"\"paired\":%s,\"wss\":true,\"wss_active\":%s,"
 		"\"wss_protocol\":\"%s\","
 		"\"wss_seen\":%s,\"wss_connect_count\":%" PRIu32 ","
+		"\"resume_accept_count\":%" PRIu32 ","
+		"\"resume_reset_count\":%" PRIu32 ","
+		"\"resume_replayed_frames\":%" PRIu32 ","
+		"\"last_resume_reason\":\"%s\","
 		"\"graph_revision\":%" PRIu64 ","
 		"\"ws_down_age_ms\":%" PRIu32 ","
 		"\"ble_fallback_active\":%s,\"ble\":%s,"
@@ -1343,6 +1513,8 @@ static esp_err_t info_get(httpd_req_t *req)
 		wss_protocol == KEELINK_WS_PROTOCOL_FABRIC_V2 ? "fabric-v2" :
 			(wss_protocol == KEELINK_WS_PROTOCOL_V1 ? "keelink-v1" : "none"),
 		wss_connect_count ? "true" : "false", wss_connect_count,
+		resume_accept_count, resume_reset_count, resume_replayed_frames,
+		last_resume_reason,
 		graph_revision, ws_down_age_ms,
 		ble_fallback_active ? "true" : "false",
 		keelink_ble_ready() ? "true" : "false", keelink_ble_state(),
