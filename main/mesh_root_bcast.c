@@ -399,6 +399,13 @@ esp_err_t mesh_root_submit_direct_command(const uint8_t peer[6],
 					  const char *payload,
 					  uint32_t command_id)
 {
+	return mesh_root_submit_direct_operation(peer, payload, command_id, NULL);
+}
+
+esp_err_t mesh_root_submit_direct_operation(
+	const uint8_t peer[6], const char *payload, uint32_t command_id,
+	const mesh_v2_operation_id_t *operation_id)
+{
 	if (!peer || !payload || !payload[0] || command_id == 0) {
 		return ESP_ERR_INVALID_ARG;
 	}
@@ -426,7 +433,10 @@ esp_err_t mesh_root_submit_direct_command(const uint8_t peer[6],
 	if (!pending_add(owner_mac, stats.root_session_id, command_id, owner)) {
 		return ESP_ERR_NO_MEM;
 	}
-	esp_err_t err = mesh_v2_root_send_command(owner_mac, command_id, payload);
+	esp_err_t err = operation_id
+		? mesh_v2_root_send_command_operation(owner_mac, command_id, payload,
+						      operation_id)
+		: mesh_v2_root_send_command(owner_mac, command_id, payload);
 	if (err != ESP_OK) {
 		(void)pending_take(owner_mac, stats.root_session_id, command_id, NULL);
 		return err;
@@ -439,10 +449,20 @@ void mesh_root_command_result(const uint8_t peer[6], uint32_t root_session,
 			      uint32_t command_id, uint8_t status,
 			      const char *text)
 {
+	mesh_root_command_result_operation(peer, root_session, command_id, status,
+					   text, NULL);
+}
+
+void mesh_root_command_result_operation(
+	const uint8_t peer[6], uint32_t root_session, uint32_t command_id,
+	uint8_t status, const char *text,
+	const mesh_v2_operation_id_t *operation_id)
+{
 	heater_zone_result(peer, root_session, command_id, status);
 	pending_command_t found = {0};
 	if (!pending_take(peer, root_session, command_id, &found)) return;
-	keelink_server_command_result(command_id, status, text);
+	keelink_server_command_result_operation(command_id, status, text,
+						 operation_id);
 
 	if (status == MESH_V2_CONTROL_STATUS_OK) {
 		log_http_server_command_status("ok", found.owner, command_id,

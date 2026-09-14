@@ -291,14 +291,15 @@ void keemash_mesh_root_on_control_event(const char *text)
 	}
 }
 
-void keemash_mesh_root_on_control(const uint8_t peer[6], uint32_t root_session,
-				  uint32_t node_session, uint8_t kind,
-				  uint32_t command_id, uint8_t status,
-				  const char *text)
+void keemash_mesh_root_on_control_ex(
+	const uint8_t peer[6], uint32_t root_session, uint32_t node_session,
+	uint8_t kind, uint32_t command_id, uint8_t status, const char *text,
+	const mesh_v2_operation_id_t *operation_id)
 {
 	(void)node_session;
 	if (kind == MESH_V2_CONTROL_RESULT) {
-		mesh_root_command_result(peer, root_session, command_id, status, text);
+		mesh_root_command_result_operation(peer, root_session, command_id,
+						   status, text, operation_id);
 	} else if (kind == MESH_V2_CONTROL_EVENT) {
 		uint8_t mixer_mac[6] = {0};
 		bool from_mixer = mesh_v2_root_find_lossless_by_tag(
@@ -317,6 +318,15 @@ void keemash_mesh_root_on_control(const uint8_t peer[6], uint32_t root_session,
 		}
 		keemash_mesh_root_on_control_event(text);
 	}
+}
+
+void keemash_mesh_root_on_control(const uint8_t peer[6], uint32_t root_session,
+				  uint32_t node_session, uint8_t kind,
+				  uint32_t command_id, uint8_t status,
+				  const char *text)
+{
+	keemash_mesh_root_on_control_ex(peer, root_session, node_session, kind,
+					command_id, status, text, NULL);
 }
 
 void keemash_mesh_root_on_state_changed(void)

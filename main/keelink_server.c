@@ -115,6 +115,8 @@ typedef struct {
 	uint32_t correlation_id;
 	uint32_t created_ms;
 	keemash_fabric_id_t operation_id;
+	bool has_mesh_operation_id;
+	mesh_v2_operation_id_t mesh_operation_id;
 } command_map_t;
 
 typedef enum {
@@ -1152,7 +1154,8 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 }
 
 static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool ble,
-			    bool fabric, const keemash_fabric_id_t *operation_id)
+			    bool fabric, const keemash_fabric_id_t *operation_id,
+			    const mesh_v2_operation_id_t *mesh_operation_id)
 {
 	lock();
 	size_t chosen = KEELINK_COMMAND_MAP_SLOTS;
@@ -1173,18 +1176,28 @@ static bool command_map_add(uint32_t command_id, uint32_t correlation_id, bool b
 			.created_ms = now_ms(),
 		};
 		if (operation_id) s_commands[chosen].operation_id = *operation_id;
+		if (mesh_operation_id) {
+			s_commands[chosen].has_mesh_operation_id = true;
+			s_commands[chosen].mesh_operation_id = *mesh_operation_id;
+		}
 		added = true;
 	}
 	unlock();
 	return added;
 }
 
-static bool command_map_take(uint32_t command_id, command_map_t *result)
+static bool command_map_take(uint32_t command_id,
+			     const mesh_v2_operation_id_t *mesh_operation_id,
+			     command_map_t *result)
 {
 	bool found = false;
 	lock();
 	for (size_t i = 0; i < KEELINK_COMMAND_MAP_SLOTS; i++) {
-		if (s_commands[i].used && s_commands[i].command_id == command_id) {
+		if (s_commands[i].used && s_commands[i].command_id == command_id &&
+		    (!mesh_operation_id ||
+		     (s_commands[i].has_mesh_operation_id &&
+		      s_commands[i].mesh_operation_id.high == mesh_operation_id->high &&
+		      s_commands[i].mesh_operation_id.low == mesh_operation_id->low))) {
 			if (result) *result = s_commands[i];
 			memset(&s_commands[i], 0, sizeof(s_commands[i]));
 			found = true;
@@ -1193,6 +1206,32 @@ static bool command_map_take(uint32_t command_id, command_map_t *result)
 	}
 	unlock();
 	return found;
+}
+
+static esp_err_t derive_mesh_operation_id(
+	const keemash_fabric_id_t *controller_id,
+	const keemash_fabric_id_t *operation_id,
+	mesh_v2_operation_id_t *derived)
+{
+	if (!controller_id || !operation_id || !derived) return ESP_ERR_INVALID_ARG;
+	struct __attribute__((packed)) {
+		uint64_t controller_high;
+		uint64_t controller_low;
+		uint64_t operation_high;
+		uint64_t operation_low;
+	} input = {
+		.controller_high = controller_id->high,
+		.controller_low = controller_id->low,
+		.operation_high = operation_id->high,
+		.operation_low = operation_id->low,
+	};
+	uint8_t digest[32];
+	esp_err_t err = sha256(&input, sizeof(input), digest);
+	if (err != ESP_OK) return err;
+	memcpy(&derived->high, digest, sizeof(derived->high));
+	memcpy(&derived->low, digest + sizeof(derived->high), sizeof(derived->low));
+	mbedtls_platform_zeroize(digest, sizeof(digest));
+	return derived->high != 0 || derived->low != 0 ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t handle_control_request(httpd_req_t *req,
@@ -1222,7 +1261,8 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 			out, writer.length);
 	}
 	uint32_t command_id = mesh_v2_root_next_command_id();
-	if (!command_map_add(command_id, header->correlation_id, false, false, NULL)) {
+	if (!command_map_add(command_id, header->correlation_id, false, false,
+			     NULL, NULL)) {
 		uint8_t out[96];
 		keemash_keelink_writer_t writer;
 		keemash_keelink_writer_init(&writer, out, sizeof(out));
@@ -1236,7 +1276,7 @@ static esp_err_t handle_control_request(httpd_req_t *req,
 	}
 	esp_err_t err = mesh_root_submit_direct_command(mac, command, command_id);
 	if (err != ESP_OK) {
-		(void)command_map_take(command_id, NULL);
+		(void)command_map_take(command_id, NULL, NULL);
 		uint8_t out[128];
 		keemash_keelink_writer_t writer;
 		keemash_keelink_writer_init(&writer, out, sizeof(out));
@@ -1453,16 +1493,28 @@ static esp_err_t handle_fabric_control_request(httpd_req_t *req,
 			"target identity does not match route alias");
 	}
 
+	keemash_fabric_id_t controller_id;
+	lock();
+	controller_id = s_controller_id;
+	unlock();
+	mesh_v2_operation_id_t mesh_operation_id = {0};
+	esp_err_t operation_err = derive_mesh_operation_id(
+		&controller_id, &request->operation_id, &mesh_operation_id);
+	if (operation_err != ESP_OK) {
+		return send_fabric_control_result(req, message->correlation,
+			&request->operation_id, operation_err,
+			"unable to derive mesh operation identity");
+	}
 	uint32_t command_id = mesh_v2_root_next_command_id();
 	if (!command_map_add(command_id, (uint32_t)message->correlation, false,
-		true, &request->operation_id)) {
+		true, &request->operation_id, &mesh_operation_id)) {
 		return send_fabric_control_result(req, message->correlation,
 			&request->operation_id, ESP_ERR_NO_MEM, "command window busy");
 	}
-	esp_err_t err = mesh_root_submit_direct_command(request->payload.bytes,
-		request->command, command_id);
+	esp_err_t err = mesh_root_submit_direct_operation(request->payload.bytes,
+		request->command, command_id, &mesh_operation_id);
 	if (err != ESP_OK) {
-		(void)command_map_take(command_id, NULL);
+		(void)command_map_take(command_id, NULL, NULL);
 		return send_fabric_control_result(req, message->correlation,
 			&request->operation_id, err, esp_err_to_name(err));
 	}
@@ -2185,8 +2237,15 @@ void keelink_server_publish_log(const uint8_t mac[6], const char *tag, const cha
 
 void keelink_server_command_result(uint32_t command_id, uint8_t status, const char *text)
 {
+	keelink_server_command_result_operation(command_id, status, text, NULL);
+}
+
+void keelink_server_command_result_operation(
+	uint32_t command_id, uint8_t status, const char *text,
+	const mesh_v2_operation_id_t *operation_id)
+{
 	command_map_t command = {0};
-	if (!command_map_take(command_id, &command)) return;
+	if (!command_map_take(command_id, operation_id, &command)) return;
 	if (command.fabric) {
 		keemash_fabric_envelope_t *reply = fabric_message_acquire();
 		if (!reply) return;
@@ -2323,12 +2382,13 @@ esp_err_t keelink_server_handle_ble_frame(const uint8_t *frame, size_t frame_len
 		if (!parse_mac(mac_text, mac) || !command[0] ||
 		    header.correlation_id == 0) return ESP_ERR_INVALID_ARG;
 		uint32_t command_id = mesh_v2_root_next_command_id();
-		if (!command_map_add(command_id, header.correlation_id, true, false, NULL)) {
+		if (!command_map_add(command_id, header.correlation_id, true, false,
+				     NULL, NULL)) {
 			return ESP_ERR_NO_MEM;
 		}
 		err = mesh_root_submit_direct_command(mac, command, command_id);
 		if (err != ESP_OK) {
-			(void)command_map_take(command_id, NULL);
+			(void)command_map_take(command_id, NULL, NULL);
 			return err;
 		}
 		return ESP_OK;

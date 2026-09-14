@@ -37,6 +37,9 @@ bool keelink_server_publish_memory_fabric(
 	const uint8_t mac[6], const mesh_v2_memory_payload_t *snapshot);
 void keelink_server_command_result(uint32_t command_id, uint8_t status,
 				   const char *text);
+void keelink_server_command_result_operation(
+	uint32_t command_id, uint8_t status, const char *text,
+	const mesh_v2_operation_id_t *operation_id);
 
 #ifdef __cplusplus
 }
