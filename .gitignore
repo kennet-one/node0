@@ -1,5 +1,6 @@
 # ESP-IDF stuff
 /build/
+/build-ota3*/
 sdkconfig
 sdkconfig.old
 
