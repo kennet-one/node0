@@ -15,6 +15,7 @@ idf_component_register(SRCS "mesh_main.c"
                         "log_http_server.c"
                         "mesh_time_sync.c"
                         "ota_v3_vault.c"
+                        "ota_v3_vault_verify.c"
                         "stack_monitor.c"
                         "time_sync.c"
                     PRIV_REQUIRES keemash_mesh_core mdns esp_wifi esp_netif esp_driver_gpio esp_http_server esp_https_server driver nvs_flash heap app_update esp_app_format spi_flash bootloader_support mbedtls bt
