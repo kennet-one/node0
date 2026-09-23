@@ -2,5 +2,5 @@ dependencies:
   keemash_mesh_core:
     git: https://github.com/kennet-one/keemash_core.git
     path: .
-    version: v0.10.0-rc.2
+    version: v0.10.0-rc.7
   espressif/mdns: "1.12.0"

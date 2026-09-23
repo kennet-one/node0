@@ -39,3 +39,6 @@ esp_err_t ota_v3_vault_find(ota_v3_vault_t *vault,
 	ota_v3_vault_entry_t *entry);
 esp_err_t ota_v3_vault_entry(ota_v3_vault_t *vault, size_t index,
 	ota_v3_vault_entry_t *entry);
+esp_err_t ota_v3_vault_read(ota_v3_vault_t *vault,
+	const ota_v3_vault_entry_t *entry, uint32_t offset,
+	uint8_t *bytes, size_t length);

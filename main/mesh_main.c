@@ -25,6 +25,7 @@
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
 #include "mesh_v2_link.h"
+#include "ota_v3_service.h"
 #include "heater_zone.h"
 #include "keemash_mesh_network.h"
 
@@ -665,6 +666,11 @@ void app_main(void)
 	mesh_v2_link_require();
 	esp_err_t v2_init_err = mesh_v2_root_init();
 	ESP_ERROR_CHECK(v2_init_err);
+	esp_err_t ota3_err = ota_v3_service_init();
+	if (ota3_err != ESP_OK) {
+		ESP_LOGW(MESH_TAG, "OTA v3 service unavailable: %s",
+			esp_err_to_name(ota3_err));
+	}
 	mesh_v2_link_refresh_routes();
 
 	ESP_LOGI(MESH_TAG,

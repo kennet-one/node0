@@ -17,6 +17,7 @@
 #include "log_http_server.h"
 #include "mesh_root_bcast.h"
 #include "heater_zone.h"
+#include "ota_v3_service.h"
 
 static keemash_mesh_tx_broker_t *s_tx_broker;
 static const char *TAG = "mesh_v2_link";
@@ -272,6 +273,12 @@ void keemash_mesh_root_on_ota_status(const uint8_t mac[6],
 		 (unsigned long)status->c.len);
 	keelink_server_publish_text_event(KEEMASH_KEELINK_CH_OTA_STATUS,
 		mac, NULL, event);
+}
+
+void keemash_mesh_root_on_ota_v3_message(const uint8_t mac[6],
+	const void *payload, size_t payload_len)
+{
+	ota_v3_service_on_mesh_message(mac, payload, payload_len);
 }
 
 void keemash_mesh_root_on_topology(const uint8_t mac[6], const void *payload, size_t payload_len)

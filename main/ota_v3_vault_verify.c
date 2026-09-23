@@ -35,11 +35,24 @@ static esp_err_t verify_package(const esp_partition_t *partition,
 	esp_err_t err = keemash_ota_v3_verify_package(read_package,
 		verification, size, &verification->fields);
 	if (err != ESP_OK) return err;
-	if (strcmp(verification->fields.project_name,
-		verification->expected_project) != 0 ||
+	if (verification->expected_project &&
+	    strcmp(verification->fields.project_name,
+		verification->expected_project) != 0) return ESP_ERR_INVALID_ARG;
+	if (verification->expected_chip &&
 	    strcmp(verification->fields.chip_target,
 		verification->expected_chip) != 0) return ESP_ERR_INVALID_ARG;
 	return ESP_OK;
+}
+
+esp_err_t ota_v3_vault_finish_verified_any(ota_v3_vault_t *vault,
+	keemash_ota_v3_signed_fields_t *verified_fields)
+{
+	if (!vault || !verified_fields) return ESP_ERR_INVALID_ARG;
+	verification_context_t verification = {0};
+	esp_err_t err = ota_v3_vault_stage_finish(vault, verify_package,
+		&verification);
+	if (err == ESP_OK) *verified_fields = verification.fields;
+	return err;
 }
 
 esp_err_t ota_v3_vault_finish_verified(ota_v3_vault_t *vault,

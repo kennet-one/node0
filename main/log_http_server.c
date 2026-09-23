@@ -45,6 +45,7 @@
 #include "keelink_server.h"
 #include "keelink_ble.h"
 #include "mesh_v2_link.h"
+#include "ota_v3_service.h"
 #include "stack_monitor.h"
 
 static const char *TAG = "log_http";
@@ -334,6 +335,7 @@ static void log_stream_notify(void);
 static void mesh_stream_notify(void);
 static void ui_stream_notify(void);
 static bool parse_mac_hex(const char *s, uint8_t mac[6]);
+static int ota_recv_retry(httpd_req_t *req, uint8_t *buf, size_t len);
 static void copy_tag(char *dst, size_t dst_sz, const char *tag);
 static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz);
 static const char *mesh_err_label(int32_t err);
@@ -4492,6 +4494,36 @@ static bool remote_ota_v2_debug_should_interrupt_upload(uint32_t written,
 }
 #endif
 
+static bool parse_hex_bytes(const char *text, uint8_t *bytes, size_t length)
+{
+	if (!text || !bytes || strlen(text) != length * 2U) return false;
+	for (size_t i = 0; i < length; ++i) {
+		unsigned value = 0;
+		if (!isxdigit((unsigned char)text[i * 2U]) ||
+		    !isxdigit((unsigned char)text[i * 2U + 1U]) ||
+		    sscanf(text + i * 2U, "%2x", &value) != 1)
+			return false;
+		bytes[i] = (uint8_t)value;
+	}
+	return true;
+}
+
+static void format_hex_bytes(const uint8_t *bytes, size_t length,
+	char *text, size_t text_size)
+{
+	static const char digits[] = "0123456789abcdef";
+	if (!text || text_size == 0U) return;
+	if (!bytes || text_size < length * 2U + 1U) {
+		text[0] = '\0';
+		return;
+	}
+	for (size_t i = 0; i < length; ++i) {
+		text[i * 2U] = digits[bytes[i] >> 4U];
+		text[i * 2U + 1U] = digits[bytes[i] & 0x0fU];
+	}
+	text[length * 2U] = '\0';
+}
+
 static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *payload,
                                          size_t payload_len, uint8_t op,
                                          uint32_t op_id,
@@ -4673,6 +4705,304 @@ static esp_err_t http_admin_check_post(httpd_req_t *req)
 	}
 
 	return http_json_ok(req, "admin unlocked");
+}
+
+static const char *ota_v3_phase_name(keemash_fabric_v2_OtaPhase phase)
+{
+	switch (phase) {
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_VALIDATING: return "validating";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_STAGING: return "staging";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_CACHED: return "cached";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_WAITING_ROUTE: return "waiting_route";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_TRANSFERRING: return "transferring";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_VERIFYING: return "verifying";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_REBOOTING: return "rebooting";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_BOOT_VALIDATING: return "boot_validating";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_COMPLETE: return "complete";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_ROLLED_BACK: return "rolled_back";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_OUTCOME_UNKNOWN: return "outcome_unknown";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_ABORTED: return "aborted";
+	case keemash_fabric_v2_OtaPhase_OTA_PHASE_FAILED: return "failed";
+	default: return "idle";
+	}
+}
+
+static bool ota_v3_busy(void)
+{
+	ota_v3_service_status_t status;
+	ota_v3_service_status(&status);
+	return status.ready && status.active;
+}
+
+static bool ota_v3_read_u32_header(httpd_req_t *req, const char *name,
+	uint32_t *value, bool required)
+{
+	char text[24] = {0};
+	if (httpd_req_get_hdr_value_str(req, name, text, sizeof(text)) != ESP_OK)
+		return !required;
+	char *end = NULL;
+	errno = 0;
+	unsigned long parsed = strtoul(text, &end, 10);
+	if (errno != 0 || !end || *end != '\0' || parsed > UINT32_MAX)
+		return false;
+	*value = (uint32_t)parsed;
+	return true;
+}
+
+static bool ota_v3_artifact_from_query(httpd_req_t *req,
+	uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN])
+{
+	char query[160] = {0};
+	char hex[KEEMASH_OTA_V3_SHA256_LEN * 2U + 1U] = {0};
+	return httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+		httpd_query_key_value(query, "artifact", hex, sizeof(hex)) == ESP_OK &&
+		parse_hex_bytes(hex, artifact_id, KEEMASH_OTA_V3_SHA256_LEN);
+}
+
+static esp_err_t http_ota_v3_status_get(httpd_req_t *req)
+{
+	ota_v3_service_status_t status;
+	ota_v3_service_status(&status);
+	char artifact[KEEMASH_OTA_V3_SHA256_LEN * 2U + 1U];
+	char mac[13];
+	format_hex_bytes(status.artifact_id, sizeof(status.artifact_id),
+		artifact, sizeof(artifact));
+	format_hex_bytes(status.target_mac, sizeof(status.target_mac), mac,
+		sizeof(mac));
+	char out[768];
+	size_t pos = append_fmt(out, sizeof(out), 0,
+		"{\"ready\":%s,\"active\":%s,\"phase\":",
+		status.ready ? "true" : "false",
+		status.active ? "true" : "false");
+	pos = append_json_string(out, sizeof(out), pos,
+		ota_v3_phase_name(status.phase));
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"phase_id\":%u,\"status\":%lu,\"target_mac\":",
+		(unsigned)status.phase, (unsigned long)status.status);
+	pos = append_json_string(out, sizeof(out), pos, mac);
+	pos = append_fmt(out, sizeof(out), pos, ",\"artifact\":");
+	pos = append_json_string(out, sizeof(out), pos, artifact);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"operation_id\":\"%016llx%016llx\",\"project\":",
+		(unsigned long long)status.operation_id.high,
+		(unsigned long long)status.operation_id.low);
+	pos = append_json_string(out, sizeof(out), pos, status.project_name);
+	pos = append_fmt(out, sizeof(out), pos, ",\"version\":");
+	pos = append_json_string(out, sizeof(out), pos, status.firmware_version);
+	pos = append_fmt(out, sizeof(out), pos,
+		",\"raw_offset\":%lu,\"raw_size\":%lu,"
+		"\"encoded_offset\":%lu,\"encoded_size\":%lu,"
+		"\"retries\":%lu,\"resumes\":%lu,\"message\":",
+		(unsigned long)status.raw_offset, (unsigned long)status.raw_size,
+		(unsigned long)status.encoded_offset,
+		(unsigned long)status.encoded_size,
+		(unsigned long)status.retries,
+		(unsigned long)status.resume_count);
+	pos = append_json_string(out, sizeof(out), pos, status.message);
+	pos = append_fmt(out, sizeof(out), pos, "}");
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, out, pos);
+}
+
+static esp_err_t http_ota_v3_vault_get(httpd_req_t *req)
+{
+	char *out = malloc(3072U);
+	if (!out) return http_json_error(req, "500 Internal Server Error",
+		"no memory for vault response");
+	size_t pos = append_fmt(out, 3072U, 0, "{\"artifacts\":[");
+	size_t count = 0U;
+	for (size_t i = 0; i < OTA_V3_VAULT_MAX_ENTRIES; ++i) {
+		ota_v3_vault_entry_t entry;
+		keemash_ota_v3_signed_fields_t fields;
+		esp_err_t err = ota_v3_service_vault_entry(i, &entry, &fields);
+		if (err == ESP_ERR_NOT_FOUND) break;
+		if (err != ESP_OK) continue;
+		char artifact[KEEMASH_OTA_V3_SHA256_LEN * 2U + 1U];
+		format_hex_bytes(entry.sha256, sizeof(entry.sha256), artifact,
+			sizeof(artifact));
+		if (count++) pos = append_fmt(out, 3072U, pos, ",");
+		pos = append_fmt(out, 3072U, pos, "{\"artifact\":");
+		pos = append_json_string(out, 3072U, pos, artifact);
+		pos = append_fmt(out, 3072U, pos, ",\"project\":");
+		pos = append_json_string(out, 3072U, pos, fields.project_name);
+		pos = append_fmt(out, 3072U, pos, ",\"version\":");
+		pos = append_json_string(out, 3072U, pos, fields.firmware_version);
+		pos = append_fmt(out, 3072U, pos,
+			",\"chip\":");
+		pos = append_json_string(out, 3072U, pos, fields.chip_target);
+		pos = append_fmt(out, 3072U, pos,
+			",\"package_size\":%lu,\"raw_size\":%lu,"
+			"\"encoded_size\":%lu}", (unsigned long)entry.size,
+			(unsigned long)fields.raw_size,
+			(unsigned long)fields.encoded_size);
+	}
+	pos = append_fmt(out, 3072U, pos, "],\"count\":%u}", (unsigned)count);
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	esp_err_t err = httpd_resp_send(req, out, pos);
+	free(out);
+	return err;
+}
+
+static esp_err_t http_ota_v3_stage_post(httpd_req_t *req)
+{
+	if (!ota_check_pin(req))
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	if (!s_ota_mutex || xSemaphoreTake(s_ota_mutex, 0) != pdTRUE)
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	esp_err_t result = ESP_FAIL;
+	char error[112] = "OTA v3 stage failed";
+	uint8_t *buffer = NULL;
+	bool abort_stage = false;
+	do {
+		if (ota_v3_busy()) {
+			snprintf(error, sizeof(error), "OTA v3 deployment already running");
+			break;
+		}
+		char artifact_hex[KEEMASH_OTA_V3_SHA256_LEN * 2U + 1U] = {0};
+		uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN];
+		if (httpd_req_get_hdr_value_str(req, "X-Artifact-SHA256",
+			artifact_hex, sizeof(artifact_hex)) != ESP_OK ||
+		    !parse_hex_bytes(artifact_hex, artifact_id, sizeof(artifact_id))) {
+			snprintf(error, sizeof(error), "missing or invalid artifact SHA-256");
+			break;
+		}
+		uint32_t upload_offset = 0U;
+		uint32_t package_size = 0U;
+		if (!ota_v3_read_u32_header(req, "X-Upload-Offset",
+			&upload_offset, false) ||
+		    !ota_v3_read_u32_header(req, "X-Artifact-Size",
+			&package_size, upload_offset != 0U)) {
+			snprintf(error, sizeof(error), "invalid OTA v3 size or offset header");
+			break;
+		}
+		if (package_size == 0U) package_size = req->content_len;
+		if (req->content_len == 0U || upload_offset > package_size ||
+		    req->content_len != package_size - upload_offset) {
+			snprintf(error, sizeof(error), "OTA v3 upload length mismatch");
+			break;
+		}
+		uint32_t resume_offset = 0U;
+		result = ota_v3_service_stage_begin(artifact_id, package_size,
+			&resume_offset);
+		if (result != ESP_OK) {
+			snprintf(error, sizeof(error), "vault begin: %s",
+				esp_err_to_name(result));
+			break;
+		}
+		if (upload_offset != resume_offset) {
+			snprintf(error, sizeof(error), "resume offset is %lu",
+				(unsigned long)resume_offset);
+			result = ESP_ERR_INVALID_ARG;
+			break;
+		}
+		buffer = malloc(OTA_V3_VAULT_MAX_CHUNK);
+		if (!buffer) {
+			result = ESP_ERR_NO_MEM;
+			snprintf(error, sizeof(error), "no memory for OTA v3 upload");
+			break;
+		}
+		uint32_t offset = upload_offset;
+		while (offset < package_size) {
+			size_t wanted = package_size - offset;
+			if (wanted > OTA_V3_VAULT_MAX_CHUNK)
+				wanted = OTA_V3_VAULT_MAX_CHUNK;
+			int received = ota_recv_retry(req, buffer, wanted);
+			if (received <= 0) {
+				result = ESP_ERR_TIMEOUT;
+				snprintf(error, sizeof(error),
+					"upload interrupted; resume from committed checkpoint");
+				break;
+			}
+			result = ota_v3_service_stage_write(offset, buffer,
+				(size_t)received);
+			if (result != ESP_OK) {
+				abort_stage = true;
+				snprintf(error, sizeof(error), "vault write: %s",
+					esp_err_to_name(result));
+				break;
+			}
+			offset += (uint32_t)received;
+		}
+		if (offset != package_size) break;
+		keemash_ota_v3_signed_fields_t fields = {0};
+		result = ota_v3_service_stage_finish(&fields);
+		if (result != ESP_OK) {
+			abort_stage = true;
+			snprintf(error, sizeof(error), "artifact verification: %s",
+				esp_err_to_name(result));
+			break;
+		}
+		char out[384];
+		size_t pos = append_fmt(out, sizeof(out), 0,
+			"{\"ok\":true,\"artifact\":");
+		pos = append_json_string(out, sizeof(out), pos, artifact_hex);
+		pos = append_fmt(out, sizeof(out), pos, ",\"project\":");
+		pos = append_json_string(out, sizeof(out), pos, fields.project_name);
+		pos = append_fmt(out, sizeof(out), pos, ",\"version\":");
+		pos = append_json_string(out, sizeof(out), pos, fields.firmware_version);
+		pos = append_fmt(out, sizeof(out), pos,
+			",\"chip\":");
+		pos = append_json_string(out, sizeof(out), pos, fields.chip_target);
+		pos = append_fmt(out, sizeof(out), pos,
+			",\"raw_size\":%lu,\"encoded_size\":%lu}",
+			(unsigned long)fields.raw_size,
+			(unsigned long)fields.encoded_size);
+		free(buffer);
+		xSemaphoreGive(s_ota_mutex);
+		httpd_resp_set_type(req, "application/json");
+		httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+		return httpd_resp_send(req, out, pos);
+	} while (0);
+	if (abort_stage) (void)ota_v3_service_stage_abort();
+	free(buffer);
+	xSemaphoreGive(s_ota_mutex);
+	return http_json_error(req,
+		result == ESP_ERR_TIMEOUT ? "408 Request Timeout" : "400 Bad Request",
+		error);
+}
+
+static esp_err_t http_ota_v3_deploy_post(httpd_req_t *req)
+{
+	if (!ota_check_pin(req))
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	uint8_t target_mac[6];
+	char target_tag[16];
+	char error[96] = {0};
+	if (!remote_ota_target_from_req(req, target_mac, target_tag,
+		sizeof(target_tag), error, sizeof(error)))
+		return http_json_error(req, "400 Bad Request", error);
+	uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN];
+	if (!ota_v3_artifact_from_query(req, artifact_id))
+		return http_json_error(req, "400 Bad Request", "bad artifact id");
+	if (!node_route_current(target_mac))
+		return http_json_error(req, "409 Conflict", "target route not ready");
+	if (!mesh_v2_root_peer_lossless(target_mac, MESH_V2_CAP_OTA_V3))
+		return http_json_error(req, "409 Conflict", "target OTA v3 not ready");
+	keemash_ota_v3_signed_fields_t fields = {0};
+	esp_err_t result = ota_v3_service_artifact_info(artifact_id, &fields);
+	if (result != ESP_OK)
+		return http_json_error(req, "404 Not Found", "artifact not cached");
+	if (strcmp(fields.project_name, target_tag) != 0)
+		return http_json_error(req, "409 Conflict",
+			"artifact project does not match target");
+	if (!s_ota_mutex || xSemaphoreTake(s_ota_mutex, 0) != pdTRUE)
+		return http_json_error(req, "409 Conflict", "OTA already running");
+	result = ota_v3_service_deploy(target_mac, target_tag, artifact_id);
+	xSemaphoreGive(s_ota_mutex);
+	if (result != ESP_OK)
+		return http_json_error(req, "409 Conflict", esp_err_to_name(result));
+	return http_json_ok(req, "OTA v3 deployment queued");
+}
+
+static esp_err_t http_ota_v3_cancel_post(httpd_req_t *req)
+{
+	if (!ota_check_pin(req))
+		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	esp_err_t err = ota_v3_service_cancel("cancelled by admin");
+	return err == ESP_OK ? http_json_ok(req, "OTA v3 cancel requested") :
+		http_json_error(req, "409 Conflict", esp_err_to_name(err));
 }
 
 static esp_err_t wait_peer_command_result(const uint8_t peer[6], uint32_t command_id,
@@ -5653,6 +5983,11 @@ static esp_err_t http_ota_post(httpd_req_t *req)
 	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
 		return http_json_error(req, "409 Conflict", "OTA already running");
 	}
+	if (ota_v3_busy()) {
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_error(req, "409 Conflict",
+			"OTA v3 deployment already running");
+	}
 
 	esp_ota_handle_t ota_handle = 0;
 	const esp_partition_t *update_partition = NULL;
@@ -6008,6 +6343,11 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 	}
 	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
 		return http_json_error(req, "409 Conflict", "OTA already running");
+	}
+	if (ota_v3_busy()) {
+		xSemaphoreGive(s_ota_mutex);
+		return http_json_error(req, "409 Conflict",
+			"OTA v3 deployment already running");
 	}
 
 	uint8_t target_mac[6] = {0};
@@ -7870,6 +8210,41 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.user_ctx	= NULL
 	};
 
+	httpd_uri_t uri_ota_v3_status = {
+		.uri		= "/ota/v3/status",
+		.method		= HTTP_GET,
+		.handler	= http_ota_v3_status_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota_v3_vault = {
+		.uri		= "/ota/v3/vault",
+		.method		= HTTP_GET,
+		.handler	= http_ota_v3_vault_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota_v3_stage = {
+		.uri		= "/ota/v3/stage",
+		.method		= HTTP_POST,
+		.handler	= http_ota_v3_stage_post,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota_v3_deploy = {
+		.uri		= "/ota/v3/deploy",
+		.method		= HTTP_POST,
+		.handler	= http_ota_v3_deploy_post,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_ota_v3_cancel = {
+		.uri		= "/ota/v3/cancel",
+		.method		= HTTP_POST,
+		.handler	= http_ota_v3_cancel_post,
+		.user_ctx	= NULL
+	};
+
 	esp_err_t err = httpd_register_uri_handler(server, &uri_root);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_log);
@@ -7916,7 +8291,17 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ota_remote_status);
 	if (err != ESP_OK) return err;
-	return httpd_register_uri_handler(server, &uri_ota_remote);
+	err = httpd_register_uri_handler(server, &uri_ota_remote);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_v3_status);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_v3_vault);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_v3_stage);
+	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_ota_v3_deploy);
+	if (err != ESP_OK) return err;
+	return httpd_register_uri_handler(server, &uri_ota_v3_cancel);
 }
 
 

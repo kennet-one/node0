@@ -436,3 +436,27 @@ esp_err_t ota_v3_vault_entry(ota_v3_vault_t *vault, size_t index,
 	xSemaphoreGive(vault->mutex);
 	return err;
 }
+
+esp_err_t ota_v3_vault_read(ota_v3_vault_t *vault,
+	const ota_v3_vault_entry_t *entry, uint32_t offset,
+	uint8_t *bytes, size_t length)
+{
+	if (!vault || !entry || !bytes || length == 0U ||
+	    offset > entry->size || length > entry->size - offset)
+		return ESP_ERR_INVALID_ARG;
+	xSemaphoreTake(vault->mutex, portMAX_DELAY);
+	bool committed = false;
+	for (size_t i = 0; i < vault->state.count; ++i) {
+		if (vault->state.entries[i].offset == entry->offset &&
+		    vault->state.entries[i].size == entry->size &&
+		    memcmp(vault->state.entries[i].sha256, entry->sha256,
+			OTA_V3_VAULT_SHA256_LEN) == 0) {
+			committed = true;
+			break;
+		}
+	}
+	esp_err_t err = committed ? esp_partition_read(vault->partition,
+		entry->offset + offset, bytes, length) : ESP_ERR_NOT_FOUND;
+	xSemaphoreGive(vault->mutex);
+	return err;
+}
