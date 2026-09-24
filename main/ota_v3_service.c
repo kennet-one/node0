@@ -95,6 +95,13 @@ static bool s_deferred_event_valid;
 static atomic_bool s_cancel;
 static uint32_t s_last_persisted_raw_offset;
 
+static void *ota_scratch_calloc(size_t size)
+{
+	void *buffer = heap_caps_calloc(1U, size,
+		MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	return buffer ? buffer : calloc(1U, size);
+}
+
 static bool id_equal(const keemash_fabric_v2_Id128 *a,
 	const keemash_fabric_v2_Id128 *b)
 {
@@ -327,7 +334,7 @@ static esp_err_t send_wait_transfer(const deploy_request_t *request,
 static esp_err_t send_prepare(deploy_context_t *context)
 {
 	keemash_fabric_v2_OtaMeshMessage *message =
-		calloc(1U, sizeof(*message));
+		ota_scratch_calloc(sizeof(*message));
 	if (!message) return ESP_ERR_NO_MEM;
 	message->which_body = keemash_fabric_v2_OtaMeshMessage_transfer_tag;
 	keemash_fabric_v2_OtaTransfer *transfer = &message->body.transfer;
@@ -377,7 +384,7 @@ static esp_err_t send_block(
 			context->chunk, length, &context->reader);
 		if (err != ESP_OK) return err;
 		keemash_fabric_v2_OtaMeshMessage *message =
-			calloc(1U, sizeof(*message));
+			ota_scratch_calloc(sizeof(*message));
 		if (!message) return ESP_ERR_NO_MEM;
 		message->which_body =
 			keemash_fabric_v2_OtaMeshMessage_transfer_tag;
@@ -410,7 +417,7 @@ static esp_err_t send_block(
 static esp_err_t send_commit(deploy_context_t *context)
 {
 	keemash_fabric_v2_OtaMeshMessage *message =
-		calloc(1U, sizeof(*message));
+		ota_scratch_calloc(sizeof(*message));
 	if (!message) return ESP_ERR_NO_MEM;
 	message->which_body = keemash_fabric_v2_OtaMeshMessage_transfer_tag;
 	keemash_fabric_v2_OtaTransfer *transfer = &message->body.transfer;
@@ -440,7 +447,7 @@ static esp_err_t send_abort(const deploy_request_t *request,
 	const char *reason)
 {
 	keemash_fabric_v2_OtaMeshMessage *message =
-		calloc(1U, sizeof(*message));
+		ota_scratch_calloc(sizeof(*message));
 	if (!message) return ESP_ERR_NO_MEM;
 	message->which_body = keemash_fabric_v2_OtaMeshMessage_transfer_tag;
 	keemash_fabric_v2_OtaTransfer *transfer = &message->body.transfer;
@@ -531,7 +538,7 @@ static esp_err_t wait_boot_report(const deploy_request_t *request)
 
 static esp_err_t run_deploy(const deploy_request_t *request)
 {
-	deploy_context_t *context = calloc(1U, sizeof(*context));
+	deploy_context_t *context = ota_scratch_calloc(sizeof(*context));
 	if (!context) return ESP_ERR_NO_MEM;
 	bool abort_before_commit = false;
 	context->request = *request;
@@ -824,9 +831,8 @@ void ota_v3_service_on_mesh_message(const uint8_t mac[6],
 {
 	if (!s_rx_queue || !mac || !payload || payload_len == 0U ||
 	    payload_len > keemash_fabric_v2_OtaMeshMessage_size) return;
-	keemash_fabric_v2_OtaMeshMessage *message = heap_caps_calloc(1U,
-		sizeof(*message), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	if (!message) message = calloc(1U, sizeof(*message));
+	keemash_fabric_v2_OtaMeshMessage *message =
+		ota_scratch_calloc(sizeof(*message));
 	if (!message) return;
 	esp_err_t decode_err = keemash_ota_v3_decode_mesh_message(payload,
 		payload_len, message);
