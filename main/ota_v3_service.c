@@ -8,6 +8,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
@@ -193,9 +194,10 @@ static void status_from_transfer(const deploy_request_t *request,
 	s_status.encoded_offset = remote->encoded_offset;
 	s_status.retries = remote->retries;
 	s_status.resume_count = remote->resume_count;
-	strncpy(s_status.message, remote->message,
-		sizeof(s_status.message) - 1U);
-	s_status.message[sizeof(s_status.message) - 1U] = '\0';
+	snprintf(s_status.message, sizeof(s_status.message), "target: %.*s",
+		(int)sizeof(s_status.message) - 9,
+		remote->message[0] ? remote->message :
+		esp_err_to_name((esp_err_t)(int32_t)remote->status));
 	ota_v3_service_status_t snapshot = s_status;
 	xSemaphoreGive(s_lock);
 	if (remote->raw_offset != 0U &&
@@ -272,17 +274,24 @@ static esp_err_t send_wait_transfer(const deploy_request_t *request,
 	keemash_fabric_v2_OtaTransferStatus *status,
 	uint32_t minimum_encoded_offset, bool commit_ack)
 {
+	esp_err_t last_err = ESP_ERR_TIMEOUT;
+	uint32_t accepted = 0U;
 	for (uint32_t attempt = 0; attempt < OTA3_SEND_RETRIES; ++attempt) {
 		if (atomic_load(&s_cancel)) return ESP_ERR_INVALID_STATE;
 		esp_err_t err = mesh_v2_root_send_ota_v3_message(request->mac,
 			message);
 		if (err != ESP_OK) {
+			last_err = err;
 			vTaskDelay(pdMS_TO_TICKS(1000U));
 			continue;
 		}
+		accepted++;
 		rx_event_t event;
 		err = wait_event(request, RX_STATUS, OTA3_STATUS_TIMEOUT_MS, &event);
-		if (err != ESP_OK) continue;
+		if (err != ESP_OK) {
+			last_err = err;
+			continue;
+		}
 		if (event.body.status.status == ESP_OK &&
 		    event.body.status.encoded_offset < minimum_encoded_offset)
 			continue;
@@ -297,7 +306,12 @@ static esp_err_t send_wait_transfer(const deploy_request_t *request,
 		return status->status == ESP_OK ? ESP_OK :
 			(esp_err_t)(int32_t)status->status;
 	}
-	return ESP_ERR_TIMEOUT;
+	ESP_LOGW(TAG, "transfer failed target=" MACSTR " kind=%u accepted=%lu/%u offset=%lu error=%s",
+		MAC2STR(request->mac),
+		(unsigned)message->body.transfer.which_body,
+		(unsigned long)accepted, OTA3_SEND_RETRIES,
+		(unsigned long)minimum_encoded_offset, esp_err_to_name(last_err));
+	return last_err;
 }
 
 static esp_err_t send_prepare(deploy_context_t *context)
@@ -585,11 +599,19 @@ static void service_task(void *context)
 		s_last_request_valid = true;
 		esp_err_t err = run_deploy(&request);
 		if (err != ESP_OK) {
+			char message[sizeof(s_status.message)] = {0};
+			xSemaphoreTake(s_lock, portMAX_DELAY);
+			if (s_status.status == (uint32_t)err &&
+			    s_status.message[0] != '\0')
+				memcpy(message, s_status.message,
+					sizeof(message));
+			xSemaphoreGive(s_lock);
 			status_set(&request,
 				atomic_load(&s_cancel) ?
 				keemash_fabric_v2_OtaPhase_OTA_PHASE_ABORTED :
 				keemash_fabric_v2_OtaPhase_OTA_PHASE_FAILED,
-				err, esp_err_to_name(err), false, true);
+				err, message[0] ? message : esp_err_to_name(err),
+				false, true);
 		}
 	}
 }
