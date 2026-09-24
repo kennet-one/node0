@@ -34,7 +34,7 @@
 /* -------------------------------------------------------------------------- */
 
 #define RX_SIZE          (256)
-#define MESH_RX_TASK_STACK (10240U)
+#define MESH_RX_TASK_STACK (7168U)
 #define NODE0_WIFI_MTXON_STACK_EXTRA_WORDS (1000U)
 #define NODE0_WIFI_MRX_STACK_EXTRA_WORDS   (500U)
 //#define FIXED_ROOT  1   // node0 only

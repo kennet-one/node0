@@ -20,7 +20,7 @@
 #include "ota_v3_vault.h"
 #include "ota_v3_vault_verify.h"
 
-#define OTA3_TASK_STACK 10240U
+#define OTA3_TASK_STACK 8192U
 #define OTA3_TASK_PRIORITY 5U
 #define OTA3_RX_QUEUE_LEN 8U
 #define OTA3_DEPLOY_QUEUE_LEN 1U
