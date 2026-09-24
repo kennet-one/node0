@@ -4318,8 +4318,15 @@ static bool remote_ota_target_from_req(httpd_req_t *req, uint8_t mac[6],
 
 	selection_snapshot(mac, tag, tag_sz);
 
-	char q[80] = {0};
-	if (req && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+	char q[160] = {0};
+	esp_err_t query_err = req ?
+		httpd_req_get_url_query_str(req, q, sizeof(q)) :
+		ESP_ERR_NOT_FOUND;
+	if (query_err != ESP_OK && query_err != ESP_ERR_NOT_FOUND) {
+		snprintf(err, err_sz, "target query too long");
+		return false;
+	}
+	if (query_err == ESP_OK) {
 		char v[32] = {0};
 		if (httpd_query_key_value(q, "mac", v, sizeof(v)) == ESP_OK) {
 			uint8_t parsed[6];
@@ -4967,6 +4974,14 @@ static esp_err_t http_ota_v3_deploy_post(httpd_req_t *req)
 {
 	if (!ota_check_pin(req))
 		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	char query[160] = {0};
+	char target_hex[32] = {0};
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+	    httpd_query_key_value(query, "mac", target_hex,
+		    sizeof(target_hex)) != ESP_OK ||
+	    strlen(target_hex) != 12U)
+		return http_json_error(req, "400 Bad Request",
+			"explicit target MAC required");
 	uint8_t target_mac[6];
 	char target_tag[16];
 	char error[96] = {0};
