@@ -286,25 +286,35 @@ static esp_err_t send_wait_transfer(const deploy_request_t *request,
 			continue;
 		}
 		accepted++;
-		rx_event_t event;
-		err = wait_event(request, RX_STATUS, OTA3_STATUS_TIMEOUT_MS, &event);
-		if (err != ESP_OK) {
-			last_err = err;
-			continue;
+		TickType_t deadline = xTaskGetTickCount() +
+			pdMS_TO_TICKS(OTA3_STATUS_TIMEOUT_MS);
+		for (;;) {
+			TickType_t now = xTaskGetTickCount();
+			if ((int32_t)(deadline - now) <= 0) {
+				last_err = ESP_ERR_TIMEOUT;
+				break;
+			}
+			rx_event_t event;
+			err = wait_event(request, RX_STATUS,
+				pdTICKS_TO_MS(deadline - now), &event);
+			if (err != ESP_OK) {
+				last_err = err;
+				break;
+			}
+			if (event.body.status.status == ESP_OK &&
+			    event.body.status.encoded_offset < minimum_encoded_offset)
+				continue;
+			if (commit_ack && event.body.status.status == ESP_OK &&
+			    event.body.status.phase !=
+				keemash_fabric_v2_OtaPhase_OTA_PHASE_VERIFYING &&
+			    event.body.status.phase !=
+				keemash_fabric_v2_OtaPhase_OTA_PHASE_REBOOTING)
+				continue;
+			*status = event.body.status;
+			status_from_transfer(request, status);
+			return status->status == ESP_OK ? ESP_OK :
+				(esp_err_t)(int32_t)status->status;
 		}
-		if (event.body.status.status == ESP_OK &&
-		    event.body.status.encoded_offset < minimum_encoded_offset)
-			continue;
-		if (commit_ack && event.body.status.status == ESP_OK &&
-		    event.body.status.phase !=
-			keemash_fabric_v2_OtaPhase_OTA_PHASE_VERIFYING &&
-		    event.body.status.phase !=
-			keemash_fabric_v2_OtaPhase_OTA_PHASE_REBOOTING)
-			continue;
-		*status = event.body.status;
-		status_from_transfer(request, status);
-		return status->status == ESP_OK ? ESP_OK :
-			(esp_err_t)(int32_t)status->status;
 	}
 	ESP_LOGW(TAG, "transfer failed target=" MACSTR " kind=%u accepted=%lu/%u offset=%lu error=%s",
 		MAC2STR(request->mac),
@@ -818,8 +828,12 @@ void ota_v3_service_on_mesh_message(const uint8_t mac[6],
 		sizeof(*message), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!message) message = calloc(1U, sizeof(*message));
 	if (!message) return;
-	if (keemash_ota_v3_decode_mesh_message(payload, payload_len, message) !=
-	    ESP_OK) {
+	esp_err_t decode_err = keemash_ota_v3_decode_mesh_message(payload,
+		payload_len, message);
+	if (decode_err != ESP_OK) {
+		ESP_LOGW(TAG, "OTA v3 RX decode failed from " MACSTR
+			" len=%lu err=%s", MAC2STR(mac),
+			(unsigned long)payload_len, esp_err_to_name(decode_err));
 		free(message);
 		return;
 	}
@@ -831,6 +845,11 @@ void ota_v3_service_on_mesh_message(const uint8_t mac[6],
 	    keemash_fabric_v2_OtaTransfer_status_tag) {
 		event.kind = RX_STATUS;
 		event.body.status = message->body.transfer.body.status;
+		ESP_LOGD(TAG, "OTA v3 RX status from " MACSTR
+			" phase=%u code=%lu encoded=%lu", MAC2STR(mac),
+			(unsigned)event.body.status.phase,
+			(unsigned long)event.body.status.status,
+			(unsigned long)event.body.status.encoded_offset);
 	} else if (message->which_body ==
 	    keemash_fabric_v2_OtaMeshMessage_boot_report_tag) {
 		event.kind = RX_BOOT_REPORT;
