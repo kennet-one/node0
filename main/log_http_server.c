@@ -5015,6 +5015,34 @@ static esp_err_t http_ota_v3_cancel_post(httpd_req_t *req)
 {
 	if (!ota_check_pin(req))
 		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
+	char query[160] = {0};
+	char operation_hex[33] = {0};
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+	    httpd_query_key_value(query, "operation", operation_hex,
+		    sizeof(operation_hex)) == ESP_OK) {
+		uint8_t operation_id[16];
+		uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN];
+		uint8_t target_mac[6];
+		char target_tag[16];
+		char error[96] = {0};
+		if (!parse_hex_bytes(operation_hex, operation_id,
+				 sizeof(operation_id)) ||
+		    !ota_v3_artifact_from_query(req, artifact_id) ||
+		    !remote_ota_target_from_req(req, target_mac, target_tag,
+				 sizeof(target_tag), error, sizeof(error)))
+			return http_json_error(req, "400 Bad Request",
+				"invalid abort target or operation");
+		if (!node_route_current(target_mac) ||
+		    !mesh_v2_root_peer_lossless(target_mac,
+			MESH_V2_CAP_OTA_V3))
+			return http_json_error(req, "409 Conflict",
+				"target OTA v3 route not ready");
+		esp_err_t err = ota_v3_service_abort_operation(target_mac,
+			artifact_id, operation_id);
+		return err == ESP_OK ?
+			http_json_ok(req, "OTA v3 abort queued") :
+			http_json_error(req, "409 Conflict", esp_err_to_name(err));
+	}
 	esp_err_t err = ota_v3_service_cancel("cancelled by admin");
 	return err == ESP_OK ? http_json_ok(req, "OTA v3 cancel requested") :
 		http_json_error(req, "409 Conflict", esp_err_to_name(err));

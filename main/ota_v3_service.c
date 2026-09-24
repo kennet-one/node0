@@ -774,6 +774,29 @@ esp_err_t ota_v3_service_cancel(const char *reason)
 	return ESP_OK;
 }
 
+esp_err_t ota_v3_service_abort_operation(const uint8_t target_mac[6],
+	const uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN],
+	const uint8_t operation_id[16])
+{
+	if (!s_task || !target_mac || !artifact_id || !operation_id)
+		return ESP_ERR_INVALID_ARG;
+	xSemaphoreTake(s_lock, portMAX_DELAY);
+	bool busy = s_status.active;
+	xSemaphoreGive(s_lock);
+	if (busy) return ESP_ERR_INVALID_STATE;
+	deploy_request_t request = {0};
+	memcpy(request.mac, target_mac, sizeof(request.mac));
+	memcpy(request.artifact_id, artifact_id,
+		sizeof(request.artifact_id));
+	for (size_t i = 0; i < 8U; ++i) {
+		request.operation_id.high =
+			(request.operation_id.high << 8U) | operation_id[i];
+		request.operation_id.low =
+			(request.operation_id.low << 8U) | operation_id[8U + i];
+	}
+	return send_abort(&request, "admin orphan cleanup");
+}
+
 void ota_v3_service_status(ota_v3_service_status_t *status)
 {
 	if (!status) return;

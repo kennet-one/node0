@@ -53,6 +53,9 @@ esp_err_t ota_v3_service_deploy(const uint8_t target_mac[6],
 	const char *expected_project,
 	const uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN]);
 esp_err_t ota_v3_service_cancel(const char *reason);
+esp_err_t ota_v3_service_abort_operation(const uint8_t target_mac[6],
+	const uint8_t artifact_id[KEEMASH_OTA_V3_SHA256_LEN],
+	const uint8_t operation_id[16]);
 void ota_v3_service_status(ota_v3_service_status_t *status);
 
 void ota_v3_service_on_mesh_message(const uint8_t mac[6],
