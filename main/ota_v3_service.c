@@ -426,11 +426,12 @@ static esp_err_t send_commit(deploy_context_t *context)
 	return err;
 }
 
-static void send_abort(const deploy_request_t *request, const char *reason)
+static esp_err_t send_abort(const deploy_request_t *request,
+	const char *reason)
 {
 	keemash_fabric_v2_OtaMeshMessage *message =
 		calloc(1U, sizeof(*message));
-	if (!message) return;
+	if (!message) return ESP_ERR_NO_MEM;
 	message->which_body = keemash_fabric_v2_OtaMeshMessage_transfer_tag;
 	keemash_fabric_v2_OtaTransfer *transfer = &message->body.transfer;
 	transfer->which_body = keemash_fabric_v2_OtaTransfer_abort_tag;
@@ -442,8 +443,10 @@ static void send_abort(const deploy_request_t *request, const char *reason)
 		KEEMASH_OTA_V3_SHA256_LEN);
 	strncpy(abort->reason, reason ? reason : "cancelled",
 		sizeof(abort->reason) - 1U);
-	(void)mesh_v2_root_send_ota_v3_message(request->mac, message);
+	esp_err_t err = mesh_v2_root_send_ota_v3_message(request->mac,
+		message);
 	free(message);
+	return err;
 }
 
 static esp_err_t send_boot_ack(const deploy_request_t *request,
@@ -520,6 +523,7 @@ static esp_err_t run_deploy(const deploy_request_t *request)
 {
 	deploy_context_t *context = calloc(1U, sizeof(*context));
 	if (!context) return ESP_ERR_NO_MEM;
+	bool abort_before_commit = false;
 	context->request = *request;
 	context->reader.vault = s_vault;
 	esp_err_t err = ota_v3_vault_find(s_vault, request->artifact_id,
@@ -550,18 +554,16 @@ static esp_err_t run_deploy(const deploy_request_t *request)
 	status_set(request,
 		keemash_fabric_v2_OtaPhase_OTA_PHASE_TRANSFERRING,
 		ESP_OK, "preparing target", true, true);
+	abort_before_commit = true;
 	err = send_prepare(context);
 	if (err != ESP_OK) goto done;
 	err = keemash_ota_v3_package_for_each_block(package_read,
 		&context->reader, &context->package, send_block, context);
-	if (err != ESP_OK) {
-		if (atomic_load(&s_cancel))
-			send_abort(request, "deployment cancelled");
-		goto done;
-	}
+	if (err != ESP_OK) goto done;
 	status_set(request,
 		keemash_fabric_v2_OtaPhase_OTA_PHASE_VERIFYING,
 		ESP_OK, "verifying target image", true, true);
+	abort_before_commit = false;
 	err = send_commit(context);
 	if (err != ESP_OK) goto done;
 	status_set(request,
@@ -569,6 +571,13 @@ static esp_err_t run_deploy(const deploy_request_t *request)
 		ESP_OK, "waiting for validated boot", true, true);
 	err = wait_boot_report(request);
 done:
+	if (err != ESP_OK && abort_before_commit) {
+		esp_err_t abort_err = send_abort(request,
+			atomic_load(&s_cancel) ? "deployment cancelled" :
+			"deployment failed");
+		ESP_LOGW(TAG, "pre-commit abort queued: %s",
+			esp_err_to_name(abort_err));
+	}
 	free(context->chunk);
 	free(context);
 	return err;
