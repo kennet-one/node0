@@ -3627,6 +3627,8 @@ static size_t append_nodes_json(char *out, size_t cap, size_t pos)
 	local_node.layer = 1;
 	local_node.max_layer = CONFIG_MESH_MAX_LAYER;
 	local_node.parent_rssi = 0;
+	local_node.diag_valid = true;
+	local_node.reset_reason = (uint16_t)esp_reset_reason();
 	local_node.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY |
 	                          MESH_V2_CAP_TOPOLOGY | MESH_V2_CAP_RELIABLE_E2E |
 	                          MESH_V2_CAP_SACK | MESH_V2_CAP_FRAGMENT |
