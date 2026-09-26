@@ -230,24 +230,22 @@ static void pending_task(void *arg)
 	(void)arg;
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(250));
-		pending_command_t expired[COMMAND_PENDING_SLOTS];
-		size_t count = 0;
 		uint32_t now = now_ms();
-		portENTER_CRITICAL(&s_pending_lock);
 		for (size_t i = 0; i < COMMAND_PENDING_SLOTS; i++) {
+			pending_command_t expired = {0};
+			portENTER_CRITICAL(&s_pending_lock);
 			if (s_pending[i].used &&
 			    (uint32_t)(now - s_pending[i].queued_ms) >=
 				    COMMAND_RESULT_TIMEOUT_MS) {
-				expired[count++] = s_pending[i];
+				expired = s_pending[i];
 				memset(&s_pending[i], 0, sizeof(s_pending[i]));
 			}
-		}
-		portEXIT_CRITICAL(&s_pending_lock);
-		for (size_t i = 0; i < count; i++) {
-			keelink_server_command_result(expired[i].command_id,
+			portEXIT_CRITICAL(&s_pending_lock);
+			if (!expired.used) continue;
+			keelink_server_command_result(expired.command_id,
 				MESH_V2_CONTROL_STATUS_FAILED, "result timeout");
-			command_feedback("TIMEOUT", expired[i].owner,
-					 expired[i].command_id, "result timeout");
+			command_feedback("TIMEOUT", expired.owner,
+					 expired.command_id, "result timeout");
 		}
 	}
 }
