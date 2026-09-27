@@ -348,8 +348,10 @@ static void zone_task(void *arg)
                 mesh_v2_root_next_command_id(), "temp_echo");
             last_source_request = now;
         }
-        if (!source.route_up || !source.reliable_ready ||
-            (last_sample && now - last_sample >= FRESH_MS)) invalid = true;
+        /* Do not revoke a still-fresh sample for a transient route/ACK flap.
+         * Kheater owns the same bounded freshness deadline and falls back
+         * independently if no replacement sample arrives. */
+        if (last_sample && now - last_sample >= FRESH_MS) invalid = true;
         if (invalid) {
             if (invalid_sent) continue;
             snprintf(command, sizeof(command), "HX:%08lx", (unsigned long)b.revision);
