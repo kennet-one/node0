@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_log_level.h"
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 #include "esp_netif.h"
