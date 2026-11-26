@@ -25,7 +25,7 @@ static const char *TAG = "mesh_sensors";
 
 typedef struct {
 	const char *tag;
-	const char *cmds[4];
+	const char *cmds[8];	// was [4]: esp_mixer has 5 cmds, cmds[4] read cmd_count as a pointer -> LoadProhibited panic
 	uint8_t cmd_count;
 } node_cmd_def_t;
 
