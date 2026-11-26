@@ -8598,12 +8598,17 @@ esp_err_t log_http_server_start(void)
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;
-	/* Keep-alive OFF: each idle keep-alive TLS session pins several KB of
-	 * internal RAM (mbedtls handshake buffers), and internal heap already runs
-	 * near the floor (min ~8 KB) with 7 mesh children — nodes drop when the
-	 * mesh stack cannot allocate. A handshake per poll (~10 s cadence) costs
-	 * far less than losing children. */
-	config.httpd.keep_alive_enable = false;
+	/* Keep-alive ON: with MBEDTLS_DYNAMIC_BUFFER every poll handshake
+	 * transiently needs a 16 KB contiguous in-buffer; the largest free block
+	 * is ~31 KB, so two concurrent handshakes make the second alloc fail and
+	 * the psa fail-path crashes (StoreProhibited in esp_mbedtls_mem_free,
+	 * psa_crypto.c psa_fail_key_creation). Reusing one session per client
+	 * removes the handshake spikes; an idle session costs only a small ctx
+	 * (BLE is off, internal min ~54 KB, max 6 sockets). */
+	config.httpd.keep_alive_enable = true;
+	config.httpd.keep_alive_idle = 10;
+	config.httpd.keep_alive_interval = 5;
+	config.httpd.keep_alive_count = 3;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;
