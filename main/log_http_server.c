@@ -467,6 +467,29 @@ typedef struct {
 static SemaphoreHandle_t s_remote_ota_ack_sem = NULL;
 static portMUX_TYPE s_remote_ota_lock = portMUX_INITIALIZER_UNLOCKED;
 static remote_ota_wait_t s_remote_ota_wait = {0};
+
+/* ---- Async remote-op queue --------------------------------------------------
+ * Slow mesh relays (remote OTA chunk waits, remote reboot ACK waits) used to run
+ * inside the single httpd worker, wedging every tablet/PC poll for minutes.
+ * Handlers now validate, stage the payload and enqueue; this worker owns the
+ * relay. Status stays observable via /ota/remote/status. */
+typedef struct {
+	bool reboot;                     /* true: reboot command, false: OTA relay */
+	uint8_t mac[6];
+	char tag[16];
+	uint8_t *buf;                    /* full image in heap (OTA only) */
+	uint32_t total_len;
+	bool debug_corrupt_sha;
+	uint32_t debug_interrupt_after;
+	uint32_t debug_route_loss_after_sends;
+} remote_op_t;
+
+static QueueHandle_t s_remote_op_queue = NULL;
+static volatile bool s_remote_op_active = false;
+
+static void remote_op_relay(const remote_op_t *op);
+static void remote_op_worker(void *arg);
+static bool remote_op_busy(void);
 static remote_ota_status_t s_remote_ota_status = {
 	.state = NODE0_OTA_IDLE,
 };
@@ -5881,22 +5904,19 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		return http_json_error(req, "403 Forbidden",
 		                       "reboot disabled: set CONFIG_NODE0_OTA_PIN");
 	}
-
 	if (!ota_check_pin(req)) {
 		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
 	}
-
-	if (!s_ota_mutex) {
-		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
-	}
-	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
-		return http_json_error(req, "409 Conflict", "OTA/reboot already running");
+	if (remote_op_busy()) {
+		return http_json_error(req, "409 Conflict",
+		                       "remote OTA/reboot already running");
 	}
 
 	uint8_t target_mac[6] = {0};
 	char target_tag[16] = "node";
 	char err_msg[96] = "remote reboot failed";
-	esp_err_t result = ESP_FAIL;
+	remote_op_t op;
+	memset(&op, 0, sizeof(op));
 
 	do {
 		if (!remote_ota_target_from_req(req, target_mac, target_tag,
@@ -5907,8 +5927,8 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		remote_ota_normalize_tag_for_mac(target_mac, target_tag,
 		                                 sizeof(target_tag));
 		if (!remote_ota_supported_tag(target_tag)) {
-			snprintf(err_msg, sizeof(err_msg), "remote reboot unsupported for %s",
-			         target_tag);
+			snprintf(err_msg, sizeof(err_msg),
+			         "remote reboot unsupported for %s", target_tag);
 			break;
 		}
 		if (!node_route_current(target_mac)) {
@@ -5918,43 +5938,21 @@ static esp_err_t http_reboot_remote_post(httpd_req_t *req)
 		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
 			(void)remote_stream_rearm_for_mac(target_mac, true);
 		}
-		if (!mesh_v2_root_peer_advertises_lossless(target_mac,
-						       MESH_V2_CAP_TYPED_CONTROL)) {
-			snprintf(err_msg, sizeof(err_msg),
-				 "target reliable CONTROL session not ready");
-			break;
-		}
 
-		uint32_t command_id = mesh_v2_root_next_command_id();
-		mesh_v2_command_result_t command_result = {0};
-		result = mesh_v2_root_send_command(target_mac, command_id,
-						"system.reboot");
-		if (result == ESP_OK)
-			result = wait_peer_command_result(target_mac, command_id,
-						  &command_result, 1000);
-		if (result != ESP_OK) {
-			snprintf(err_msg, sizeof(err_msg),
-				 "reliable reboot result timeout: %s",
-				 esp_err_to_name(result));
-			break;
-		}
-		if (command_result.status != MESH_V2_CONTROL_STATUS_OK) {
-			snprintf(err_msg, sizeof(err_msg), "reliable reboot rejected: %.48s",
-				 command_result.text);
-			result = ESP_FAIL;
-			break;
-		}
-		snprintf(err_msg, sizeof(err_msg), "remote reboot accepted, %s rebooting",
-		         target_tag);
-		ESP_LOGI(TAG, "%s via reliable CONTROL id=%lu", err_msg,
-		         (unsigned long)command_id);
+		memcpy(op.mac, target_mac, 6);
+		copy_tag(op.tag, sizeof(op.tag), target_tag);
+		op.reboot = true;
 
-		xSemaphoreGive(s_ota_mutex);
-		return http_json_ok(req, err_msg);
+		if (xQueueSend(s_remote_op_queue, &op, 0) != pdTRUE) {
+			snprintf(err_msg, sizeof(err_msg), "remote op queue busy");
+			break;
+		}
+		ESP_LOGI(TAG, "remote reboot queued for " MACSTR " (%s)",
+		         MAC2STR(target_mac), target_tag);
+		return http_json_ok(req, "remote reboot queued");
 	} while (0);
 
 	ESP_LOGW(TAG, "remote reboot failed: %s", err_msg);
-	xSemaphoreGive(s_ota_mutex);
 	return http_json_error(req, "400 Bad Request", err_msg);
 }
 
@@ -6372,6 +6370,208 @@ static esp_err_t http_ota_remote_status_get(httpd_req_t *req)
 	return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
+/* Runs on the remote-op worker task (never on httpd). Mirrors the former
+ * inline handler relay, but reads chunks from the staged full-image buffer
+ * instead of the HTTP socket, so the client connection is long gone. */
+static void remote_op_relay(const remote_op_t *op)
+{
+	char err_msg[96] = "remote op failed";
+	esp_err_t result = ESP_FAIL;
+	bool remote_started = false;
+	bool sha_started = false;
+	mbedtls_md_context_t sha_ctx;
+	uint32_t v2_op_id = 0;
+	uint8_t sha[MESH_V2_OTA_SHA256_LEN] = {0};
+
+	do {
+		if (!node_route_current(op->mac)) {
+			snprintf(err_msg, sizeof(err_msg), "target route not ready");
+			break;
+		}
+		if (!node_has_fresh_telemetry(op->mac, NODEINFO_STALE_MS)) {
+			(void)remote_stream_rearm_for_mac(op->mac, true);
+		}
+
+		if (op->reboot) {
+			if (!mesh_v2_root_peer_advertises_lossless(op->mac,
+					MESH_V2_CAP_TYPED_CONTROL)) {
+				snprintf(err_msg, sizeof(err_msg),
+				         "target reliable CONTROL session not ready");
+				break;
+			}
+			uint32_t command_id = mesh_v2_root_next_command_id();
+			mesh_v2_command_result_t command_result = {0};
+			result = mesh_v2_root_send_command(op->mac, command_id,
+			                                   "system.reboot");
+			if (result == ESP_OK)
+				result = wait_peer_command_result(op->mac, command_id,
+				                                   &command_result, 1000);
+			if (result != ESP_OK) {
+				snprintf(err_msg, sizeof(err_msg),
+				         "reliable reboot result timeout: %s",
+				         esp_err_to_name(result));
+				break;
+			}
+			if (command_result.status != MESH_V2_CONTROL_STATUS_OK) {
+				snprintf(err_msg, sizeof(err_msg),
+				         "reliable reboot rejected: %.48s",
+				         command_result.text);
+				result = ESP_FAIL;
+				break;
+			}
+			snprintf(err_msg, sizeof(err_msg),
+			         "remote reboot accepted, %s rebooting", op->tag);
+			ESP_LOGI(TAG, "%s via reliable CONTROL id=%lu (worker)", err_msg,
+			         (unsigned long)command_id);
+			break;
+		}
+
+		/* ---- OTA relay from the staged buffer ---- */
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+		if (op->debug_route_loss_after_sends > 0) {
+			remote_ota_v2_debug_set_route_loss_after_sends(
+				op->debug_route_loss_after_sends);
+			ESP_LOGW(TAG, "remote OTA v2 debug: route/session loss after %lu sends",
+			         (unsigned long)op->debug_route_loss_after_sends);
+		}
+#endif
+		remote_ota_status_begin(op->mac, op->tag, op->total_len);
+
+		v2_op_id = remote_ota_next_op_id();
+		remote_ota_status_mark_v2(v2_op_id, REMOTE_OTA_V2_CHUNK_SIZE);
+
+		result = ota_sha256_start(&sha_ctx);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "sha256 init failed");
+			break;
+		}
+		sha_started = true;
+
+		mesh_v2_ota_prepare_payload_t prepare;
+		memset(&prepare, 0, sizeof(prepare));
+		prepare.c.op = MESH_V2_OTA_OP_PREPARE;
+		prepare.c.op_id = v2_op_id;
+		prepare.c.image_size = op->total_len;
+		prepare.c.len = REMOTE_OTA_V2_CHUNK_SIZE;
+		{
+			/* project/version from the staged image header */
+			esp_app_desc_t desc = {0};
+			memcpy(&desc, op->buf,
+			       sizeof(desc) < op->total_len ? sizeof(desc) : op->total_len);
+			copy_packet_text(prepare.c.project_name, sizeof(prepare.c.project_name),
+			                 desc.project_name, sizeof(desc.project_name));
+			copy_packet_text(prepare.c.version, sizeof(prepare.c.version),
+			                 desc.version, sizeof(desc.version));
+		}
+
+		mesh_v2_ota_status_payload_t ack_v2;
+		remote_started = true;
+		result = remote_ota_send_wait_v2(op->mac, &prepare, sizeof(prepare),
+		                                 MESH_V2_OTA_OP_PREPARE, v2_op_id,
+		                                 &ack_v2, err_msg, sizeof(err_msg));
+		if (result != ESP_OK) break;
+
+		result = ota_sha256_update(&sha_ctx, op->buf, op->total_len);
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "sha256 update failed");
+			break;
+		}
+
+		{
+			uint32_t written = 0;
+			result = remote_ota_send_chunks_v2_from_buffer(
+				op->mac, op->buf, op->total_len, op->total_len,
+				v2_op_id, &written, err_msg, sizeof(err_msg));
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+			if (result == ESP_OK &&
+			    remote_ota_v2_debug_should_interrupt_upload(
+				    written, op->debug_interrupt_after, err_msg, sizeof(err_msg))) {
+				result = ESP_FAIL;
+			}
+#endif
+			if (result == ESP_OK && written != op->total_len) {
+				snprintf(err_msg, sizeof(err_msg), "remote OTA v2 incomplete");
+				result = ESP_FAIL;
+			}
+		}
+		if (result != ESP_OK) break;
+
+		result = ota_sha256_finish(&sha_ctx, sha);
+		sha_started = false;
+		if (result != ESP_OK) {
+			snprintf(err_msg, sizeof(err_msg), "sha256 finish failed");
+			break;
+		}
+
+		mesh_v2_ota_commit_payload_t commit;
+		memset(&commit, 0, sizeof(commit));
+		commit.c.op = MESH_V2_OTA_OP_COMMIT;
+		commit.c.op_id = v2_op_id;
+		commit.c.image_size = op->total_len;
+		commit.c.offset = op->total_len;
+		commit.c.len = op->total_len;
+		memcpy(commit.c.sha256, sha, sizeof(sha));
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+		if (op->debug_corrupt_sha) {
+			commit.c.sha256[0] ^= 0x5AU;
+			ESP_LOGW(TAG, "remote OTA v2 debug: corrupting COMMIT sha256");
+		}
+#endif
+		result = remote_ota_send_wait_v2(op->mac, &commit, sizeof(commit),
+		                                 MESH_V2_OTA_OP_COMMIT, v2_op_id,
+		                                 &ack_v2, err_msg, sizeof(err_msg));
+		if (result != ESP_OK) break;
+
+		snprintf(err_msg, sizeof(err_msg), "remote OTA v2 OK, %s rebooting", op->tag);
+		ESP_LOGI(TAG, "%s", err_msg);
+	} while (0);
+
+	if (sha_started) {
+		mbedtls_md_free(&sha_ctx);
+	}
+
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	remote_ota_v2_debug_clear_faults();
+#endif
+	if (result != ESP_OK && remote_started && v2_op_id != 0) {
+		remote_ota_send_abort_v2(op->mac, v2_op_id, err_msg);
+	}
+	if (!op->reboot) {
+		remote_ota_status_finish(result == ESP_OK ? NODE0_OTA_REBOOTING
+		                                          : NODE0_OTA_FAILED, err_msg);
+	}
+	if (result != ESP_OK) {
+		ESP_LOGW(TAG, "remote op failed: %s", err_msg);
+	}
+}
+
+static void remote_op_worker(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		remote_op_t op;
+		if (xQueueReceive(s_remote_op_queue, &op, portMAX_DELAY) != pdTRUE) {
+			continue;
+		}
+		s_remote_op_active = true;
+		/* serialize against the local /ota self-flash handler */
+		if (xSemaphoreTake(s_ota_mutex, portMAX_DELAY) == pdTRUE) {
+			remote_op_relay(&op);
+			xSemaphoreGive(s_ota_mutex);
+		}
+		if (op.buf) {
+			free(op.buf);
+		}
+		s_remote_op_active = false;
+	}
+}
+
+static bool remote_op_busy(void)
+{
+	return s_remote_op_active ||
+	       (s_remote_op_queue && uxQueueMessagesWaiting(s_remote_op_queue) > 0);
+}
+
 static esp_err_t http_ota_remote_post(httpd_req_t *req)
 {
 	if (!ota_enabled()) {
@@ -6385,265 +6585,132 @@ static esp_err_t http_ota_remote_post(httpd_req_t *req)
 		remote_ota_status_finish(NODE0_OTA_FAILED, "bad OTA PIN");
 		return http_json_error(req, "403 Forbidden", "bad OTA PIN");
 	}
-
-	if (!s_ota_mutex) {
-		return http_json_error(req, "500 Internal Server Error", "OTA mutex unavailable");
-	}
-	if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
-		return http_json_error(req, "409 Conflict", "OTA already running");
+	if (remote_op_busy()) {
+		return http_json_error(req, "409 Conflict",
+		                       "remote OTA/reboot already running");
 	}
 	if (ota_v3_busy()) {
-		xSemaphoreGive(s_ota_mutex);
 		return http_json_error(req, "409 Conflict",
-			"OTA v3 deployment already running");
+		                       "OTA v3 deployment already running");
 	}
 
 	uint8_t target_mac[6] = {0};
 	char target_tag[16] = "node";
 	char err_msg[96] = "remote OTA failed";
 	uint8_t *buf = NULL;
-	bool remote_started = false;
-	uint32_t v2_op_id = 0;
-	esp_err_t result = ESP_FAIL;
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-	bool debug_corrupt_sha = false;
-	uint32_t debug_interrupt_after = 0;
-	uint32_t debug_route_loss_after_sends = 0;
-	char debug_q[192] = {0};
-	remote_ota_v2_debug_clear_faults();
-	if (httpd_req_get_url_query_str(req, debug_q, sizeof(debug_q)) == ESP_OK) {
-		debug_corrupt_sha = query_bool_value(debug_q, "debug_corrupt_sha");
-		debug_interrupt_after = query_u32_value(debug_q, "debug_interrupt_after");
-		debug_route_loss_after_sends =
-			query_u32_value(debug_q, "debug_route_loss_after_sends");
-	}
-#endif
-
-	do {
-		if (!remote_ota_mode_from_req(req, err_msg, sizeof(err_msg))) {
-			break;
-		}
-		if (!remote_ota_target_from_req(req, target_mac, target_tag, sizeof(target_tag),
-		                                err_msg, sizeof(err_msg))) {
-			break;
-		}
-		remote_ota_normalize_tag_for_mac(target_mac, target_tag,
-		                                 sizeof(target_tag));
-		if (!remote_ota_supported_tag(target_tag)) {
-			snprintf(err_msg, sizeof(err_msg), "remote OTA unsupported for %s", target_tag);
-			break;
-		}
-		if (!node_route_current(target_mac)) {
-			snprintf(err_msg, sizeof(err_msg), "target route not ready");
-			break;
-		}
-		if (!node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS)) {
-			(void)remote_stream_rearm_for_mac(target_mac, true);
-		}
-		bool v2_supported = remote_ota_v2_supported_for_mac(target_mac);
-		if (!v2_supported) {
-			snprintf(err_msg, sizeof(err_msg), "target OTA v2 not ready");
-			break;
-		}
-
-		size_t total_len = req->content_len;
-		if (total_len == 0 || total_len > UINT32_MAX) {
-			snprintf(err_msg, sizeof(err_msg), "bad Content-Length");
-			break;
-		}
-
-		buf = (uint8_t *)malloc(NODE0_OTA_BUF_SIZE);
-		if (!buf) {
-			snprintf(err_msg, sizeof(err_msg), "no memory for OTA buffer");
-			break;
-		}
-
-		const size_t validate_need =
-			sizeof(esp_image_header_t) +
-			sizeof(esp_image_segment_header_t) +
-			sizeof(esp_app_desc_t);
-		size_t first_want = total_len < NODE0_OTA_BUF_SIZE ? total_len : NODE0_OTA_BUF_SIZE;
-		size_t first_have = 0;
-		while (first_have < first_want && first_have < validate_need) {
-			int r = ota_recv_retry(req, buf + first_have, first_want - first_have);
-			if (r <= 0) {
-				break;
-			}
-			first_have += (size_t)r;
-		}
-		if (first_have == 0) {
-			snprintf(err_msg, sizeof(err_msg), "failed to read OTA image");
-			break;
-		}
-
-		esp_app_desc_t new_desc = {0};
-		if (!ota_validate_first_chunk(buf, first_have, &new_desc, target_tag,
-		                              err_msg, sizeof(err_msg))) {
-			break;
-		}
-
-		ESP_LOGI(TAG, "remote OTA upload -> " MACSTR " tag=%s project=%s version=%s size=%lu",
-		         MAC2STR(target_mac), target_tag, new_desc.project_name,
-		         new_desc.version, (unsigned long)total_len);
-
-		remote_ota_status_begin(target_mac, target_tag, (uint32_t)total_len);
-
-		{
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-			if (debug_route_loss_after_sends > 0) {
-				remote_ota_v2_debug_set_route_loss_after_sends(
-					debug_route_loss_after_sends);
-				ESP_LOGW(TAG, "remote OTA v2 debug: route/session loss after %lu sends",
-				         (unsigned long)debug_route_loss_after_sends);
-			}
-#endif
-			mbedtls_md_context_t sha_ctx;
-			bool sha_started = false;
-			uint8_t sha[MESH_V2_OTA_SHA256_LEN] = {0};
-			v2_op_id = remote_ota_next_op_id();
-			remote_ota_status_mark_v2(v2_op_id, REMOTE_OTA_V2_CHUNK_SIZE);
-
-			result = ota_sha256_start(&sha_ctx);
-			if (result != ESP_OK) {
-				snprintf(err_msg, sizeof(err_msg), "sha256 init failed");
-				break;
-			}
-			sha_started = true;
-
-			mesh_v2_ota_prepare_payload_t prepare;
-			memset(&prepare, 0, sizeof(prepare));
-			prepare.c.op = MESH_V2_OTA_OP_PREPARE;
-			prepare.c.op_id = v2_op_id;
-			prepare.c.image_size = (uint32_t)total_len;
-			prepare.c.len = REMOTE_OTA_V2_CHUNK_SIZE;
-			copy_packet_text(prepare.c.project_name, sizeof(prepare.c.project_name),
-			                 new_desc.project_name, sizeof(new_desc.project_name));
-			copy_packet_text(prepare.c.version, sizeof(prepare.c.version),
-			                 new_desc.version, sizeof(new_desc.version));
-
-			mesh_v2_ota_status_payload_t ack_v2;
-			remote_started = true;
-			result = remote_ota_send_wait_v2(target_mac, &prepare, sizeof(prepare),
-			                                MESH_V2_OTA_OP_PREPARE, v2_op_id,
-			                                &ack_v2, err_msg, sizeof(err_msg));
-			if (result != ESP_OK) {
-				if (sha_started) mbedtls_md_free(&sha_ctx);
-				break;
-			}
-
-			result = ota_sha256_update(&sha_ctx, buf, first_have);
-			if (result == ESP_OK) {
-				uint32_t written = 0;
-				result = remote_ota_send_chunks_v2_from_buffer(
-					target_mac, buf, first_have, (uint32_t)total_len,
-					v2_op_id, &written, err_msg, sizeof(err_msg));
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-				if (result == ESP_OK &&
-				    remote_ota_v2_debug_should_interrupt_upload(
-					    written, debug_interrupt_after, err_msg, sizeof(err_msg))) {
-					result = ESP_FAIL;
-				}
-#endif
-				while (result == ESP_OK && written < total_len) {
-					size_t to_read = total_len - written;
-					if (to_read > NODE0_OTA_BUF_SIZE) to_read = NODE0_OTA_BUF_SIZE;
-
-					int r = ota_recv_retry(req, buf, to_read);
-					if (r <= 0) {
-						snprintf(err_msg, sizeof(err_msg), "OTA upload interrupted");
-						result = ESP_FAIL;
-						break;
-					}
-					result = ota_sha256_update(&sha_ctx, buf, (size_t)r);
-					if (result != ESP_OK) {
-						snprintf(err_msg, sizeof(err_msg), "sha256 update failed");
-						break;
-					}
-					result = remote_ota_send_chunks_v2_from_buffer(
-						target_mac, buf, (size_t)r, (uint32_t)total_len,
-						v2_op_id, &written, err_msg, sizeof(err_msg));
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-					if (result == ESP_OK &&
-					    remote_ota_v2_debug_should_interrupt_upload(
-						    written, debug_interrupt_after, err_msg, sizeof(err_msg))) {
-						result = ESP_FAIL;
-					}
-#endif
-				}
-				if (result == ESP_OK && written != total_len) {
-					snprintf(err_msg, sizeof(err_msg), "remote OTA v2 incomplete");
-					result = ESP_FAIL;
-				}
-			} else {
-				snprintf(err_msg, sizeof(err_msg), "sha256 update failed");
-			}
-
-			if (result == ESP_OK) {
-				result = ota_sha256_finish(&sha_ctx, sha);
-				sha_started = false;
-				if (result != ESP_OK) {
-					snprintf(err_msg, sizeof(err_msg), "sha256 finish failed");
-				}
-			}
-			if (sha_started) {
-				mbedtls_md_free(&sha_ctx);
-			}
-			if (result != ESP_OK) {
-				break;
-			}
-
-			mesh_v2_ota_commit_payload_t commit;
-			memset(&commit, 0, sizeof(commit));
-			commit.c.op = MESH_V2_OTA_OP_COMMIT;
-			commit.c.op_id = v2_op_id;
-			commit.c.image_size = (uint32_t)total_len;
-			commit.c.offset = (uint32_t)total_len;
-			commit.c.len = (uint32_t)total_len;
-			memcpy(commit.c.sha256, sha, sizeof(sha));
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-			if (debug_corrupt_sha) {
-				commit.c.sha256[0] ^= 0x5AU;
-				ESP_LOGW(TAG, "remote OTA v2 debug: corrupting COMMIT sha256");
-			}
-#endif
-
-			result = remote_ota_send_wait_v2(target_mac, &commit, sizeof(commit),
-			                                MESH_V2_OTA_OP_COMMIT, v2_op_id,
-			                                &ack_v2, err_msg, sizeof(err_msg));
-			if (result != ESP_OK) {
-				break;
-			}
-
-			snprintf(err_msg, sizeof(err_msg), "remote OTA v2 OK, %s rebooting", target_tag);
-			remote_ota_status_finish(NODE0_OTA_REBOOTING, err_msg);
-			ESP_LOGI(TAG, "%s", err_msg);
-
-			free(buf);
-#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-			remote_ota_v2_debug_clear_faults();
-#endif
-			xSemaphoreGive(s_ota_mutex);
-			return http_json_ok(req, err_msg);
-		}
-
-	} while (0);
+	remote_op_t op;
+	memset(&op, 0, sizeof(op));
 
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
 	remote_ota_v2_debug_clear_faults();
 #endif
-	if (remote_started) {
-		remote_ota_send_abort_v2(target_mac, v2_op_id, err_msg);
+	{
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+		char debug_q[192] = {0};
+		if (httpd_req_get_url_query_str(req, debug_q, sizeof(debug_q)) == ESP_OK) {
+			op.debug_corrupt_sha = query_bool_value(debug_q, "debug_corrupt_sha");
+			op.debug_interrupt_after = query_u32_value(debug_q, "debug_interrupt_after");
+			op.debug_route_loss_after_sends =
+				query_u32_value(debug_q, "debug_route_loss_after_sends");
+		}
+#endif
+
+		do {
+			if (!remote_ota_mode_from_req(req, err_msg, sizeof(err_msg))) {
+				break;
+			}
+			if (!remote_ota_target_from_req(req, target_mac, target_tag,
+			                                sizeof(target_tag),
+			                                err_msg, sizeof(err_msg))) {
+				break;
+			}
+			remote_ota_normalize_tag_for_mac(target_mac, target_tag,
+			                                 sizeof(target_tag));
+			if (!remote_ota_supported_tag(target_tag)) {
+				snprintf(err_msg, sizeof(err_msg),
+				         "remote OTA unsupported for %s", target_tag);
+				break;
+			}
+			if (!node_route_current(target_mac)) {
+				snprintf(err_msg, sizeof(err_msg), "target route not ready");
+				break;
+			}
+			if (!remote_ota_v2_supported_for_mac(target_mac)) {
+				snprintf(err_msg, sizeof(err_msg), "target OTA v2 not ready");
+				break;
+			}
+
+			size_t total_len = req->content_len;
+			if (total_len == 0 || total_len > 0x200000U) {
+				snprintf(err_msg, sizeof(err_msg), "bad Content-Length");
+				break;
+			}
+
+			/* Stage the whole image first (PSRAM for >16 KB); the relay then
+			 * runs on the worker task and this handler returns at once. */
+			buf = (uint8_t *)malloc(total_len);
+			if (!buf) {
+				snprintf(err_msg, sizeof(err_msg), "no memory for OTA buffer");
+				break;
+			}
+			size_t have = 0;
+			while (have < total_len) {
+				int r = ota_recv_retry(req, buf + have, total_len - have);
+				if (r <= 0) {
+					snprintf(err_msg, sizeof(err_msg),
+					         "failed to read OTA image");
+					break;
+				}
+				have += (size_t)r;
+			}
+			if (have != total_len) {
+				break;
+			}
+
+			esp_app_desc_t new_desc = {0};
+			if (!ota_validate_first_chunk(buf, have, &new_desc, target_tag,
+			                              err_msg, sizeof(err_msg))) {
+				break;
+			}
+
+			ESP_LOGI(TAG, "remote OTA upload -> " MACSTR
+			         " tag=%s project=%s version=%s size=%lu (queued)",
+			         MAC2STR(target_mac), target_tag, new_desc.project_name,
+			         new_desc.version, (unsigned long)total_len);
+
+			if (node_has_fresh_telemetry(target_mac, NODEINFO_STALE_MS) == false) {
+				(void)remote_stream_rearm_for_mac(target_mac, true);
+			}
+
+			memcpy(op.mac, target_mac, 6);
+			copy_tag(op.tag, sizeof(op.tag), target_tag);
+			op.buf = buf;
+			op.total_len = (uint32_t)total_len;
+			op.reboot = false;
+
+			if (xQueueSend(s_remote_op_queue, &op, 0) != pdTRUE) {
+				snprintf(err_msg, sizeof(err_msg),
+				         "remote op queue busy");
+				break;
+			}
+			/* ownership passed to the worker */
+			buf = NULL;
+
+			return http_json_ok(req,
+			                   "remote OTA v2 queued; poll /ota/remote/status?mac=");
+		} while (0);
 	}
+
+#if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
+	remote_ota_v2_debug_clear_faults();
+#endif
 	if (buf) {
 		free(buf);
 	}
-
 	remote_ota_status_finish(NODE0_OTA_FAILED, err_msg);
 	ESP_LOGW(TAG, "remote OTA failed: %s", err_msg);
-	xSemaphoreGive(s_ota_mutex);
 	return http_json_error(req, "400 Bad Request", err_msg);
 }
-
 static void ota_mark_running_app_valid_if_pending(void)
 {
 #ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
@@ -8531,6 +8598,12 @@ esp_err_t log_http_server_init(void)
 		ESP_LOGW(TAG, "OTA mutex allocation failed; web OTA disabled");
 	}
 	s_remote_ota_ack_sem = xSemaphoreCreateBinary();
+	s_remote_op_queue = xQueueCreate(1, sizeof(remote_op_t));
+	if (s_remote_op_queue) {
+		xTaskCreate(remote_op_worker, "remote_op", 8192, NULL, 5, NULL);
+	} else {
+		ESP_LOGE(TAG, "remote op queue alloc failed; remote ops disabled");
+	}
 	if (!s_remote_ota_ack_sem) {
 		ESP_LOGW(TAG, "remote OTA ACK semaphore allocation failed; remote OTA disabled");
 	}
