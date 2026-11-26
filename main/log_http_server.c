@@ -8115,7 +8115,7 @@ static void url_decode(char *s)
 			*w++ = *r;
 		}
 	}
-	*w = ' ';
+	*w = 0;
 }
 
 /* One-shot mesh command: GET /cmd?tag=lampk&cmd=lam
