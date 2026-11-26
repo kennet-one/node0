@@ -8497,7 +8497,13 @@ esp_err_t log_http_server_start(void)
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;
-	config.httpd.keep_alive_enable = false;
+	/* Keep-alive on: the kiosk tablet polls /tasks + /climate every ~10 s and
+	 * reuses one TLS session instead of paying a full handshake per request.
+	 * lru_purge_enable above already caps idle sockets. */
+	config.httpd.keep_alive_enable = true;
+	config.httpd.keep_alive_idle = 10;
+	config.httpd.keep_alive_interval = 2;
+	config.httpd.keep_alive_count = 4;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;

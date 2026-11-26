@@ -157,7 +157,8 @@ static void mesh_time_root_task(void *arg)
 
 		esp_err_t err = root_send_time_to_all((int64_t)now, s_seq);
 		if (err == ESP_OK) {
-			ESP_LOGI(TAG, "TIME TX seq=%" PRIu32 " epoch=%" PRId64, s_seq, (int64_t)now);
+			/* INFO every 5 s flooded the RAM log ring (32% of buffer); TX success is routine -> DEBUG */
+			ESP_LOGD(TAG, "TIME TX seq=%" PRIu32 " epoch=%" PRId64, s_seq, (int64_t)now);
 		} else {
 			ESP_LOGW(TAG, "TIME TX err=%s seq=%" PRIu32, esp_err_to_name(err), s_seq);
 		}
@@ -225,6 +226,6 @@ esp_err_t mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len)
 	s_have_time = true;
 	s_last_rx_seq = tp.seq;
 
-	ESP_LOGI(TAG, "TIME RX seq=%" PRIu32 " set epoch=%" PRId64, tp.seq, tp.epoch_sec);
+	ESP_LOGD(TAG, "TIME RX seq=%" PRIu32 " set epoch=%" PRId64, tp.seq, tp.epoch_sec);
 	return ESP_OK;
 }
