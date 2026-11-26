@@ -16,9 +16,9 @@
 
 static const char *TAG = "mesh_sensors";
 
-#define SENS_POLL_MS (60000U)	// per-node refresh window
+#define SENS_POLL_MS (90000U)	// per-node refresh window
 #define SENS_TICK_MS (10000U)
-#define SENS_INFLIGHT_MS (30000U)
+#define SENS_INFLIGHT_MS (8000U)
 #define SENS_TASK_STACK (4096)
 #define SENS_PENDING_MAX 8
 #define SENS_INVALID (-2147483647)
@@ -366,7 +366,7 @@ int mesh_sensors_cache_json(char *out, size_t cap)
 
 		mesh_v2_root_stats_t st;
 		bool seen = have_mac && mesh_v2_root_stats_for_mac(n.mac, &st);
-		bool online = seen && st.seen && st.ping_age_ms < 60000;
+		bool online = seen && st.seen && st.ping_age_ms < 180000;
 
 		char macs[13] = "";
 		if (have_mac)
