@@ -6454,10 +6454,18 @@ static void remote_op_relay(const remote_op_t *op)
 		prepare.c.image_size = op->total_len;
 		prepare.c.len = REMOTE_OTA_V2_CHUNK_SIZE;
 		{
-			/* project/version from the staged image header */
+			/* project/version from the staged image header: the app descriptor
+			 * sits AFTER esp_image_header_t + first esp_image_segment_header_t,
+			 * not at image offset 0 (that passed "23a3f28" as project). */
 			esp_app_desc_t desc = {0};
-			memcpy(&desc, op->buf,
-			       sizeof(desc) < op->total_len ? sizeof(desc) : op->total_len);
+			const size_t desc_off = sizeof(esp_image_header_t) +
+			                        sizeof(esp_image_segment_header_t);
+			if ((size_t)op->total_len < desc_off + sizeof(desc)) {
+				snprintf(err_msg, sizeof(err_msg), "image too small for app desc");
+				result = ESP_FAIL;
+				break;
+			}
+			memcpy(&desc, op->buf + desc_off, sizeof(desc));
 			copy_packet_text(prepare.c.project_name, sizeof(prepare.c.project_name),
 			                 desc.project_name, sizeof(desc.project_name));
 			copy_packet_text(prepare.c.version, sizeof(prepare.c.version),
