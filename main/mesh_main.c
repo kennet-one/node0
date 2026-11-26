@@ -614,7 +614,9 @@ void app_main(void)
 
 	ESP_ERROR_CHECK(esp_mesh_disable_ps());
 	/* Encrypted mesh children may be quiet for more than the 10 s default. */
-	ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(30));
+	/* 60 s: with 30 s the AP expired children ~26-30 s after join under CPU load,
+	   causing SA Query disassoc waves (parent_disconnect_count in the hundreds). */
+	ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(60));
 
 	mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
 
@@ -650,6 +652,9 @@ void app_main(void)
 
 	ESP_ERROR_CHECK(log_http_server_init());
 	ESP_ERROR_CHECK(log_http_server_start());
+	/* mesh lib INFO spam (xseqno/recv dups) floods the vprintf ring and burns CPU;
+	   node0's own MESH_EVENT logs use tag "node0" and stay at INFO. */
+	esp_log_set_level("mesh", ESP_LOG_WARN);
 	log_internal_heap("before BLE");
 #if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
 	esp_err_t ble_err = keelink_ble_init();
