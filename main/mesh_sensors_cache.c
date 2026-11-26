@@ -271,8 +271,11 @@ static void self_poll_tick(void)
 			continue;
 		if (!have_mac) {
 			uint8_t mac[6];
+			// lossless-with-cap first; fall back to any ready route so the
+			// cache still fills while v2 sessions re-establish after boot
 			if (mesh_v2_root_find_lossless_by_tag(s_defs[ni].tag, mac,
-							      MESH_V2_CAP_TYPED_CONTROL)) {
+							      MESH_V2_CAP_TYPED_CONTROL) ||
+			    mesh_v2_root_find_ready_by_tag(s_defs[ni].tag, mac)) {
 				portENTER_CRITICAL(&s_lock);
 				memcpy(s_nodes[ni].mac, mac, 6);
 				s_nodes[ni].have_mac = true;
@@ -366,7 +369,10 @@ int mesh_sensors_cache_json(char *out, size_t cap)
 
 		mesh_v2_root_stats_t st;
 		bool seen = have_mac && mesh_v2_root_stats_for_mac(n.mac, &st);
-		bool online = seen && st.seen && st.ping_age_ms < 180000;
+		// online = seen and recently heard: valid ping OR fresh v2/tunnel frame
+		bool online = seen && st.seen &&
+			((st.ping_valid && st.ping_age_ms < 180000) ||
+			 (st.last_tunnel_ms && now - st.last_tunnel_ms < 180000));
 
 		char macs[13] = "";
 		if (have_mac)
