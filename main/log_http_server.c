@@ -47,6 +47,7 @@
 #include "mesh_v2_link.h"
 #include "heater_climate_cache.h"
 #include "mesh_sensors_cache.h"
+#include "mesh_root_bcast.h"
 #include "ota_v3_service.h"
 #include "stack_monitor.h"
 
@@ -8099,10 +8100,61 @@ static esp_err_t http_root_get(httpd_req_t *req)
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
+static void url_decode(char *s)
+{
+	char *w = s;
+	for (char *r = s; *r; r++) {
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = (r[1] >= '0' && r[1] <= '9') ? r[1] - '0' : (r[1] | 32) - 'a' + 10;
+			int lo = (r[2] >= '0' && r[2] <= '9') ? r[2] - '0' : (r[2] | 32) - 'a' + 10;
+			*w++ = (char)(hi * 16 + lo);
+			r += 2;
+		} else if (*r == '+') {
+			*w++ = ' ';
+		} else {
+			*w++ = *r;
+		}
+	}
+	*w = ' ';
+}
+
+/* One-shot mesh command: GET /cmd?tag=lampk&cmd=lam
+ * Open to the LAN (the kiosk tablet and desktop live there; the PC agent API
+ * on 8088 is already open on this network). OTA/admin endpoints stay PIN-
+ * protected. Every command is logged with its peer fd for audit.
+ * Replies {"ok":true,"id":N} once queued to the node. */
+static esp_err_t http_cmd_get(httpd_req_t *req)
+{
+	int fd = httpd_req_to_sockfd(req);
+	ESP_LOGI(TAG, "cmd from fd=%d", fd);
+	char q[256] = {0};
+	char tag[24] = {0}, cmd[80] = {0};
+	if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) {
+		return http_json_error(req, "400 Bad Request", "missing query");
+	}
+	if (httpd_query_key_value(q, "tag", tag, sizeof(tag)) != ESP_OK ||
+	    httpd_query_key_value(q, "cmd", cmd, sizeof(cmd)) != ESP_OK) {
+		return http_json_error(req, "400 Bad Request", "need tag & cmd");
+	}
+	url_decode(tag);
+	url_decode(cmd);
+	uint32_t id = 0;
+	esp_err_t err = mesh_root_submit_owner_command_ex(tag, cmd, &id);
+	if (err != ESP_OK) {
+		return http_json_error(req, "502 Bad Gateway", esp_err_to_name(err));
+	}
+	char body[96];
+	snprintf(body, sizeof(body), "{\"ok\":true,\"id\":%lu}", (unsigned long)id);
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t http_sensors_get(httpd_req_t *req)
 {
 	enum { SENSORS_JSON_MAX = 4096 };
-	char *buf = malloc(SENSORS_JSON_MAX);
+	char *buf = heap_caps_malloc(SENSORS_JSON_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!buf) buf = malloc(SENSORS_JSON_MAX);
 	if (!buf) {
 		httpd_resp_set_status(req, "503 Unavailable");
 		httpd_resp_set_type(req, "application/json");
@@ -8127,7 +8179,8 @@ static esp_err_t http_climate_get(httpd_req_t *req)
 	/* Full body: serve climate cache snapshot as JSON. Uses heap buffer so the
 	 * 12 KB httpd stack stays light. */
 	enum { CLIMATE_JSON_MAX = 1024 };
-	char *buf = malloc(CLIMATE_JSON_MAX);
+	char *buf = heap_caps_malloc(CLIMATE_JSON_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!buf) buf = malloc(CLIMATE_JSON_MAX);
 	if (!buf) {
 		httpd_resp_set_status(req, "503 Unavailable");
 		httpd_resp_set_type(req, "application/json");
@@ -8188,6 +8241,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/sensors",
 		.method		= HTTP_GET,
 		.handler	= http_sensors_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_cmd = {
+		.uri		= "/cmd",
+		.method		= HTTP_GET,
+		.handler	= http_cmd_get,
 		.user_ctx	= NULL
 	};
 
@@ -8374,6 +8434,11 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		ESP_LOGW(TAG, "register /sensors failed: %s", esp_err_to_name(err));
 		err = ESP_OK;
 	}
+	err = httpd_register_uri_handler(server, &uri_cmd);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "register /cmd failed: %s", esp_err_to_name(err));
+		err = ESP_OK;
+	}
 	err = httpd_register_uri_handler(server, &uri_ui_status);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ui_stream);
@@ -8533,13 +8598,12 @@ esp_err_t log_http_server_start(void)
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;
 	config.httpd.send_wait_timeout = 3;
-	/* Keep-alive on: the kiosk tablet polls /tasks + /climate every ~10 s and
-	 * reuses one TLS session instead of paying a full handshake per request.
-	 * lru_purge_enable above already caps idle sockets. */
-	config.httpd.keep_alive_enable = true;
-	config.httpd.keep_alive_idle = 10;
-	config.httpd.keep_alive_interval = 2;
-	config.httpd.keep_alive_count = 4;
+	/* Keep-alive OFF: each idle keep-alive TLS session pins several KB of
+	 * internal RAM (mbedtls handshake buffers), and internal heap already runs
+	 * near the floor (min ~8 KB) with 7 mesh children — nodes drop when the
+	 * mesh stack cannot allocate. A handshake per poll (~10 s cadence) costs
+	 * far less than losing children. */
+	config.httpd.keep_alive_enable = false;
 	config.tls_handshake_timeout_ms = 4000;
 	config.port_secure = CONFIG_NODE0_HTTPS_PORT;
 	config.servercert = node0_https_servercert_pem_start;
