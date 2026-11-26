@@ -612,6 +612,11 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_mesh_set_max_layer(CONFIG_MESH_MAX_LAYER));
 	ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
 	ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
+	/* default esp_mesh_send block time is forever: one blocked send to a
+	 * mid-bounce child jams the root broker and starves HELLO_ACKs for ALL
+	 * children (the ~25-min post-reboot recovery livelock). 5 s timeout:
+	 * fail fast, the 5 s HELLO retry recovers the session. */
+	esp_mesh_send_block_time(5000);
 
 	ESP_ERROR_CHECK(esp_mesh_disable_ps());
 	/* Encrypted mesh children may be quiet for more than the 10 s default. */
@@ -670,6 +675,10 @@ void app_main(void)
 	log_internal_heap("after BLE host start");
 #endif
 	ESP_ERROR_CHECK(esp_mesh_start());
+	/* Start the RX task immediately (idempotent): before the router join it
+	 * did not exist, children's upstream XON windows (~9 packets) closed and
+	 * their HELLOs blocked forever. */
+	mesh_comm_start();
 	/* climate cache self-poll DISABLED while boot-loop cause is profiled;
 	   passive HC1/HP1/HZ1 cache + /climate route stay active */
 	heater_climate_cache_init();
