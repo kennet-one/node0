@@ -13,6 +13,13 @@ extern "C" {
 // Route a known command to its owner, or broadcast unknown legacy text.
 void mesh_root_broadcast_text(const char *payload);
 esp_err_t mesh_root_send_state_to_mixer(const char *legacy_token);
+// Submit a text command to a node by tag from root-internal code (the
+// climate cache self-poll). Queues through the command result tracker.
+esp_err_t mesh_root_submit_owner_command(const char *owner, const char *payload);
+/* Same as mesh_root_submit_owner_command, additionally returns the command id
+ * via out_id (may be NULL) so callers can match results to submissions. */
+esp_err_t mesh_root_submit_owner_command_ex(const char *owner, const char *payload,
+					    uint32_t *out_id);
 void mesh_root_command_result(const uint8_t peer[6], uint32_t root_session,
 			      uint32_t command_id, uint8_t status,
 			      const char *text);

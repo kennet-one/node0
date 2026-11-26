@@ -45,6 +45,7 @@
 #include "keelink_server.h"
 #include "keelink_ble.h"
 #include "mesh_v2_link.h"
+#include "heater_climate_cache.h"
 #include "ota_v3_service.h"
 #include "stack_monitor.h"
 
@@ -8097,6 +8098,31 @@ static esp_err_t http_root_get(httpd_req_t *req)
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t http_climate_get(httpd_req_t *req)
+{
+	/* Full body: serve climate cache snapshot as JSON. Uses heap buffer so the
+	 * 12 KB httpd stack stays light. */
+	enum { CLIMATE_JSON_MAX = 1024 };
+	char *buf = malloc(CLIMATE_JSON_MAX);
+	if (!buf) {
+		httpd_resp_set_status(req, "503 Unavailable");
+		httpd_resp_set_type(req, "application/json");
+		return httpd_resp_send(req, "{\"ok\":false,\"error\":\"no mem\"}", HTTPD_RESP_USE_STRLEN);
+	}
+	int n = heater_climate_cache_json(buf, CLIMATE_JSON_MAX);
+	if (n <= 0) {
+		free(buf);
+		httpd_resp_set_status(req, "503 Unavailable");
+		httpd_resp_set_type(req, "application/json");
+		return httpd_resp_send(req, "{\"ok\":false,\"error\":\"not ready\"}", HTTPD_RESP_USE_STRLEN);
+	}
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	esp_err_t err = httpd_resp_send(req, buf, (ssize_t)n);
+	free(buf);
+	return err;
+}
+
 static esp_err_t register_log_http_handlers(httpd_handle_t server)
 {
 	httpd_uri_t uri_root = {
@@ -8124,6 +8150,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/tasks",
 		.method		= HTTP_GET,
 		.handler	= http_tasks_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_climate = {
+		.uri		= "/climate",
+		.method		= HTTP_GET,
+		.handler	= http_climate_get,
 		.user_ctx	= NULL
 	};
 
@@ -8298,6 +8331,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_tasks);
 	if (err != ESP_OK) return err;
+	err = httpd_register_uri_handler(server, &uri_climate);
+	if (err != ESP_OK) {
+		/* Non-fatal: failed /climate registration must not abort server start
+		 * (return err -> log_http_server_init fail -> ESP_ERROR_CHECK abort -> rollback). */
+		ESP_LOGW(TAG, "register /climate failed: %s", esp_err_to_name(err));
+		err = ESP_OK;
+	}
 	err = httpd_register_uri_handler(server, &uri_ui_status);
 	if (err != ESP_OK) return err;
 	err = httpd_register_uri_handler(server, &uri_ui_stream);
@@ -8450,9 +8490,9 @@ esp_err_t log_http_server_start(void)
 	config.httpd.stack_size = 12288;
 	config.httpd.max_open_sockets = HTTPS_MAX_OPEN_SOCKETS;
 #if CONFIG_NODE0_LOSSLESS_DEBUG_ENABLE
-	config.httpd.max_uri_handlers = 30;
+	config.httpd.max_uri_handlers = 40;
 #else
-	config.httpd.max_uri_handlers = 28;
+	config.httpd.max_uri_handlers = 40;
 #endif
 	config.httpd.backlog_conn = 2;
 	config.httpd.recv_wait_timeout = 3;

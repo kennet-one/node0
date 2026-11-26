@@ -13,6 +13,7 @@
 #include "mesh_root_bcast.h"
 #include "mesh_v2_link.h"
 #include "heater_zone.h"
+#include "heater_climate_cache.h"
 #include "keemash_mesh_root.h"
 #include "keelink_server.h"
 #include "log_http_server.h"
@@ -443,6 +444,39 @@ esp_err_t mesh_root_submit_direct_operation(
 	return ESP_OK;
 }
 
+esp_err_t mesh_root_submit_owner_command(const char *owner, const char *payload)
+{
+	return mesh_root_submit_owner_command_ex(owner, payload, NULL);
+}
+
+esp_err_t mesh_root_submit_owner_command_ex(const char *owner, const char *payload,
+					    uint32_t *out_id)
+{
+	if (!owner || !owner[0] || !payload || !payload[0])
+		return ESP_ERR_INVALID_ARG;
+	if (!ensure_pending_task()) return ESP_ERR_INVALID_STATE;
+	uint8_t owner_mac[6] = {0};
+	if (!mesh_v2_root_find_lossless_by_tag(owner, owner_mac,
+					       MESH_V2_CAP_TYPED_CONTROL)) {
+		return ESP_ERR_NOT_FOUND;
+	}
+	mesh_v2_root_stats_t stats = {0};
+	(void)mesh_v2_root_stats_for_mac(owner_mac, &stats);
+	uint32_t command_id = mesh_v2_root_next_command_id();
+	if (out_id) *out_id = command_id;
+	if (!pending_add(owner_mac, stats.root_session_id, command_id, owner))
+		return ESP_ERR_NO_MEM;
+	esp_err_t err = mesh_v2_root_send_command(owner_mac, command_id,
+						  payload);
+	if (err != ESP_OK) {
+		(void)pending_take(owner_mac, stats.root_session_id,
+				   command_id, NULL);
+		return err;
+	}
+	log_http_server_command_status("queued", owner, command_id, payload);
+	return ESP_OK;
+}
+
 void mesh_root_command_result(const uint8_t peer[6], uint32_t root_session,
 			      uint32_t command_id, uint8_t status,
 			      const char *text)
@@ -456,6 +490,8 @@ void mesh_root_command_result_operation(
 	uint8_t status, const char *text,
 	const mesh_v2_operation_id_t *operation_id)
 {
+	heater_climate_cache_on_result_text(text);
+	heater_climate_cache_note_result(command_id, status, text);
 	heater_zone_result(peer, root_session, command_id, status);
 	pending_command_t found = {0};
 	if (!pending_take(peer, root_session, command_id, &found)) return;
