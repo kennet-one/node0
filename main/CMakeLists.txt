@@ -7,6 +7,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/${NODE0_HTTPS_CERT}" OR
 endif()
 
 idf_component_register(SRCS "mesh_main.c"
+                        "mbedtls_alloc.c"
                         "mesh_root_bcast.c"
                         "heater_zone.c"
                         "heater_climate_cache.c"

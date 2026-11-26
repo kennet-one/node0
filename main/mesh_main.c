@@ -31,6 +31,7 @@
 #include "ota_v3_service.h"
 #include "heater_zone.h"
 #include "keemash_mesh_network.h"
+#include "mbedtls_alloc.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Constants / globals                                                       */
@@ -574,6 +575,7 @@ static void ip_event_handler(void *arg,
 void app_main(void)
 {
 	//ESP_ERROR_CHECK(mesh_light_init());   // optional LED init
+	keemash_mbedtls_alloc_init();   // split TLS allocator: big bufs -> PSRAM, small -> internal
 	log_time_vprintf_start();
 	
 	ESP_ERROR_CHECK(nvs_flash_init());
