@@ -655,7 +655,7 @@ void app_main(void)
 	ESP_ERROR_CHECK(log_http_server_start());
 	/* mesh lib INFO spam (xseqno/recv dups) floods the vprintf ring and burns CPU;
 	   node0's own MESH_EVENT logs use tag "node0" and stay at INFO. */
-	esp_log_set_level("mesh", ESP_LOG_WARN);
+	esp_log_level_set("mesh", ESP_LOG_WARN);
 	log_internal_heap("before BLE");
 #if CONFIG_NODE0_KEELINK_ENABLE && CONFIG_NODE0_KEELINK_BLE_ENABLE
 	esp_err_t ble_err = keelink_ble_init();
