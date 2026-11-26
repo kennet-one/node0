@@ -281,13 +281,6 @@ static void stack_monitor_task(void *arg)
 			xSemaphoreGive(s_sample_lock);
 		}
 
-		/* TLSF corruption hunt (2026-02): full heap integrity check once per
-		 * monitor cycle. Prints block owner tasks (HEAP_TASK_TRACKING) and
-		 * aborts only via its own assert path on real corruption. */
-		if (!heap_caps_check_integrity_all(true)) {
-			ESP_LOGE("HEAPCHK", "heap integrity check FAILED");
-		}
-
 		vTaskDelay(pdMS_TO_TICKS(STACK_MONITOR_PERIOD_MS));
 	}
 }
