@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "mesh_root_bcast.h"
+#include "mesh_sensors_cache.h"
 #include "mesh_v2_link.h"
 #include "heater_zone.h"
 #include "heater_climate_cache.h"
@@ -492,6 +493,7 @@ void mesh_root_command_result_operation(
 {
 	heater_climate_cache_on_result_text(text);
 	heater_climate_cache_note_result(command_id, status, text);
+	mesh_sensors_cache_on_result(peer, command_id, status, text);
 	heater_zone_result(peer, root_session, command_id, status);
 	pending_command_t found = {0};
 	if (!pending_take(peer, root_session, command_id, &found)) return;

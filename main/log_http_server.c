@@ -46,6 +46,7 @@
 #include "keelink_ble.h"
 #include "mesh_v2_link.h"
 #include "heater_climate_cache.h"
+#include "mesh_sensors_cache.h"
 #include "ota_v3_service.h"
 #include "stack_monitor.h"
 
@@ -8098,6 +8099,29 @@ static esp_err_t http_root_get(httpd_req_t *req)
 	return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t http_sensors_get(httpd_req_t *req)
+{
+	enum { SENSORS_JSON_MAX = 4096 };
+	char *buf = malloc(SENSORS_JSON_MAX);
+	if (!buf) {
+		httpd_resp_set_status(req, "503 Unavailable");
+		httpd_resp_set_type(req, "application/json");
+		return httpd_resp_send(req, "{\"ok\":false,\"error\":\"no mem\"}", HTTPD_RESP_USE_STRLEN);
+	}
+	int n = mesh_sensors_cache_json(buf, SENSORS_JSON_MAX);
+	if (n <= 0) {
+		free(buf);
+		httpd_resp_set_status(req, "503 Unavailable");
+		httpd_resp_set_type(req, "application/json");
+		return httpd_resp_send(req, "{\"ok\":false,\"error\":\"no data\"}", HTTPD_RESP_USE_STRLEN);
+	}
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	esp_err_t err = httpd_resp_send(req, buf, (ssize_t)n);
+	free(buf);
+	return err;
+}
+
 static esp_err_t http_climate_get(httpd_req_t *req)
 {
 	/* Full body: serve climate cache snapshot as JSON. Uses heap buffer so the
@@ -8157,6 +8181,13 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		.uri		= "/climate",
 		.method		= HTTP_GET,
 		.handler	= http_climate_get,
+		.user_ctx	= NULL
+	};
+
+	httpd_uri_t uri_sensors = {
+		.uri		= "/sensors",
+		.method		= HTTP_GET,
+		.handler	= http_sensors_get,
 		.user_ctx	= NULL
 	};
 
@@ -8336,6 +8367,11 @@ static esp_err_t register_log_http_handlers(httpd_handle_t server)
 		/* Non-fatal: failed /climate registration must not abort server start
 		 * (return err -> log_http_server_init fail -> ESP_ERROR_CHECK abort -> rollback). */
 		ESP_LOGW(TAG, "register /climate failed: %s", esp_err_to_name(err));
+		err = ESP_OK;
+	}
+	err = httpd_register_uri_handler(server, &uri_sensors);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "register /sensors failed: %s", esp_err_to_name(err));
 		err = ESP_OK;
 	}
 	err = httpd_register_uri_handler(server, &uri_ui_status);

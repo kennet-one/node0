@@ -26,6 +26,7 @@
 #include "mesh_time_sync.h"
 #include "mesh_v2_link.h"
 #include "heater_climate_cache.h"
+#include "mesh_sensors_cache.h"
 #include "ota_v3_service.h"
 #include "heater_zone.h"
 #include "keemash_mesh_network.h"
@@ -666,6 +667,7 @@ void app_main(void)
 	/* climate cache self-poll DISABLED while boot-loop cause is profiled;
 	   passive HC1/HP1/HZ1 cache + /climate route stay active */
 	heater_climate_cache_init();
+	mesh_sensors_cache_init();
 	keelink_ble_note_boot_checkpoint(90);
 	mesh_v2_link_require();
 	esp_err_t v2_init_err = mesh_v2_root_init();
