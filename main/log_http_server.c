@@ -114,7 +114,12 @@ static void https_session_event(esp_https_server_user_cb_arg_t *event)
 #define REMOTE_OTA_V2_ACK_TIMEOUT_MS	30000U
 #define REMOTE_OTA_V2_RESYNC_TIMEOUT_MS	45000U
 #define REMOTE_OTA_V2_RESYNC_POLL_MS	1000U
-#define REMOTE_OTA_V2_CHUNK_SIZE	256U
+#define REMOTE_OTA_V2_CHUNK_SIZE	1024U
+/* 2026-11-27: 256 -> 1024. 4x fewer ACK/mutex/WiFi transactions per MB:
+ * the per-transaction cost (tx-broker submit, root stats s_lock update per
+ * ACK, esp_wifi adapter work) was starving CPU interrupts past the 800 ms
+ * INT_WDT during pushes (interrupt WDT panics #28/#29). Protocol cap is
+ * MESH_V2_OTA_CHUNK_MAX (1024), accepted by children since v0.9.4. */
 #if REMOTE_OTA_V2_CHUNK_SIZE > MESH_V2_OTA_CHUNK_MAX
 	#error "REMOTE_OTA_V2_CHUNK_SIZE exceeds MESH_V2_OTA_CHUNK_MAX"
 #endif
@@ -728,10 +733,21 @@ static uint32_t node_last_app_ms(const uint8_t mac[6])
 	if (!mac) return 0;
 	if (mac_eq(mac, s_local_mac)) return ms_now();
 
-	mesh_v2_root_stats_t v2;
-	if (mesh_v2_root_stats_for_mac(mac, &v2)) {
-		last_ms = max_ms_value(last_ms, v2.last_v2_ms);
-		last_ms = max_ms_value(last_ms, v2.last_tunnel_ms);
+	/* 2026-11-27 #28/#29: mesh_v2_root_stats_for_mac takes the reliable
+	 * lock (and spins on the root stats portMUX on the other core) —
+	 * calling it from the /nodes hot path DURING an OTA push starved CPU
+	 * interrupts past INT_WDT (panic via node_last_app_ms). Same shallow
+	 * policy as append_node_health_json_fields: skip deep stats while any
+	 * OTA transfer is active; the nodes table below still provides a
+	 * last-seen floor. */
+	if (remote_op_busy() || ota_v3_busy()) {
+		/* shallow path: fall through to the short spinlock tables */
+	} else {
+		mesh_v2_root_stats_t v2;
+		if (mesh_v2_root_stats_for_mac(mac, &v2)) {
+			last_ms = max_ms_value(last_ms, v2.last_v2_ms);
+			last_ms = max_ms_value(last_ms, v2.last_tunnel_ms);
+		}
 	}
 
 	portENTER_CRITICAL(&s_nodes_lock);
