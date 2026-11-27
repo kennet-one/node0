@@ -392,6 +392,7 @@ static void remote_ota_normalize_tag_for_mac(const uint8_t mac[6],
                                              char *tag, size_t tag_sz);
 static bool node_route_current(const uint8_t mac[6]);
 static bool remote_ota_v2_supported_for_mac(const uint8_t mac[6]);
+static bool ota_v3_busy(void);
 static uint32_t remote_ota_next_op_id(void);
 static esp_err_t remote_ota_send_wait_v2(const uint8_t mac[6], const void *payload,
                                          size_t payload_len, uint8_t op,
@@ -3383,7 +3384,13 @@ static size_t append_node_health_json_fields(char *out, size_t cap, size_t pos,
                                              uint32_t now)
 {
 	mesh_v2_root_stats_t v2;
-	bool has_v2 = mac && mesh_v2_root_stats_for_mac(mac, &v2);
+	/* Deep root stats take the reliable-layer lock (100 ms waits); during an
+	 * OTA relay push that lock is held in long bursts and the accumulating
+	 * waits collided with the mesh RX adapter mutex -> interrupt WDT crash
+	 * (2026-11-27 02:49, http_nodes_get vs ota_v3_root chunk push). Serve
+	 * shallow data while any OTA transfer is active. */
+	bool ota_active = remote_op_busy() || ota_v3_busy();
+	bool has_v2 = mac && !ota_active && mesh_v2_root_stats_for_mac(mac, &v2);
 	bool remote = mac && !mac_eq(mac, s_local_mac);
 	bool has_nodeinfo = last_nodeinfo_ms != 0;
 	bool has_route_history = last_route_ms != 0;
