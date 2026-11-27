@@ -128,7 +128,7 @@ static void https_session_event(esp_https_server_user_cb_arg_t *event)
 #define LOG_LEASE_TASK_STACK		2048U
 #define HTTPS_MAX_OPEN_SOCKETS		6
 #define UI_STATUS_JSON_MAX		16384U
-#define MESH_STATUS_JSON_MAX		16384U
+#define MESH_STATUS_JSON_MAX		32768U
 #define NODE_LIST_JSON_MAX		12288U
 #define HTTP_TLS_WRITE_CHUNK		1024U
 #define UI_CONTROL_POLL_MS		15000
@@ -2570,7 +2570,9 @@ static esp_err_t http_send_buffer_chunked(httpd_req_t *req, const char *data,
 static esp_err_t http_nodes_get(httpd_req_t *req)
 {
 	enum { NODES_JSON_MAX = MESH_STATUS_JSON_MAX };
-	char *out = (char *)malloc(NODES_JSON_MAX);
+	char *out = (char *)heap_caps_malloc(NODES_JSON_MAX,
+	                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!out) out = (char *)malloc(NODES_JSON_MAX);
 	if (!out) {
 		return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
 		                           "no memory for nodes");
@@ -7160,7 +7162,9 @@ static size_t append_mesh_status_json(char *out, size_t cap, size_t pos, uint32_
 
 static esp_err_t http_mesh_status_get(httpd_req_t *req)
 {
-	char *out = (char *)malloc(MESH_STATUS_JSON_MAX);
+	char *out = (char *)heap_caps_malloc(MESH_STATUS_JSON_MAX,
+	                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!out) out = (char *)malloc(MESH_STATUS_JSON_MAX);
 	if (!out) {
 		return http_json_error(req, "500 Internal Server Error",
 		                       "no memory for mesh status");
