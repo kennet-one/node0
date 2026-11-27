@@ -6210,6 +6210,11 @@ static esp_err_t remote_ota_send_chunks_v2_from_buffer(const uint8_t mac[6],
 	size_t pos = 0;
 	esp_err_t ret = ESP_OK;
 	while (pos < len) {
+		/* Pace the chunk loop: back-to-back ACK->send cycles keep the
+		 * esp_wifi adapter mutex hot and starve the mesh RX task
+		 * (interrupt WDT panics 2026-11-27 #26/#27). 2 ms per chunk
+		 * costs ~4 s per 1 MB push and keeps RX breathing. */
+		vTaskDelay(pdMS_TO_TICKS(2));
 		size_t remain = len - pos;
 		uint32_t chunk_len = (uint32_t)(remain > REMOTE_OTA_V2_CHUNK_SIZE
 		                                ? REMOTE_OTA_V2_CHUNK_SIZE
