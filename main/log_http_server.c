@@ -170,7 +170,13 @@ static portMUX_TYPE s_command_diag_lock = portMUX_INITIALIZER_UNLOCKED;
 static command_diag_t s_command_diag;
 
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
-static char s_lines[LOG_HTTP_LINES][LOG_HTTP_LINE_MAX];
+/* 2026-11-27: moved to PSRAM (45 KB of internal RAM freed — internal free
+ * was down to 15 KB with a 356 B historical minimum, which starved TLS
+ * session allocation under load). Copies are <=255 B inside a portMUX
+ * region (~2 us, cache-line writes) — safe. Allocated in
+ * log_http_server_init() before the vprintf hook installs; accessors
+ * NULL-guard so a pre-init call just drops the line. */
+static char (*s_lines)[LOG_HTTP_LINE_MAX];
 static uint32_t s_write_idx = 0;	// absolute line cursor
 static uint32_t s_total_lines = 0;
 static uint8_t s_http_wire_drop_budget = 0;
@@ -1681,7 +1687,10 @@ static void log_buffer_clear(void)
 		s_write_idx = 0;
 		s_total_lines = 0;
 		s_http_wire_drop_budget = 0;
-		memset(s_lines, 0, sizeof(s_lines));
+		if (s_lines) {
+			memset(s_lines, 0,
+			       (size_t)LOG_HTTP_LINES * LOG_HTTP_LINE_MAX);
+		}
 	}
 	portEXIT_CRITICAL(&s_log_lock);
 	log_stream_notify();
@@ -1689,7 +1698,7 @@ static void log_buffer_clear(void)
 
 static void log_buffer_append_line(const char *line, size_t len)
 {
-	if (!line || len == 0) return;
+	if (!line || len == 0 || !s_lines) return;
 
 	// Trim trailing CR/LF.
 	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
@@ -1776,7 +1785,7 @@ static uint32_t log_buffer_next_cursor(void)
 static bool log_buffer_copy_abs_line(uint32_t abs_i, char *out, size_t out_sz,
                                      size_t *out_len)
 {
-	if (!out || out_sz == 0) return false;
+	if (!out || out_sz == 0 || !s_lines) return false;
 
 	bool ok = false;
 	size_t pos = 0;
@@ -8605,6 +8614,26 @@ esp_err_t log_http_server_init(void)
 {
 	esp_wifi_get_mac(WIFI_IF_STA, s_local_mac);
 	esp_wifi_get_mac(WIFI_IF_AP, s_local_ap_mac);
+
+	if (!s_lines) {
+		s_lines = heap_caps_calloc(LOG_HTTP_LINES, LOG_HTTP_LINE_MAX,
+		                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!s_lines) {
+			/* Fall back to internal rather than losing the log. */
+			s_lines = heap_caps_calloc(LOG_HTTP_LINES,
+			                           LOG_HTTP_LINE_MAX,
+			                           MALLOC_CAP_INTERNAL |
+			                           MALLOC_CAP_8BIT);
+		}
+		if (!s_lines) {
+			ESP_LOGE(TAG, "log line buffer allocation failed; /log disabled");
+		} else {
+			ESP_LOGI(TAG, "log line buffer: %u x %u bytes in %s RAM",
+			         (unsigned)LOG_HTTP_LINES,
+			         (unsigned)LOG_HTTP_LINE_MAX,
+			         esp_ptr_external_ram(s_lines) ? "external" : "internal");
+		}
+	}
 
 	if (!s_taskmon) {
 		s_taskmon = heap_caps_calloc(LOG_HTTP_MAX_NODES,
